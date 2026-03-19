@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+checkpoints/
+*.pt
+*.egg-info/
+dist/
+build/
+.env
