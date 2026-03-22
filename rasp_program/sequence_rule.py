@@ -1,29 +1,33 @@
 """
-RASP program for the modulo-3 sequence rule, compiled via tracr.
+RASP program for the modulo-4 sequence rule, compiled via tracr.
 
-Rule:  at sequence position i the token is  (x + OFFSETS[i % 3]) % 12
-       where x = tokens[0] (the starting integer) and OFFSETS = [0, 5, 7].
+Rule:  at sequence position i the token is  (x + OFFSETS[i % 4]) % 12
+       where x = tokens[0] (the starting integer) and OFFSETS = [0, 5, 7, 0].
+
+Example (x=2): 2, 7, 9, 2, 2, 7, 9, 2, ...
 
 Autoregressive next-token prediction
 ─────────────────────────────────────
-At sequence position s (= tracr position p-1, since BOS is at tracr pos 0),
-we want to predict the token at sequence position s+1, i.e. tracr position p.
+At sequence position q we want to predict the token at position q+1.
 
 Key insight (no mod-12 arithmetic needed):
   The token at cycle position c is always equal to the token at
   sequence position c in the input (for any starting integer x).
   Therefore, predicting the next token = looking up the right reference:
 
-    At tracr position p, predict = tokens at tracr position (p % 3) + 1
+    predict[q] = tokens[(q + 1) % 4]
 
-  Verification (p=1,2,3,4,...  → look-up target):
-    p=1 → look at (1%3)+1 = 2 → tokens[1] = x+5  ✓ (next of seq[0])
-    p=2 → look at (2%3)+1 = 3 → tokens[2] = x+7  ✓ (next of seq[1])
-    p=3 → look at (3%3)+1 = 1 → tokens[0] = x    ✓ (next of seq[2])
-    p=4 → look at (4%3)+1 = 2 → tokens[1] = x+5  ✓ (next of seq[3])
+  Verification (q=0,1,2,3,4,...):
+    q=0 → look at (0+1)%4 = 1 → tokens[1] = x+5   ✓
+    q=1 → look at (1+1)%4 = 2 → tokens[2] = x+7   ✓
+    q=2 → look at (2+1)%4 = 3 → tokens[3] = x+0=x ✓
+    q=3 → look at (3+1)%4 = 0 → tokens[0] = x     ✓
+    q=4 → look at (4+1)%4 = 1 → tokens[1] = x+5   ✓
     ...
 
 This requires only ONE attention head and NO MLP operations.
+Note: the TracR model requires T ≥ 4 (one full cycle) to resolve position q=2.
+      FallbackRuleModel computes the result directly and works for any T ≥ 1.
 
 Fallback
 ────────
@@ -39,7 +43,7 @@ import numpy as np
 from typing import Union
 
 VOCAB_SIZE = 12
-OFFSETS    = [0, 5, 7]
+OFFSETS    = [0, 5, 7, 0]    # period-4 rule
 BOS_TOKEN  = "BOS"
 
 
@@ -69,7 +73,7 @@ def _build_rasp_program():
     lookup_selector = rasp.Select(
         rasp.indices,   # key indices
         rasp.indices,   # query indices
-        lambda k, q: k == (q + 1) % 3,
+        lambda k, q: k == (q + 1) % 4,
     )
     predicted_next = rasp.Aggregate(lookup_selector, rasp.tokens).named("predicted_next")
     return predicted_next
@@ -162,7 +166,7 @@ class FallbackRuleModel:
         x    = tokens_batch[:, 0:1].astype(np.int32)   # (B, 1)
         t    = np.arange(T, dtype=np.int32)[np.newaxis, :]  # (1, T)
         offsets = np.array(OFFSETS, dtype=np.int32)
-        o    = offsets[(t + 1) % 3]                         # (1, T) → broadcast
+        o    = offsets[(t + 1) % 4]                         # (1, T) → broadcast
         next_tokens = (x + o) % VOCAB_SIZE                  # (B, T)
 
         out = np.zeros((B, T, VOCAB_SIZE), dtype=np.float32)
@@ -206,9 +210,11 @@ def build_rule_model(
 if __name__ == "__main__":
     print("=== FallbackRuleModel ===")
     fb = FallbackRuleModel()
-    tests = [(0, [0, 5, 7, 0, 5, 7], [5, 7, 0, 5, 7, 0]),
-             (9, [9, 2, 4, 9, 2, 4], [2, 4, 9, 2, 4, 9]),
-             (11,[11,4, 6,11, 4, 6], [4, 6,11, 4, 6,11])]
+    # sequence: x, x+5, x+7, x,  x, x+5, x+7, x, ...  (period 4)
+    # next-tok:  x+5,x+7, x, x, x+5,x+7, x,  x,  ...
+    tests = [(0, [0, 5, 7, 0, 0, 5, 7, 0], [5, 7, 0, 0, 5, 7, 0, 0]),
+             (2, [2, 7, 9, 2, 2, 7, 9, 2], [7, 9, 2, 2, 7, 9, 2, 2]),
+             (9, [9, 2, 4, 9, 9, 2, 4, 9], [2, 4, 9, 9, 2, 4, 9, 9])]
     for x, seq, expected in tests:
         tokens = np.array([seq], dtype=np.int32)
         preds  = fb.get_logits_vectorized(tokens)[0].argmax(-1).tolist()

@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 VOCAB_SIZE = 12
-OFFSETS = [0, 5, 7]          # rule offsets per cycle step
+OFFSETS = [0, 5, 7, 0]       # rule offsets per cycle step (period 4)
 
 # Training splits
 AR_TRAIN_STARTERS      = list(range(6))         # 0-5  → AR pretrain (set A)
@@ -41,8 +41,8 @@ EVAL_NEITHER       = [8, 9, 10, 11]    # complement: seen in neither
 
 
 def make_sequence(x: int, n_cycles: int) -> list[int]:
-    """Return [t_0, t_1, ..., t_{3n-1}] for n full cycles."""
-    return [(x + OFFSETS[i % 3]) % VOCAB_SIZE for i in range(3 * n_cycles)]
+    """Return [t_0, t_1, ..., t_{4n-1}] for n full cycles."""
+    return [(x + OFFSETS[i % 4]) % VOCAB_SIZE for i in range(4 * n_cycles)]
 
 
 def build_examples(starters: list[int], n_cycles: int, n_seqs_per_starter: int = 1):

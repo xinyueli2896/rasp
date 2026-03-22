@@ -48,7 +48,7 @@ def train(args):
     # Build patched model: loads frozen AR weights, builds frozen rule model, adds adapter
     model = build_patched_model(
         ar_ckpt_path   = args.ar_ckpt,
-        max_seq_len    = args.n_cycles * 3 + 10,
+        max_seq_len    = args.n_cycles * 4 + 10,
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,

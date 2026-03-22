@@ -49,7 +49,7 @@ from models.adapter      import build_patched_model
 def _make_ar(d_model, n_layers, n_heads, n_cycles, device):
     return AutoregressiveTransformer(
         vocab_size  = VOCAB_SIZE,
-        max_seq_len = n_cycles * 3 + 10,
+        max_seq_len = n_cycles * 4 + 10,
         d_model     = d_model,
         n_layers    = n_layers,
         n_heads     = n_heads,
@@ -81,7 +81,7 @@ def load_finetune(args, device):
 def load_patched(args, device):
     model = build_patched_model(
         ar_ckpt_path   = args.ar_ckpt,
-        max_seq_len    = args.n_cycles * 3 + 10,
+        max_seq_len    = args.n_cycles * 4 + 10,
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,
@@ -112,7 +112,7 @@ def rule_following_acc(model, starters, n_cycles, n_prompt, device):
 
     Returns dict {x: accuracy} and mean accuracy.
     """
-    gen_len = n_cycles * 3 - n_prompt
+    gen_len = n_cycles * 4 - n_prompt
     results = {}
     for x in starters:
         seq      = make_sequence(x, n_cycles)                               # list, length 3*n_cycles

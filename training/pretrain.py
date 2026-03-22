@@ -43,7 +43,7 @@ def train(args):
     # Model
     model = AutoregressiveTransformer(
         vocab_size  = VOCAB_SIZE,
-        max_seq_len = args.n_cycles * 3 + 10,   # +10 for safety
+        max_seq_len = args.n_cycles * 4 + 10,   # +10 for safety
         d_model     = args.d_model,
         n_layers    = args.n_layers,
         n_heads     = args.n_heads,
