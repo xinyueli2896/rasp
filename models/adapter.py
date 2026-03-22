@@ -16,11 +16,9 @@ Architecture overview
                                         │  Adapter  (trainable)  │
                                         │                        │
                                         │  gate = σ(MLP(h‖r))    │
-                                        │  bias = MLP(h‖r)       │
                                         │                        │
-                                        │  out = gate*rule       │
-                                        │      +(1-gate)*ar      │
-                                        │      + bias            │
+                                        │  out = (1-gate)*rule   │
+                                        │      +    gate *ar     │
                                         └────────────────────────┘
                                                      │
                                               final_logits (B,T,12)
@@ -81,29 +79,21 @@ class RuleAdapter(nn.Module):
         # agreement/disagreement between the two models directly.
         in_dim = d_model + 2 * vocab_size
 
-        # Scalar gate: how much additional weight to give to AR over rule model
-        # Initialised to output ~0 (trust rule model by default)
+        # Scalar gate: interpolation weight between rule (gate=0) and AR (gate=1).
+        # Initialised so gate ≈ 0 → adapter starts as pure rule model.
         self.gate_net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
-        # Small residual bias (initialised to 0)
-        self.bias_net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, vocab_size),
-        )
-
         self._init()
 
     def _init(self):
-        # Zero-init so adapter starts as identity for rule model
+        # Zero-init weights of last layer; set bias to -10 so sigmoid(-10) ≈ 0.
+        # This ensures the untrained adapter outputs rule_logits exactly.
         nn.init.zeros_(self.gate_net[-1].weight)
-        nn.init.zeros_(self.gate_net[-1].bias)   # sigmoid(0) = 0.5 initially
-        nn.init.zeros_(self.bias_net[-1].weight)
-        nn.init.zeros_(self.bias_net[-1].bias)
+        nn.init.constant_(self.gate_net[-1].bias, -10.0)
 
     def forward(
         self,
@@ -112,14 +102,12 @@ class RuleAdapter(nn.Module):
         rule_logits: torch.Tensor,   # (B, T, vocab_size)
     ) -> torch.Tensor:               # (B, T, vocab_size)
 
-        # Include ar_logits so the gate can detect AR↔rule disagreement
-        feat  = torch.cat([ar_hidden, ar_logits, rule_logits], dim=-1)  # (B,T,d+2V)
-        gate  = torch.sigmoid(self.gate_net(feat))                       # (B,T,1)
-        bias  = self.bias_net(feat)                                      # (B,T,V)
+        feat = torch.cat([ar_hidden, ar_logits, rule_logits], dim=-1)  # (B,T,d+2V)
+        gate = torch.sigmoid(self.gate_net(feat))                       # (B,T,1)
 
-        # Rule-first: start from rule logits, add gated AR correction
-        ar_correction = gate * (ar_logits - rule_logits)
-        return rule_logits + ar_correction + bias
+        # Pure convex interpolation: gate=0 → rule_logits, gate=1 → ar_logits.
+        # No additive bias: ensures OOD starters always fall back to rule_logits.
+        return (1.0 - gate) * rule_logits + gate * ar_logits
 
 
 # ---------------------------------------------------------------------------

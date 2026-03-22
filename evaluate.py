@@ -281,8 +281,10 @@ def get_args():
                    help="Number of prompt tokens (default 1 = starting value only)")
     p.add_argument("--verbose",        action="store_true",
                    help="Print per-starter accuracy breakdown")
-    p.add_argument("--force_fallback", action="store_true",
-                   help="Use FallbackRuleModel even if tracr is available")
+    p.add_argument("--force_fallback", action="store_true", default=True,
+                   help="Use FallbackRuleModel (default True: TracrRuleModel requires T>=3 tokens "
+                        "but generation starts from T=1, so Tracr gives wrong rule_logits "
+                        "for the first two steps of every sequence)")
     return p.parse_args()
 
 
