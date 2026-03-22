@@ -16,6 +16,7 @@ import os
 import argparse
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -52,7 +53,7 @@ def train(args):
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,
-        adapter_hidden = args.adapter_hidden,
+        adapter_rank   = args.adapter_rank,
         force_fallback = args.force_fallback,
         device         = str(device),
     )
@@ -136,34 +137,53 @@ def train(args):
     print(f"\nSaved best adapter checkpoint → {os.path.join(args.ckpt_dir, 'adapter.pt')}")
     print(f"Best test accuracy on unseen starters: {best_test_acc:.4f}")
 
-    # --- Gate analysis: how much does the adapter trust the rule model? ---
-    _analyze_gate(model, test_loader, device)
+    # --- Attention analysis: what rule positions does each AR position attend to? ---
+    _analyze_attn(model, test_loader, device)
 
 
-def _analyze_gate(model, loader, device):
-    """Print mean gate values (0=trust AR, 1=trust rule) per cycle position."""
+def _analyze_attn(model, loader, device):
+    """Print mean cross-attention weights per (query cycle pos, key cycle pos) pair."""
     model.eval()
-    import torch.nn.functional as F
     import numpy as np
 
-    gates_by_pos = {0: [], 1: [], 2: []}
+    # Accumulate attention weights: attn_sum[q_cyc][k_cyc] += weight
+    n_cyc = 4
+    attn_sum   = [[0.0] * n_cyc for _ in range(n_cyc)]
+    attn_count = [[0]   * n_cyc for _ in range(n_cyc)]
+
     with torch.no_grad():
         for inp, _ in loader:
             inp = inp.to(device)
             ar_logits, ar_hidden = model.ar_model(inp, return_hidden=True)
             rule_logits = model.rule_model(inp)
-            # Match the feature construction in RuleAdapter.forward
-            feat = torch.cat([ar_hidden, ar_logits, rule_logits], dim=-1)
-            gate = torch.sigmoid(model.adapter.gate_net(feat)).squeeze(-1)  # (B, T)
-            T = inp.shape[1]
-            for t in range(T):
-                pos_in_cycle = (t + 1) % 3
-                gates_by_pos[pos_in_cycle].extend(gate[:, t].cpu().tolist())
 
-    print("\nMean adapter gate values per cycle position")
-    print("  (0 = fully trust AR,  1 = fully trust rule model)")
-    for pos, vals in sorted(gates_by_pos.items()):
-        print(f"  cycle pos {pos}: gate = {np.mean(vals):.4f} ± {np.std(vals):.4f}")
+            B, T, _ = ar_hidden.shape
+            Q = model.adapter.W_q(ar_hidden)
+            K = model.adapter.W_k(rule_logits)
+            scores = (Q @ K.transpose(-2, -1)) * model.adapter.scale
+            causal = torch.ones(T, T, device=inp.device).tril().bool()
+            scores = scores.masked_fill(~causal, float('-inf'))
+            attn   = F.softmax(scores, dim=-1)  # (B, T, T)
+
+            # Average over batch
+            attn_mean = attn.mean(0).cpu().numpy()  # (T, T)
+            for q in range(T):
+                for k in range(q + 1):            # only causal positions
+                    qc = q % n_cyc
+                    kc = k % n_cyc
+                    attn_sum[qc][kc]   += attn_mean[q, k]
+                    attn_count[qc][kc] += 1
+
+    print("\nMean cross-attention weight: row = query cycle pos, col = key cycle pos")
+    print("  (each row sums to ≤ 1; earlier cycles share weight with current)")
+    header = "       " + "  ".join(f"key={k}" for k in range(n_cyc))
+    print(header)
+    for q in range(n_cyc):
+        row = []
+        for k in range(n_cyc):
+            c = attn_count[q][k]
+            row.append(f"{attn_sum[q][k]/c:.3f}" if c > 0 else "  -  ")
+        print(f"  q={q}:  " + "  ".join(row))
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +199,8 @@ def get_args():
     p.add_argument("--d_model",            type=int,   default=128)
     p.add_argument("--n_layers",           type=int,   default=4)
     p.add_argument("--n_heads",            type=int,   default=4)
-    p.add_argument("--adapter_hidden",     type=int,   default=64)
+    p.add_argument("--adapter_rank",       type=int,   default=16,
+                   help="Low-rank bottleneck dimension for W_q/W_k/W_v/W_o")
     p.add_argument("--n_cycles",           type=int,   default=8)
     p.add_argument("--n_seqs_per_starter", type=int,   default=200)
     p.add_argument("--log_every",          type=int,   default=10)
