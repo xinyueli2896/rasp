@@ -3,9 +3,16 @@ Sequence dataset for the modulo rule:
   position i: (x + OFFSETS[i % 3]) % 12
 where OFFSETS = [0, 5, 7] and x is the starting integer.
 
-Train/test split is over *starting integers*:
-  train_starters  = {0..SPLIT_AT-1}
-  test_starters   = {SPLIT_AT..11}
+Starting-integer splits (vocab = 0-11):
+
+  Pretrain set A = {0,1,2,3,4,5}   – AR pretraining
+  Finetune set B = {2,3,4,5,6,7}   – fine-tuning (with or without rule alignment)
+
+Four-way evaluation partition:
+  Pretrain-only  (A \ B) = {0, 1}       – seen only during pretraining
+  Finetune-only  (B \ A) = {6, 7}       – seen only during fine-tuning
+  Both           (A ∩ B) = {2, 3, 4, 5} – seen in both stages
+  Neither                = {8, 9,10,11}  – never seen during any training
 """
 
 import numpy as np
@@ -15,20 +22,22 @@ from torch.utils.data import Dataset, DataLoader
 VOCAB_SIZE = 12
 OFFSETS = [0, 5, 7]          # rule offsets per cycle step
 
-# Three-way split:
-#   AR_TRAIN_STARTERS   – used for AR pretraining (AR will be perfect here)
-#   ADAPTER_TRAIN_STARTERS – used for adapter training (includes starters
-#                            the AR model has NOT seen → gives the adapter
-#                            a training signal to trust the rule model)
-#   TEST_STARTERS        – held out for evaluation (truly unseen)
-AR_TRAIN_STARTERS      = list(range(6))      # 0-5  → AR pretrained
-ADAPTER_TRAIN_STARTERS = list(range(8))      # 0-7  → adapter training
-                                             #   starters 6-7: AR wrong, rule right
-                                             #   starters 0-5: AR right, rule right
-TEST_STARTERS          = list(range(8, 12))  # 8-11 → test generalisation
+# Training splits
+AR_TRAIN_STARTERS      = list(range(6))         # 0-5  → AR pretrain (set A)
+FINETUNE_STARTERS      = list(range(2, 8))       # 2-7  → fine-tune set B
+                                                 #   {6,7}: AR wrong, rule right
+                                                 #   {2,3,4,5}: AR right, rule right
+TEST_STARTERS          = list(range(8, 12))      # 8-11 → never-seen test set
 
-# Backward-compat alias used by evaluation
-TRAIN_STARTERS = AR_TRAIN_STARTERS
+# Backward-compat aliases
+ADAPTER_TRAIN_STARTERS = FINETUNE_STARTERS
+TRAIN_STARTERS         = AR_TRAIN_STARTERS
+
+# Four evaluation categories
+EVAL_PRETRAIN_ONLY = [0, 1]            # A \ B : seen only in pretrain
+EVAL_FINETUNE_ONLY = [6, 7]            # B \ A : seen only in finetune
+EVAL_BOTH          = [2, 3, 4, 5]      # A ∩ B : seen in both stages
+EVAL_NEITHER       = [8, 9, 10, 11]    # complement: seen in neither
 
 
 def make_sequence(x: int, n_cycles: int) -> list[int]:
