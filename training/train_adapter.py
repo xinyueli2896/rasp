@@ -79,10 +79,8 @@ def train(args):
         for inp, tgt in train_loader:
             inp, tgt = inp.to(device), tgt.to(device)
 
-            # Get intermediate representations for the loss terms
-            ar_logits, ar_hidden = model.ar_model(inp, return_hidden=True)
-            rule_logits          = model.rule_model(inp)
-            logits               = model.adapter(ar_hidden, ar_logits, rule_logits)
+            rule_logits = model.rule_model(inp)
+            logits      = model(inp)
 
             # 1. Cross-entropy: predict the correct next token
             ce_loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
