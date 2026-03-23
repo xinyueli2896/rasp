@@ -1,12 +1,32 @@
 """
-PyTorch-compatible wrapper around the rule model (tracr or fallback).
+PyTorch-compatible wrapper around the rule model.
 
 RuleModelWrapper.forward(idx) behaves like the AR transformer:
   idx    : (B, T) long tensor  – input token IDs (0-11)
-  returns: (B, T, 12) float tensor  – logits (one-hot-like)
+  returns: (B, T, 12) float tensor  – one-hot logits, part of the autograd graph
 
-The underlying computation is the FallbackRuleModel / TracrRuleModel;
-numpy arrays are converted to/from torch as needed.
+Gradient design
+───────────────
+The rule model is "frozen" – it has no learnable parameters and its weights
+never change.  But its output IS part of the autograd computation graph:
+
+  rule_logits = rule_model(idx)   # requires_grad=True leaf tensor
+
+This means:
+  • ∂loss/∂rule_logits is computed during backward() and accumulates in
+    rule_logits.grad (useful for interpretability / gradient analysis).
+  • Gradient flows through rule_logits into the adapter's v_linear and
+    out_proj computations even though those layers are also frozen.
+
+Implementation: the forward is pure PyTorch (no numpy, no torch.no_grad),
+and the output tensor is detached from integer-arithmetic ops then marked
+requires_grad=True so it acts as a differentiable leaf.
+
+The rule
+────────
+Rule: at sequence position t, the predicted next token is
+      (x + OFFSETS[(t+1) % 4]) % 12
+where x = idx[:, 0] (starting integer) and OFFSETS = [0, 5, 7, 0].
 """
 
 from __future__ import annotations
@@ -14,58 +34,86 @@ from __future__ import annotations
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from rasp_program.sequence_rule import build_rule_model, FallbackRuleModel, VOCAB_SIZE
+from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
 
 
 class RuleModelWrapper(nn.Module):
     """
-    Frozen, non-trainable wrapper that exposes the rule model with a
-    standard nn.Module interface so it can sit next to the AR transformer.
+    Frozen rule model with autograd-compatible output.
 
-    No parameters – the rule is hard-coded / compiled.
+    The rule is implemented in pure PyTorch (no numpy / JAX).
+    Output tensor has requires_grad=True so it participates in the
+    autograd graph without requiring any trainable parameters.
+
+    parameters() returns empty – this module contributes no weights
+    to the optimizer.  The "frozen" constraint is enforced by having
+    nothing to update, not by disabling requires_grad on the output.
     """
 
     def __init__(self, max_seq_len: int = 128, force_fallback: bool = False):
         super().__init__()
-        self._rule_model = build_rule_model(max_seq_len=max_seq_len,
-                                            force_fallback=force_fallback)
-        # Mark as frozen (no parameters to train)
-        self._is_rule_model = True
+        # Register OFFSETS as a non-trainable buffer so it moves with the model
+        self.register_buffer(
+            "_offsets", torch.tensor(OFFSETS, dtype=torch.long)
+        )
 
-    @torch.no_grad()
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         """
         idx : (B, T) long tensor
-        Returns logits (B, T, 12) float tensor on the same device as idx.
+        Returns logits (B, T, VOCAB_SIZE) float tensor.
+
+        The returned tensor is a requires_grad=True leaf: it has no
+        connection to upstream computations (the rule is deterministic),
+        but gradients will accumulate in .grad during backward().
+        Call retain_grad() on the result before backward() if you need
+        to inspect rule_logits.grad.
         """
+        B, T   = idx.shape
         device = idx.device
-        tokens_np = idx.cpu().numpy().astype(np.int32)
-        logits_np = self._rule_model.get_logits_vectorized(tokens_np) \
-                    if isinstance(self._rule_model, FallbackRuleModel) \
-                    else self._rule_model.get_logits(tokens_np)
-        return torch.from_numpy(logits_np).to(device)
+
+        # next_token[b, t] = (x[b] + OFFSETS[(t+1) % 4]) % VOCAB_SIZE
+        t      = torch.arange(T, device=device)
+        o      = self._offsets[(t + 1) % len(self._offsets)]  # (T,) offsets
+        x      = idx[:, 0]                                     # (B,) starters
+        next_t = (x[:, None] + o[None, :]) % VOCAB_SIZE        # (B, T) long
+
+        logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()  # (B, T, V)
+
+        # Detach from integer arithmetic (which has no grad), then mark as a
+        # requires_grad leaf so the tensor participates in the autograd graph.
+        return logits.detach().requires_grad_(True)
 
     def parameters(self, recurse=True):
-        # No parameters; return empty iterator
-        return iter([])
+        return iter([])   # no trainable parameters; excluded from optimizer
 
     def named_parameters(self, prefix="", recurse=True):
         return iter([])
 
 
 if __name__ == "__main__":
-    model = RuleModelWrapper(force_fallback=True)
-    # x=0: sequence = 0,5,7,0,5,7,...
-    inp = torch.tensor([[0, 5, 7, 0, 5, 7, 0]], dtype=torch.long)
+    model = RuleModelWrapper()
+    # x=0: period-4 sequence = 0, 5, 7, 0, 0, 5, 7, 0, ...
+    # next-token predictions:   5, 7, 0, 0, 5, 7, 0
+    inp = torch.tensor([[0, 5, 7, 0, 0, 5, 7]], dtype=torch.long)
     logits = model(inp)
-    print("logits shape:", logits.shape)
+    print("logits shape    :", logits.shape)
+    print("requires_grad   :", logits.requires_grad)
+    print("grad_fn         :", logits.grad_fn, " (None = leaf tensor, grad in .grad)")
     preds = logits.argmax(-1)
-    print("predictions :", preds.tolist())
-    # At position t, predicted next = (0 + OFFSETS[(t+1)%3]) % 12
-    expected = [5, 7, 0, 5, 7, 0, 5]
-    print("expected    :", expected)
-    print("correct     :", preds[0].tolist() == expected)
+    print("predictions     :", preds.tolist())
+    expected = [[5, 7, 0, 0, 5, 7, 0]]
+    print("expected        :", expected)
+    print("correct         :", preds.tolist() == expected)
+
+    # Verify gradient flows from downstream computation back to rule_logits
+    dummy_weight = torch.randn(VOCAB_SIZE, VOCAB_SIZE, requires_grad=True)
+    loss = (logits @ dummy_weight).sum()
+    loss.backward()
+    print("\nGradient test:")
+    print("  ∂loss/∂dummy_weight computed:", dummy_weight.grad is not None)
+    # Leaf tensors with requires_grad=True accumulate .grad automatically
+    print("  rule_logits.grad shape:", logits.grad.shape)
