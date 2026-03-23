@@ -72,9 +72,12 @@ class RuleModelWrapper(nn.Module):
             "_offsets", torch.tensor(OFFSETS, dtype=torch.long)
         )
         # Rule model's own token embeddings — independent of AR model.
-        # Initialized as a random matrix; fixed for the lifetime of the model.
-        # Saved in state_dict so oracle init is consistent across checkpoints.
-        rule_emb = torch.randn(VOCAB_SIZE, rule_d_model)
+        # Deterministic (fixed seed) so the same matrix is produced on every
+        # construction with the same rule_d_model, keeping oracle init consistent
+        # across training and evaluation without requiring a separate checkpoint.
+        gen = torch.Generator()
+        gen.manual_seed(42 + rule_d_model)
+        rule_emb = torch.randn(VOCAB_SIZE, rule_d_model, generator=gen)
         self.register_buffer("rule_tok_emb", rule_emb)
 
     def forward(self, idx: torch.Tensor,

@@ -152,14 +152,10 @@ def _analyze_attn(model, loader, device):
     with torch.no_grad():
         for inp, _ in loader:
             inp = inp.to(device)
-            ar_logits, ar_hidden = model.ar_model(inp, return_hidden=True)
+            ar_logits, ar_hidden         = model.ar_model(inp, return_hidden=True)
+            _,         rule_hidden       = model.rule_model(inp, return_hidden=True)
 
             B, T, _ = ar_hidden.shape
-            # rule_hidden: RASP attention output (tok_emb of predicted next token)
-            t_idx_a   = torch.arange(T, device=inp.device)
-            src_pos   = (t_idx_a + 1) % adapter.cycle_length
-            rule_hidden = model.ar_model.tok_emb(inp)[:, src_pos, :]
-
             Q = adapter.q_linear(ar_hidden)    # (B, T, embed_dim)
             K = adapter.k_linear(rule_hidden)  # (B, T, embed_dim)
 
