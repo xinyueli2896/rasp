@@ -5,12 +5,12 @@ Architecture overview
 ─────────────────────
                 ┌─────────────────────────┐
   tokens ──────►│ AR Transformer (frozen)  │──► ar_hidden  (B,T,d_model)
-                │                          │──► ar_logits  (B,T,12)
+                │                          │──► ar_logits  (B,T,vocab_size)
                 └─────────────────────────┘
                                                       │  Q = q_linear(ar_hidden)
                 ┌─────────────────────────┐           │
-  tokens ──────►│ RASP attention (frozen) │──► rule_hidden (B,T,d_model)
-                │  tok_emb[(t+1)%cycle]   │           │  K = k_linear(rule_hidden)
+  tokens ──────►│ Rule model (frozen)     │──► rule_hidden (B,T,rule_d_model)
+                │  rule_tok_emb[next_tok] │           │  K = k_linear(rule_hidden)
                 └─────────────────────────┘           │  V = v_linear(rule_hidden)
                                                       ▼
                                         ┌─────────────────────────┐
@@ -22,7 +22,7 @@ Architecture overview
                                         │  attn = softmax(scores  │
                                         │          + causal mask) │
                                         │  out = attn @ V         │
-                                        │  h_rule = out_proj(out) │  ← hidden space
+                                        │  h_rule = out_proj(out) │  ← AR hidden space
                                         └─────────────────────────┘
                                                       │
                                            + ar_proj(ar_logits)   ← direct AR correction
@@ -32,44 +32,40 @@ Architecture overview
                                                       │
                                               lm_head (frozen)
                                                       │
-                                              final_logits (B,T,12)
+                                              final_logits (B,T,vocab_size)
 
-rule_hidden: RASP hidden state
-───────────────────────────────
-rule_hidden is extracted by running the RASP/tracr attention operation directly
-in the AR model's embedding space:
+rule_hidden: rule model's private hidden state
+──────────────────────────────────────────────
+rule_hidden is taken directly from the rule model's own embedding table:
 
-    rule_hidden[b, t] = tok_emb.weight[tokens[b, (t+1) % cycle_length]]
+    rule_hidden[b, t] = rule_tok_emb[predicted_next[b, t]]
 
-This is the token embedding of the predicted next token — the actual output of the
-RASP attention head applied to the frozen AR model's token embedding matrix.
-
-It is constant per (cycle-position, starter) pair, so causal aggregation over
-same-cycle positions is exact.
+rule_tok_emb lives in rule_d_model-dimensional space, which is independent
+of the AR model's d_model and vocabulary.  k_linear and v_linear project from
+rule_d_model into the adapter's embed_dim.
 
 Oracle SVD initialisation (init_from_lmhead)
 ─────────────────────────────────────────────
-W_E = lm_head.weight  shape (vocab_size, d_model) = (12, 128)
-rule_hidden[t] = W_E[predicted_next[t]]  (one row of W_E)
+W_E : (vocab_size, d_model)     – AR lm_head.weight
+R_E : (vocab_size, rule_d_model) – rule model's rule_tok_emb
 
-We need: lm_head(ar_hidden + gates·h) = rule_logits
-  ⟹  ar_logits + W_E · h = rule_logits
-  ⟹  W_E · (out_proj · v_linear · rule_hidden + ar_proj · ar_logits)
-        = rule_logits − ar_logits
+Goal: W_E @ out_proj.weight @ v_linear.weight @ R_E.T = I_vocab
+i.e.  W_E @ M @ R_E.T = I   where M = out_proj.weight @ v_linear.weight
 
-Two-path solution:
-  (A) out_proj · v_linear: maps rule_hidden → hidden correction
-       Condition: W_E @ out_proj.weight @ v_linear.weight @ W_E[c] = e_c  ∀c
-       i.e.  W_E @ M @ W_E.T = I_vocab  where M = out_proj.weight @ v_linear.weight
+Solution:  M = W_E⁺ @ (R_E.T)⁺  (pseudoinverses)
+  Proof: W_E @ M @ R_E.T = (W_E @ W_E⁺) @ ((R_E.T)⁺ @ R_E.T)
+                          = I @ I = I  ✓   (holds when both have full row rank)
 
-  (B) ar_proj: direct path for −ar_logits
-       ar_proj.weight = −W_E⁺ = −W_E.T @ (W_E @ W_E.T)⁻¹
+M has shape (d_model × rule_d_model).  Factorised through bottleneck via SVD of M:
+  M = U_M S_M Vh_M
+  out_proj.weight[:, :r] = U_M[:, :r] * sqrt(S_M[:r])   (d_model  × embed_dim)
+  v_linear.weight[:r, :] = sqrt(S_M[:r]) * Vh_M[:r, :]  (embed_dim × rule_d_model)
 
-SVD of W_E = U S Vhᵀ  (U: 12×12 orthogonal, S: 12, Vh: 12×128)
-  M = Vhᵀ diag(S⁻²) Vh  satisfies  W_E M W_E.T = I  (since U square orthogonal)
-  Factorised through bottleneck (r = min(embed_dim, vocab_size) = 12):
-    v_linear.weight[:r, :]  = S_inv[:,None] * Vh[:r, :]   (embed_dim × d_model)
-    out_proj.weight[:, :r]  = Vh[:r,:].T * S_inv[None,:]  (d_model  × embed_dim)
+ar_proj: direct path for −ar_logits
+  ar_proj.weight = −W_E⁺ = −W_E.T @ (W_E @ W_E.T)⁻¹
+
+Note: when R_E = W_E (shared vocab, old behaviour), M = W_E⁺ @ (W_E.T)⁺ = Vh.T S⁻² Vh,
+which exactly matches the previous SVD init.
 
 Cycle-position bias
 ───────────────────
@@ -77,10 +73,10 @@ A learnable 4×4 bias matrix cycle_bias[c_q, c_k] (c = t % 4) is added to
 the raw attention scores.  Diagonal init (+4) primes same-cycle attention
 from step 0, preventing the flat-landscape problem with uniform attention.
 
-Parameter count (d=128, embed_dim=32, n_heads=4, vocab=12, cycle_length=4):
+Parameter count (d_model=128, rule_d_model=128, embed_dim=32, n_heads=4, vocab=12, cycle=4):
   q_linear:  128×32 + 32  = 4,128
-  k_linear:  128×32 + 32  = 4,128   ← d_model input (rule_hidden)
-  v_linear:  128×32 + 32  = 4,128   ← d_model input (rule_hidden)
+  k_linear:  128×32 + 32  = 4,128   ← rule_d_model input
+  v_linear:  128×32 + 32  = 4,128   ← rule_d_model input
   out_proj:   32×128 + 128 = 4,224
   ar_proj:    12×128       = 1,536   (no bias, frozen)
   cycle_bias: 4×4          =    16
@@ -111,18 +107,19 @@ class LowRankCrossAttentionAdapter(nn.Module):
     Multi-head low-rank cross-attention adapter operating in hidden space.
 
     Queries come from AR hidden states; keys and values come from rule_hidden,
-    the RASP hidden state (token embedding of predicted next token at each
-    position, extracted by the RASP lookup attention in PatchedModel.forward).
+    the rule model's private hidden state (rule_tok_emb[predicted_next_token]).
+    rule_hidden lives in rule_d_model space, which is independent of d_model.
     The attended output is projected to d_model space and added as a residual
     to ar_hidden.
 
-    Call init_from_lmhead(lm_head_weight) after construction to set up the
+    Call init_from_lmhead(W_E, R_E) after construction to set up the
     SVD oracle initialisation that gives exact rule predictions at step 0.
 
     Parameters
     ----------
     d_model      : int – AR transformer hidden size
-    vocab_size   : int – vocabulary size (12)
+    rule_d_model : int – rule model hidden size (rule_tok_emb dimension)
+    vocab_size   : int – AR vocabulary size (12)
     embed_dim    : int – low-rank attention dimension (divisible by n_heads)
     n_heads      : int – number of attention heads
     cycle_length : int – period of the sequence rule (4)
@@ -131,6 +128,7 @@ class LowRankCrossAttentionAdapter(nn.Module):
     def __init__(
         self,
         d_model:      int = 128,
+        rule_d_model: int = 128,
         vocab_size:   int = 12,
         embed_dim:    int = 32,
         n_heads:      int = 4,
@@ -144,10 +142,10 @@ class LowRankCrossAttentionAdapter(nn.Module):
         self.embed_dim    = embed_dim
         self.cycle_length = cycle_length
 
-        self.q_linear  = nn.Linear(d_model,   embed_dim, bias=True)
-        self.k_linear  = nn.Linear(d_model,   embed_dim, bias=True)   # input: rule_hidden
-        self.v_linear  = nn.Linear(d_model,   embed_dim, bias=True)   # input: rule_hidden
-        self.out_proj  = nn.Linear(embed_dim, d_model,   bias=True)   # output: hidden space
+        self.q_linear  = nn.Linear(d_model,      embed_dim, bias=True)
+        self.k_linear  = nn.Linear(rule_d_model, embed_dim, bias=True)  # input: rule_hidden
+        self.v_linear  = nn.Linear(rule_d_model, embed_dim, bias=True)  # input: rule_hidden
+        self.out_proj  = nn.Linear(embed_dim,    d_model,   bias=True)  # output: AR hidden space
         # Direct AR correction: frozen linear that maps ar_logits → hidden space
         # Initialized to -W_E^+ so it cancels the ar_logits component.
         self.ar_proj   = nn.Linear(vocab_size, d_model,  bias=False)
@@ -170,48 +168,48 @@ class LowRankCrossAttentionAdapter(nn.Module):
             self.cycle_bias.fill_diagonal_(4.0)
 
     @torch.no_grad()
-    def init_from_lmhead(self, W_E: torch.Tensor):
+    def init_from_lmhead(self, W_E: torch.Tensor, R_E: torch.Tensor):
         """
         Set v_linear, out_proj, and ar_proj for oracle behaviour at step 0.
 
-        W_E : (vocab_size, d_model) – lm_head.weight from the frozen AR model.
+        W_E : (vocab_size, d_model)      – AR lm_head.weight
+        R_E : (vocab_size, rule_d_model) – rule model's rule_tok_emb
 
-        Two-path oracle for rule_hidden inputs:
-          h = out_proj(attn @ v_linear(rule_hidden)) + ar_proj(ar_logits)
+        Goal: W_E @ out_proj.weight @ v_linear.weight @ R_E.T = I_vocab
+              i.e. W_E @ M @ R_E.T = I,  M = out_proj.weight @ v_linear.weight
 
-          rule_hidden[t] = W_E[predicted_next[t]]   (one row of W_E)
+        Solution: M = W_E⁺ @ (R_E.T)⁺  (pseudoinverses)
+          Proof: W_E @ M @ R_E.T = (W_E @ W_E⁺) @ ((R_E.T)⁺ @ R_E.T) = I ✓
+          (holds when W_E and R_E both have full row rank, true for vocab_size ≤ d_model
+           and vocab_size ≤ rule_d_model with random R_E a.s.)
 
-          Condition: W_E @ out_proj.weight @ v_linear.weight @ W_E[c] = e_c  ∀c
-          i.e.  W_E @ M @ W_E.T = I_vocab  (12×12 identity)
+        M is factorised through the embed_dim bottleneck via SVD of M:
+          M = U_M S_M Vh_M
+          out_proj.weight[:, :r] = U_M[:, :r] * sqrt(S_M[:r])
+          v_linear.weight[:r, :] = sqrt(S_M[:r]) * Vh_M[:r, :]
 
-          SVD  W_E = U S Vhᵀ  (U: 12×12 orthogonal, S: 12, Vh: 12×128)
-          Solution:  M = Vhᵀ diag(S⁻²) Vh
-          Factorised:
-            v_linear.weight[:r, :]  = S_inv[:,None] * Vh[:r,:]   (embed_dim × d_model)
-            out_proj.weight[:, :r]  = Vh[:r,:].T * S_inv[None,:] (d_model  × embed_dim)
-          Proof: W_E @ M @ W_E.T = U S Vh @ Vhᵀ S⁻² Vh @ Vhᵀ Sᵀ Uᵀ = U U.T = I ✓
-
-          ar_proj.weight = -W_E⁺ = -W_E.T @ (W_E @ W_E.T)⁻¹  cancels ar_logits.
+        ar_proj.weight = -W_E⁺ cancels the ar_logits component.
         """
-        vocab_size, d_model = W_E.shape
-        r = min(self.embed_dim, vocab_size)
+        r = min(self.embed_dim, W_E.shape[0])
 
-        # Thin SVD of W_E  →  U (vocab×vocab), S (vocab,), Vh (vocab×d_model)
-        U, S, Vh = torch.linalg.svd(W_E, full_matrices=False)
-        S_inv = 1.0 / S[:r]
+        W_E_pinv = torch.linalg.pinv(W_E)    # (d_model,      vocab_size)
+        R_E_T_pinv = torch.linalg.pinv(R_E.T)  # (vocab_size, rule_d_model)
+        M = W_E_pinv @ R_E_T_pinv            # (d_model, rule_d_model)
 
-        # Factorize M = Vhᵀ diag(S⁻²) Vh through embed_dim bottleneck
-        self.v_linear.weight.zero_()
-        self.v_linear.weight[:r, :] = S_inv[:, None] * Vh[:r, :]   # (embed_dim, d_model)
+        # Rank-r factorization of M via SVD
+        U_M, S_M, Vh_M = torch.linalg.svd(M, full_matrices=False)
+        S_sqrt = S_M[:r].sqrt()
 
         self.out_proj.weight.zero_()
-        self.out_proj.weight[:, :r] = Vh[:r, :].T * S_inv[None, :] # (d_model, embed_dim)
+        self.out_proj.weight[:, :r] = U_M[:, :r] * S_sqrt[None, :]    # (d_model, embed_dim)
+
+        self.v_linear.weight.zero_()
+        self.v_linear.weight[:r, :] = S_sqrt[:, None] * Vh_M[:r, :]   # (embed_dim, rule_d_model)
 
         self.v_linear.bias.zero_()
         self.out_proj.bias.zero_()
 
-        # ar_proj: -W_E⁺ = -W_E.T @ (W_E @ W_E.T)⁻¹   shape (d_model, vocab_size)
-        W_E_pinv = W_E.T @ torch.linalg.inv(W_E @ W_E.T)
+        # ar_proj: -W_E⁺  shape (d_model, vocab_size)
         self.ar_proj.weight.copy_(-W_E_pinv)
 
         # gates=1: full oracle correction from step 0
@@ -266,11 +264,12 @@ class PatchedModel(nn.Module):
     trainable cross-attention adapter.
 
     Forward pass:
-      1. ar_hidden, ar_logits = AR transformer            (frozen)
-      2. rule_logits           = rule model               (frozen, for ar_proj)
-      3. rule_hidden           = rule_logits @ lm_head.weight  (RASP hidden state, frozen)
-      4. modified_hidden = adapter(ar_hidden, ar_logits, rule_hidden)  (trainable)
-      5. final_logits    = lm_head(modified_hidden)       (frozen)
+      1. ar_logits, ar_hidden = AR transformer                  (frozen)
+      2. rule_logits, rule_hidden = rule model                  (frozen)
+         rule_hidden comes from rule_model.rule_tok_emb — the rule model's
+         own private embedding space, independent of the AR vocabulary.
+      3. modified_hidden = adapter(ar_hidden, ar_logits, rule_hidden)  (trainable)
+      4. final_logits    = lm_head(modified_hidden)              (frozen)
     """
 
     def __init__(
@@ -287,11 +286,14 @@ class PatchedModel(nn.Module):
         for p in self.ar_model.parameters():
             p.requires_grad_(False)
 
-        # Oracle init: set v_linear/out_proj using the frozen lm_head weights.
+        # Oracle init: set v_linear/out_proj using AR lm_head and rule embedding.
         # Zero out q_linear and k_linear so Q·K = 0 for all (query, key) pairs;
         # attention is then determined solely by cycle_bias (generalises perfectly).
         # Freeze all four projections — only cycle_bias (16) and gates (1) train.
-        self.adapter.init_from_lmhead(self.ar_model.lm_head.weight.detach())
+        self.adapter.init_from_lmhead(
+            self.ar_model.lm_head.weight.detach(),
+            self.rule_model.rule_tok_emb.detach(),
+        )
         with torch.no_grad():
             self.adapter.q_linear.weight.zero_()
             self.adapter.q_linear.bias.zero_()
@@ -302,18 +304,13 @@ class PatchedModel(nn.Module):
                 p.requires_grad_(False)
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        ar_logits, ar_hidden = self.ar_model(idx, return_hidden=True)   # frozen
-        rule_logits          = self.rule_model(idx)                      # frozen (for ar_proj)
+        ar_logits, ar_hidden         = self.ar_model(idx, return_hidden=True)   # frozen
+        rule_logits, rule_hidden     = self.rule_model(idx, return_hidden=True) # frozen
 
-        # rule_hidden: token embedding of the rule's predicted next token — the hidden
-        # state the RASP/tracr compiled transformer produces after its lookup attention.
-        # For one-hot rule_logits at token c: rule_hidden = lm_head.weight[c].
-        # This equals tok_emb[tokens[(t+1)%cycle]] on correct sequences but works
-        # for any sequence length (including prompts shorter than cycle_length).
-        rule_hidden = rule_logits.float() @ self.ar_model.lm_head.weight  # (B, T, d_model)
-
+        # rule_hidden (B, T, rule_d_model): rule model's private embedding of its
+        # predicted next token — independent of the AR model's vocabulary and lm_head.
         modified_hidden = self.adapter(ar_hidden, ar_logits, rule_hidden)
-        return self.ar_model.lm_head(modified_hidden)                   # frozen
+        return self.ar_model.lm_head(modified_hidden)                           # frozen
 
     def trainable_parameters(self):
         return self.adapter.parameters()
@@ -339,6 +336,7 @@ def build_patched_model(
     ar_ckpt_path:   str | None = None,
     max_seq_len:    int = 128,
     d_model:        int = 128,
+    rule_d_model:   int = 128,
     n_layers:       int = 4,
     n_heads:        int = 4,
     adapter_rank:   int = 32,
@@ -357,9 +355,10 @@ def build_patched_model(
         print(f"[PatchedModel] Loaded AR weights from {ar_ckpt_path}")
 
     rule_model = RuleModelWrapper(max_seq_len=max_seq_len,
+                                  rule_d_model=rule_d_model,
                                   force_fallback=force_fallback).to(device)
     adapter    = LowRankCrossAttentionAdapter(
-                     d_model=d_model, vocab_size=12,
+                     d_model=d_model, rule_d_model=rule_d_model, vocab_size=12,
                      embed_dim=adapter_rank, n_heads=4,
                      cycle_length=cycle_length).to(device)
 
@@ -381,13 +380,11 @@ if __name__ == "__main__":
     print("predictions   :", out.argmax(-1).tolist())
     print("expected      : [[7, 9, 2, 2, 7, 9, 2, 2]]")
 
-    # Verify RASP hidden extraction: rule_logits @ W_E == tok_emb[predicted_next]
-    rule_logits = model.rule_model(x)
-    rule_hidden_matmul = rule_logits.float() @ model.ar_model.lm_head.weight
-    B, T = x.shape
-    t_idx = torch.arange(T)
-    src   = (t_idx + 1) % model.adapter.cycle_length
-    rule_hidden_gather = model.ar_model.tok_emb(x)[:, src, :]
-    print("rule_hidden shape:", rule_hidden_matmul.shape)
-    print("matmul == gather (equiv on correct sequences):",
-          torch.allclose(rule_hidden_matmul, rule_hidden_gather, atol=1e-5))
+    # Verify rule hidden extraction: rule_hidden == rule_tok_emb[predicted_next]
+    rule_logits, rule_hidden = model.rule_model(x, return_hidden=True)
+    # predicted next tokens for x=2, T=8: (2 + OFFSETS[(t+1)%4]) % 12
+    next_t = rule_logits[0].argmax(-1)  # ground-truth predictions
+    rule_hidden_ref = model.rule_model.rule_tok_emb[next_t]
+    print("rule_hidden shape:", rule_hidden.shape)
+    print("hidden matches rule_tok_emb lookup:",
+          torch.allclose(rule_hidden[0], rule_hidden_ref, atol=1e-6))
