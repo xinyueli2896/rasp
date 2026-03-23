@@ -142,12 +142,12 @@ def train(args):
 
 
 def _analyze_attn(model, loader, device):
-    """Print mean cross-attention weights per (query cycle pos, key cycle pos) pair."""
+    """Print mean cross-attention weights per (query cycle pos, key cycle pos) pair.
+    Averages over all heads and batch items."""
     model.eval()
-    import numpy as np
 
-    # Accumulate attention weights: attn_sum[q_cyc][k_cyc] += weight
-    n_cyc = 4
+    n_cyc  = 4
+    adapter = model.adapter
     attn_sum   = [[0.0] * n_cyc for _ in range(n_cyc)]
     attn_count = [[0]   * n_cyc for _ in range(n_cyc)]
 
@@ -158,23 +158,35 @@ def _analyze_attn(model, loader, device):
             rule_logits = model.rule_model(inp)
 
             B, T, _ = ar_hidden.shape
-            Q = model.adapter.W_q(ar_hidden)
-            K = model.adapter.W_k(rule_logits)
-            scores = (Q @ K.transpose(-2, -1)) * model.adapter.scale
+            Q = adapter.q_linear(ar_hidden)    # (B, T, embed_dim)
+            K = adapter.k_linear(rule_logits)  # (B, T, embed_dim)
+
+            # Multi-head reshape
+            Q = Q.view(B, T, adapter.n_heads, adapter.head_dim).transpose(1, 2)
+            K = K.view(B, T, adapter.n_heads, adapter.head_dim).transpose(1, 2)
+
+            scores = (Q @ K.transpose(-2, -1)) * adapter.scale  # (B, H, T, T)
+
+            t_idx = torch.arange(T, device=inp.device)
+            bias  = adapter.cycle_bias[t_idx[:, None] % adapter.cycle_length,
+                                       t_idx[None, :] % adapter.cycle_length]
+            scores = scores + bias.unsqueeze(0).unsqueeze(0)
+
             causal = torch.ones(T, T, device=inp.device).tril().bool()
             scores = scores.masked_fill(~causal, float('-inf'))
-            attn   = F.softmax(scores, dim=-1)  # (B, T, T)
+            attn   = F.softmax(scores, dim=-1)           # (B, H, T, T)
 
-            # Average over batch
-            attn_mean = attn.mean(0).cpu().numpy()  # (T, T)
+            # Average over batch and heads → (T, T)
+            attn_mean = attn.mean(dim=(0, 1)).cpu().numpy()
             for q in range(T):
-                for k in range(q + 1):            # only causal positions
+                for k in range(q + 1):
                     qc = q % n_cyc
                     kc = k % n_cyc
                     attn_sum[qc][kc]   += attn_mean[q, k]
                     attn_count[qc][kc] += 1
 
-    print("\nMean cross-attention weight: row = query cycle pos, col = key cycle pos")
+    print(f"\nMean cross-attention (avg over {adapter.n_heads} heads): "
+          f"row=query cycle, col=key cycle")
     print("  (each row sums to ≤ 1; earlier cycles share weight with current)")
     header = "       " + "  ".join(f"key={k}" for k in range(n_cyc))
     print(header)
@@ -184,6 +196,8 @@ def _analyze_attn(model, loader, device):
             c = attn_count[q][k]
             row.append(f"{attn_sum[q][k]/c:.3f}" if c > 0 else "  -  ")
         print(f"  q={q}:  " + "  ".join(row))
+
+    print(f"\nAdapter gates value: {adapter.gates.item():.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -199,8 +213,8 @@ def get_args():
     p.add_argument("--d_model",            type=int,   default=128)
     p.add_argument("--n_layers",           type=int,   default=4)
     p.add_argument("--n_heads",            type=int,   default=4)
-    p.add_argument("--adapter_rank",       type=int,   default=16,
-                   help="Low-rank bottleneck dimension for W_q/W_k/W_v/W_o")
+    p.add_argument("--adapter_rank",       type=int,   default=32,
+                   help="embed_dim for low-rank adapter (divisible by 4 heads)")
     p.add_argument("--n_cycles",           type=int,   default=8)
     p.add_argument("--n_seqs_per_starter", type=int,   default=200)
     p.add_argument("--log_every",          type=int,   default=10)

@@ -2,64 +2,63 @@
 Low-rank cross-attention adapter that patches the rule model onto the frozen
 AR transformer.
 
-Architecture overview
-─────────────────────
+Architecture overview (inspired by midi_yinyang LowRankMultiheadAttention)
+───────────────────────────────────────────────────────────────────────────
                 ┌─────────────────────────┐
   tokens ──────►│ AR Transformer (frozen)  │──► ar_hidden  (B,T,d_model)
                 │                          │──► ar_logits  (B,T,12)
                 └─────────────────────────┘
                                                       │
-                ┌─────────────────────────┐           │  Q = W_q(ar_hidden)
+                ┌─────────────────────────┐           │  Q = q_linear(ar_hidden)
   tokens ──────►│ Rule Model    (frozen)  │──► rule_logits (B,T,12)
-                └─────────────────────────┘           │  K = W_k(rule_logits)
-                                                      │  V = rule_logits  (no W_v)
+                └─────────────────────────┘           │  K = k_linear(rule_logits)
+                                                      │  V = v_linear(rule_logits)
                                                       ▼
                                         ┌─────────────────────────┐
-                                        │  Cross-Attention        │
+                                        │  Multi-Head Cross-Attn  │
                                         │  (trainable, low-rank)  │
                                         │                         │
-                                        │  scores = Q Kᵀ/√r       │
+                                        │  scores = QKᵀ/√head_dim │
                                         │        + cycle_bias     │
                                         │  attn = softmax(scores  │
                                         │          + causal mask) │
-                                        │  attended = attn @ V    │
+                                        │  out = attn @ V         │
+                                        │  delta = out_proj(out)  │
                                         └─────────────────────────┘
                                                       │
-                                 ar_logits + α · attended
+                                 ar_logits + gates · delta
                                                       │
                                               final_logits (B,T,12)
 
-The adapter works entirely in *logit space*:
-  - Values are rule_logits directly (already in vocab space; no W_v needed)
-  - The cross-attention produces an attention-weighted mixture of rule logits
-  - A learnable scalar α blends this into ar_logits
-
-"Low-rank" refers to the Q and K projection dimension (rank ≪ d_model).
+Design follows midi_yinyang (music-x-lab/midi_yinyang):
+  • Separate W_v projection + out_proj (more expressive than V=rule_logits)
+  • Multi-head attention (n_heads heads, each of dimension embed_dim//n_heads)
+  • gates: scalar Parameter init=0, grows from zero — safe init that avoids
+    polluting AR predictions at the start; bootstraps once out_proj(attn@V) ≠ 0
 
 Cycle-position bias (key design decision)
 ─────────────────────────────────────────
-With purely content-based attention (random W_q, W_k init), the attention
+With purely content-based attention (random W_q/W_k init), the attention
 starts approximately uniform and remains so — the optimisation landscape is
-flat because mean(rule_logits) ≈ uniform over vocab, making attended ≈ 1/12
-everywhere regardless of weights.
+flat because mean(rule_logits) ≈ uniform over vocab.
 
 The fix: a learnable 4×4 cycle-position bias matrix cycle_bias[c_q, c_k]
 (where c_q = t%4 and c_k = s%4) is added to the raw attention scores.
-Initialised strongly diagonal (bias=+4 on diagonal), it primes the attention
-to attend to same-cycle positions at step 0:
+Initialised strongly diagonal (bias=+4 on diagonal), it primes attention
+to attend to same-cycle positions from step 0:
 
   attended[t] ≈ mean(rule_logits[s] for s where s%4==t%4)
-             = rule_logits[t]   (since same-cycle rule logits are identical)
+             = rule_logits[t]   (same-cycle rule logits are identical)
 
-This means the untrained adapter already approximates:
-  logits ≈ ar_logits + α · rule_logits[t]
-
-which is the correct oracle blend. W_q and W_k then refine the content-based
-component (e.g. adapting to unseen x values), while cycle_bias can also shift
-if non-diagonal patterns turn out to be better.
-
-Parameter count (d=128, r=16, cycle_length=4):
-  W_q: d×r = 2048,  W_k: 12×r = 192,  cycle_bias: 16,  α: 1  →  2,257 total
+Parameter count (d=128, embed_dim=32, n_heads=4, vocab=12, cycle_length=4):
+  q_linear:  128×32 + 32  = 4,128
+  k_linear:   12×32 + 32  =   416
+  v_linear:   12×32 + 32  =   416
+  out_proj:   32×12 + 12  =   396
+  cycle_bias: 4×4         =    16
+  gates:      1            =     1
+  ─────────────────────────────────
+  Total:                     5,373
 """
 
 from __future__ import annotations
@@ -81,89 +80,148 @@ from models.rule_model   import RuleModelWrapper
 
 class LowRankCrossAttentionAdapter(nn.Module):
     """
-    Low-rank cross-attention adapter operating in logit space.
+    Multi-head low-rank cross-attention adapter (yinyang-style).
 
-    Queries from AR hidden state; keys and values from rule logits.
-    The attended output (a mixture of rule one-hot logits) is added to
-    ar_logits scaled by a learnable scalar α.
+    Queries come from AR hidden states; keys and values come from rule logits.
+    The attended output is projected to logit space and gated by a learnable
+    scalar `gates` (init=0, grows from zero during training).
 
     Parameters
     ----------
-    d_model   : int – AR transformer hidden size (query input dimension)
+    d_model    : int – AR transformer hidden size (query input dimension)
     vocab_size : int – vocabulary size = rule output dimension (12)
-    rank      : int – low-rank bottleneck for Q and K projections
+    embed_dim  : int – low-rank attention dimension (must be divisible by n_heads)
+    n_heads    : int – number of attention heads
+    cycle_length : int – period of the sequence rule (4)
     """
 
     def __init__(
         self,
         d_model:      int = 128,
         vocab_size:   int = 12,
-        rank:         int = 16,
-        cycle_length: int = 4,     # period of the sequence rule
+        embed_dim:    int = 32,
+        n_heads:      int = 4,
+        cycle_length: int = 4,
     ):
         super().__init__()
-        self.rank         = rank
-        self.scale        = rank ** -0.5
+        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
+        self.n_heads      = n_heads
+        self.head_dim     = embed_dim // n_heads
+        self.scale        = self.head_dim ** -0.5
+        self.embed_dim    = embed_dim
         self.cycle_length = cycle_length
 
-        self.W_q = nn.Linear(d_model,    rank, bias=False)   # AR hidden   → queries
-        self.W_k = nn.Linear(vocab_size, rank, bias=False)   # rule logits → keys
-        # No W_v: values ARE rule_logits (already in vocab/logit space)
+        # Low-rank projections (yinyang design: separate Q, K, V, out_proj)
+        self.q_linear  = nn.Linear(d_model,    embed_dim, bias=True)
+        self.k_linear  = nn.Linear(vocab_size, embed_dim, bias=True)
+        self.v_linear  = nn.Linear(vocab_size, embed_dim, bias=True)
+        self.out_proj  = nn.Linear(embed_dim,  vocab_size, bias=True)
 
-        # cycle_bias[c_q, c_k]: learnable bias added to attention scores
-        # when query is at cycle position c_q and key is at cycle position c_k.
-        # Initialised strongly diagonal so same-cycle positions attend to each
-        # other at step 0, giving attended[t] ≈ rule_logits[t] immediately.
+        # Cycle-position bias: primes same-cycle attention from step 0
         self.cycle_bias = nn.Parameter(torch.zeros(cycle_length, cycle_length))
 
-        # Blend scalar: α · attended is added to ar_logits.
-        # Start at 5.0 so rule signal immediately overcomes typical AR logit gaps
-        # (~4 units gap for OOD starters).  Cycle-bias already ensures correct
-        # attention from step 0, so there's no need to ramp up slowly.
-        self.alpha = nn.Parameter(torch.tensor(5.0))
+        # Gate scalar (yinyang design): learnable blend coefficient.
+        self.gates = nn.Parameter(torch.zeros(1))
 
-        self._init()
+        self._init_weights()
 
-    def _init(self):
-        std = self.rank ** -0.5
-        nn.init.normal_(self.W_q.weight, std=std)
-        nn.init.normal_(self.W_k.weight, std=std)
-        # Diagonal init for cycle_bias: strongly prefer same-cycle attention
-        nn.init.constant_(self.cycle_bias, 0.0)
+        # Freeze v_linear and out_proj after identity init.
+        # These are initialised so that out_proj(v_linear(x)) = x exactly.
+        # Allowing them to drift under CE loss (where AR is already correct on
+        # training starters) destroys the identity and degrades generalisation.
+        # Only q_linear, k_linear, cycle_bias, and gates are trainable.
+        for p in self.v_linear.parameters():
+            p.requires_grad_(False)
+        for p in self.out_proj.parameters():
+            p.requires_grad_(False)
+
+    def _init_weights(self):
+        vocab_size = self.out_proj.out_features   # 12
+
+        # Standard Xavier init for Q and K projections
+        for linear in [self.q_linear, self.k_linear]:
+            nn.init.xavier_uniform_(linear.weight)
+            nn.init.zeros_(linear.bias)
+
+        # V → out_proj as approximate identity through the embed_dim bottleneck:
+        #   v_linear  : (vocab_size→embed_dim)  embeds first vocab_size dims as I,
+        #               pads remainder with 0       →  v_linear(x) = [x; 0]
+        #   out_proj  : (embed_dim→vocab_size)   extracts first vocab_size dims
+        #               →  out_proj([x; 0]) = x
+        #
+        # Combined: out_proj(v_linear(x)) = x  (exact for embed_dim ≥ vocab_size)
+        #
+        # With cycle_bias diagonal init, attn ≈ same-cycle rule_logits, so at step 0:
+        #   delta = out_proj(attn @ v_linear(rule_logits)) * gates
+        #         ≈ out_proj(v_linear(rule_logits))         * gates
+        #         ≈ rule_logits                              * gates
+        # This gives:  final = ar_logits + gates * rule_logits
+        # which is the oracle blend.  gates then just needs to be large enough
+        # to overcome AR logit gaps for OOD starters.
+        with torch.no_grad():
+            self.v_linear.weight.zero_()
+            self.v_linear.weight[:vocab_size, :] = torch.eye(vocab_size)
+            self.v_linear.bias.zero_()
+
+            self.out_proj.weight.zero_()
+            self.out_proj.weight[:, :vocab_size] = torch.eye(vocab_size)
+            self.out_proj.bias.zero_()
+
+        # Diagonal cycle bias: strongly prefer same-cycle attention at init
         with torch.no_grad():
             self.cycle_bias.fill_diagonal_(4.0)
+
+        # Gates: start large enough to immediately dominate AR logit gaps (~4 units).
+        # The identity init above ensures the initial delta ≈ rule_logits,
+        # so a large gates value is safe (and necessary for OOD starters).
+        with torch.no_grad():
+            self.gates.fill_(5.0)
 
     def forward(
         self,
         ar_hidden:   torch.Tensor,   # (B, T, d_model)
         ar_logits:   torch.Tensor,   # (B, T, vocab_size)
-        rule_logits: torch.Tensor,   # (B, T, vocab_size)  – one-hot predictions
+        rule_logits: torch.Tensor,   # (B, T, vocab_size)
     ) -> torch.Tensor:               # (B, T, vocab_size)
 
         B, T, _ = ar_hidden.shape
         device  = ar_hidden.device
 
-        Q = self.W_q(ar_hidden)    # (B, T, rank)
-        K = self.W_k(rule_logits)  # (B, T, rank)
+        # Low-rank projections
+        Q = self.q_linear(ar_hidden)    # (B, T, embed_dim)
+        K = self.k_linear(rule_logits)  # (B, T, embed_dim)
+        V = self.v_linear(rule_logits)  # (B, T, embed_dim)
 
-        # Content-based scores
-        scores = (Q @ K.transpose(-2, -1)) * self.scale          # (B, T, T)
+        # Split into heads: (B, n_heads, T, head_dim)
+        def split_heads(x: torch.Tensor) -> torch.Tensor:
+            return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Add cycle-position bias: cycle_bias[t%L, s%L] for all (t, s)
+        Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
+
+        # Scaled dot-product attention scores
+        scores = (Q @ K.transpose(-2, -1)) * self.scale   # (B, n_heads, T, T)
+
+        # Cycle-position bias — broadcast over batch and heads
         t_idx  = torch.arange(T, device=device)
         bias   = self.cycle_bias[t_idx[:, None] % self.cycle_length,
                                   t_idx[None, :] % self.cycle_length]  # (T, T)
-        scores = scores + bias
+        scores = scores + bias.unsqueeze(0).unsqueeze(0)
 
         # Causal mask
         causal = torch.ones(T, T, device=device).tril().bool()
         scores = scores.masked_fill(~causal, float('-inf'))
-        attn   = F.softmax(scores, dim=-1)                        # (B, T, T)
 
-        # Values are rule_logits — output in vocab/logit space
-        attended = attn @ rule_logits                             # (B, T, vocab_size)
+        attn = F.softmax(scores, dim=-1)                  # (B, n_heads, T, T)
 
-        return ar_logits + self.alpha * attended
+        # Weighted value aggregation
+        out = (attn @ V)                                  # (B, n_heads, T, head_dim)
+        out = out.transpose(1, 2).contiguous()            # (B, T, n_heads, head_dim)
+        out = out.view(B, T, self.embed_dim)              # (B, T, embed_dim)
+
+        # Project to vocab/logit space and scale by gate (yinyang: out_proj × gates)
+        delta = self.out_proj(out) * self.gates           # (B, T, vocab_size)
+
+        return ar_logits + delta
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +292,7 @@ def build_patched_model(
     d_model:        int = 128,
     n_layers:       int = 4,
     n_heads:        int = 4,
-    adapter_rank:   int = 16,
+    adapter_rank:   int = 32,          # embed_dim for the low-rank adapter
     cycle_length:   int = 4,
     force_fallback: bool = False,
     device:         str = "cpu",
@@ -253,7 +311,8 @@ def build_patched_model(
                                   force_fallback=force_fallback).to(device)
     adapter    = LowRankCrossAttentionAdapter(
                      d_model=d_model, vocab_size=12,
-                     rank=adapter_rank, cycle_length=cycle_length).to(device)
+                     embed_dim=adapter_rank, n_heads=4,
+                     cycle_length=cycle_length).to(device)
 
     return PatchedModel(ar_model, rule_model, adapter)
 
@@ -261,8 +320,10 @@ def build_patched_model(
 if __name__ == "__main__":
     model = build_patched_model(force_fallback=True)
     print(f"Adapter parameters: {sum(p.numel() for p in model.adapter.parameters()):,}")
+    print(f"  gates init: {model.adapter.gates.item():.4f}")
 
     x = torch.tensor([[2, 7, 9, 2, 2]], dtype=torch.long)
     out = model(x)
-    print("output shape:", out.shape)
-    print("predictions :", out.argmax(-1).tolist())
+    print("output shape  :", out.shape)
+    print("predictions   :", out.argmax(-1).tolist())
+    print("(gates=0 → adapter output is zero at init, predictions = pure AR)")
