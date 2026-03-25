@@ -90,18 +90,12 @@ class YinyangCrossAttention(nn.Module):
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
         self.dropout  = nn.Dropout(dropout)
-
-        # gate=0 at init → no injection; tanh keeps it in (-1, 1)
-        self.gate = nn.Parameter(torch.zeros(1))
-
         self._init_weights()
 
     def _init_weights(self):
-        for linear in [self.q_proj, self.k_proj, self.v_proj]:
+        for linear in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor) -> torch.Tensor:
         """
@@ -128,7 +122,7 @@ class YinyangCrossAttention(nn.Module):
         attn = self.dropout(F.softmax(scores, dim=-1))    # (B, n_heads, T, T)
 
         out = (attn @ V).transpose(1, 2).contiguous().view(B, T, self.embed_dim)
-        return torch.tanh(self.gate) * self.out_proj(out)
+        return self.out_proj(out)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +334,7 @@ if __name__ == '__main__':
     print(f'yinyang_attn modules: {len(model.yinyang_attn)}')
     for i, m in enumerate(model.yinyang_attn):
         n = sum(p.numel() for p in m.parameters())
-        print(f'  adapter {i}: {n:,} params, gate={m.gate.item():.4f}')
+        print(f'  adapter {i}: {n:,} params')
 
     x = torch.randint(0, 12, (2, 16))
     logits = model(x)

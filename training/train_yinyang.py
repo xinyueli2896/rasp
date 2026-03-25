@@ -107,12 +107,10 @@ def train(args):
         test_acc = test_correct / test_tokens
 
         if epoch % args.log_every == 0 or epoch == args.epochs:
-            gates = [f'{m.gate.item():.3f}' for m in model.yinyang_attn]
             print(
                 f'Epoch {epoch:4d}/{args.epochs}  '
                 f'train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  '
-                f'test_acc(unseen)={test_acc:.4f}  '
-                f'gates={gates}'
+                f'test_acc(unseen)={test_acc:.4f}'
             )
 
         if test_acc > best_test_acc:
