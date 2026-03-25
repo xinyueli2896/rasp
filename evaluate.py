@@ -99,24 +99,53 @@ def load_patched(args, device):
 
 
 def load_yinyang(label, ckpt_path, args, device):
+    if not os.path.exists(ckpt_path):
+        print(f"  {label:<12}: WARNING {ckpt_path} not found")
+        model = build_yinyang_model(
+            ar_ckpt_path=args.ar_ckpt, max_seq_len=args.n_cycles * 4 + 10,
+            d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
+            use_lora=False, force_fallback=args.force_fallback, device=str(device),
+        )
+        model.eval()
+        return model
+
+    state = torch.load(ckpt_path, map_location=device)
+    has_lora = any('lora_' in k for k in state)
+
+    # Detect LoRA rank from checkpoint shape (lora_A has shape [rank, d_model])
+    lora_rank = 16
+    for k, v in state.items():
+        if 'lora_A' in k:
+            lora_rank = v.shape[0]
+            break
+
     model = build_yinyang_model(
         ar_ckpt_path   = args.ar_ckpt,
         max_seq_len    = args.n_cycles * 4 + 10,
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,
-        use_lora       = False,
+        use_lora       = has_lora,
+        lora_rank      = lora_rank,
         force_fallback = args.force_fallback,
         device         = str(device),
     )
-    if os.path.exists(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device)
-        yinyang_state = {k.removeprefix('yinyang_attn.'): v
-                         for k, v in state.items() if k.startswith('yinyang_attn.')}
-        model.yinyang_attn.load_state_dict(yinyang_state)
-        print(f"  {label:<12}: loaded yinyang_attn from {ckpt_path}")
+
+    # Load yinyang_attn weights
+    yinyang_state = {k.removeprefix('yinyang_attn.'): v
+                     for k, v in state.items() if k.startswith('yinyang_attn.')}
+    model.yinyang_attn.load_state_dict(yinyang_state)
+
+    # Load LoRA weights if present
+    if has_lora:
+        lora_state = {k.removeprefix('ar_model.'): v
+                      for k, v in state.items() if k.startswith('ar_model.')}
+        missing, unexpected = model.ar_model.load_state_dict(lora_state, strict=False)
+        lora_keys = [k for k in lora_state if 'lora_' in k]
+        print(f"  {label:<12}: loaded yinyang_attn + LoRA (rank={lora_rank}, {len(lora_keys)} lora tensors) from {ckpt_path}")
     else:
-        print(f"  {label:<12}: WARNING {ckpt_path} not found")
+        print(f"  {label:<12}: loaded yinyang_attn from {ckpt_path}")
+
     model.eval()
     return model
 
@@ -185,7 +214,7 @@ def run_evaluation(args):
         ("Pretrain-only", EVAL_PRETRAIN_ONLY,  "A\\B = {0,1}"),
         ("Finetune-only", EVAL_FINETUNE_ONLY,  "B\\A = {6,7}"),
         ("Both          ", EVAL_BOTH,           "A∩B = {2,3,4,5}"),
-        ("Neither       ", EVAL_NEITHER,        "{8,9,10,11}"),
+        ("Neither       ", EVAL_NEITHER,        "{12,13,14,15}"),
     ]
 
     models = [
@@ -231,7 +260,7 @@ def run_evaluation(args):
     for mdl_label, mdl in models:
         _, mean = rule_following_acc(mdl, all_starters, args.n_cycles, n_prompt, device)
         overall[mdl_label] = mean
-    row = f"{'Overall':<20} {'all 12 starters':<18}"
+    row = f"{'Overall':<20} {'all 16 starters':<18}"
     for lbl in mdl_labels:
         row += f" {overall[lbl]:>{col_w}.3f}"
     print(row)
