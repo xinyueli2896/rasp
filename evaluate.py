@@ -38,8 +38,9 @@ from data.dataset import (
     AR_TRAIN_STARTERS, FINETUNE_STARTERS, TEST_STARTERS,
     EVAL_PRETRAIN_ONLY, EVAL_FINETUNE_ONLY, EVAL_BOTH, EVAL_NEITHER,
 )
-from models.transformer import AutoregressiveTransformer
-from models.adapter      import build_patched_model
+from models.transformer   import AutoregressiveTransformer
+from models.adapter       import build_patched_model
+from models.yinyang_model import build_yinyang_model
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +98,29 @@ def load_patched(args, device):
     return model
 
 
+def load_yinyang(args, device):
+    model = build_yinyang_model(
+        ar_ckpt_path   = args.ar_ckpt,
+        max_seq_len    = args.n_cycles * 4 + 10,
+        d_model        = args.d_model,
+        n_layers       = args.n_layers,
+        n_heads        = args.n_heads,
+        use_lora       = False,   # load weights directly; LoRA state merged into checkpoint
+        force_fallback = args.force_fallback,
+        device         = str(device),
+    )
+    if os.path.exists(args.yinyang_ckpt):
+        state = torch.load(args.yinyang_ckpt, map_location=device)
+        yinyang_state = {k.removeprefix('yinyang_attn.'): v
+                         for k, v in state.items() if k.startswith('yinyang_attn.')}
+        model.yinyang_attn.load_state_dict(yinyang_state)
+        print(f"  Yinyang    : loaded AR={args.ar_ckpt}, yinyang={args.yinyang_ckpt}")
+    else:
+        print(f"  Yinyang    : WARNING {args.yinyang_ckpt} not found, using random weights")
+    model.eval()
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Core metric: rule-following accuracy on generated sequences
 # ---------------------------------------------------------------------------
@@ -141,6 +165,7 @@ def run_evaluation(args):
     pretrain_model  = load_pretrain(args, device)
     finetune_model  = load_finetune(args, device)
     patched_model   = load_patched(args, device)
+    yinyang_model   = load_yinyang(args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -165,6 +190,7 @@ def run_evaluation(args):
         ("Pretrain",  pretrain_model),
         ("Finetune",  finetune_model),
         ("Ft+Rule",   patched_model),
+        ("Yinyang",   yinyang_model),
     ]
 
     # Collect all results: results[cat_label][model_label] = (per_starter_dict, mean)
@@ -184,9 +210,9 @@ def run_evaluation(args):
     print("=" * 72)
 
     col_w = 10
-    hdr_labels = ["Data Split", "Starters", "Pretrain", "Finetune", "Ft+Rule"]
-    print(f"{'Data Split':<20} {'Starters':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}}")
-    print("-" * 72)
+    hdr_labels = ["Data Split", "Starters", "Pretrain", "Finetune", "Ft+Rule", "Yinyang"]
+    print(f"{'Data Split':<20} {'Starters':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}} {'Yinyang':>{col_w}}")
+    print("-" * 82)
     for cat_label, starters, starters_str in categories:
         r = all_results[cat_label]
         print(
@@ -194,8 +220,9 @@ def run_evaluation(args):
             f" {r['Pretrain'][1]:>{col_w}.3f}"
             f" {r['Finetune'][1]:>{col_w}.3f}"
             f" {r['Ft+Rule'][1]:>{col_w}.3f}"
+            f" {r['Yinyang'][1]:>{col_w}.3f}"
         )
-    print("-" * 72)
+    print("-" * 82)
     # Overall mean across all starters
     all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
     overall = {}
@@ -207,8 +234,9 @@ def run_evaluation(args):
         f" {overall['Pretrain']:>{col_w}.3f}"
         f" {overall['Finetune']:>{col_w}.3f}"
         f" {overall['Ft+Rule']:>{col_w}.3f}"
+        f" {overall['Yinyang']:>{col_w}.3f}"
     )
-    print("=" * 72)
+    print("=" * 82)
 
     # -----------------------------------------------------------------------
     # Per-starter detail
@@ -216,9 +244,9 @@ def run_evaluation(args):
     if args.verbose:
         print()
         print("Per-starter breakdown")
-        print("-" * 72)
-        print(f"{'Starter':>8} {'Category':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}}")
-        print("-" * 72)
+        print("-" * 82)
+        print(f"{'Starter':>8} {'Category':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}} {'Yinyang':>{col_w}}")
+        print("-" * 82)
         for cat_label, starters, _ in categories:
             r = all_results[cat_label]
             for x in starters:
@@ -227,8 +255,9 @@ def run_evaluation(args):
                     f" {r['Pretrain'][0][x]:>{col_w}.3f}"
                     f" {r['Finetune'][0][x]:>{col_w}.3f}"
                     f" {r['Ft+Rule'][0][x]:>{col_w}.3f}"
+                    f" {r['Yinyang'][0][x]:>{col_w}.3f}"
                 )
-        print("-" * 72)
+        print("-" * 82)
 
     # -----------------------------------------------------------------------
     # Qualitative generation examples (one per category)
@@ -251,6 +280,7 @@ def run_evaluation(args):
         pt_gen = pretrain_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
         ft_gen = finetune_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
         pa_gen = patched_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
+        yy_gen = yinyang_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
 
         def mark(gen): return "✓" if gen == expected else "✗"
         print(f"  [{cat_label}] x={x}  prompt={seq[:n_prompt]}")
@@ -258,6 +288,7 @@ def run_evaluation(args):
         print(f"    Pretrain : {pt_gen}  {mark(pt_gen)}")
         print(f"    Finetune : {ft_gen}  {mark(ft_gen)}")
         print(f"    Ft+Rule  : {pa_gen}  {mark(pa_gen)}")
+        print(f"    Yinyang  : {yy_gen}  {mark(yy_gen)}")
         print()
 
 
@@ -273,6 +304,8 @@ def get_args():
                    help="Fine-tuned AR checkpoint (no rule alignment)")
     p.add_argument("--adapter_ckpt",   type=str,  default="checkpoints/adapter.pt",
                    help="Adapter checkpoint for fine-tuned + rule model")
+    p.add_argument("--yinyang_ckpt",   type=str,  default="checkpoints/yinyang.pt",
+                   help="Yinyang checkpoint")
     p.add_argument("--d_model",        type=int,  default=128)
     p.add_argument("--n_layers",       type=int,  default=4)
     p.add_argument("--n_heads",        type=int,  default=4)
