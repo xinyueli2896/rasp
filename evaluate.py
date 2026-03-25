@@ -98,25 +98,25 @@ def load_patched(args, device):
     return model
 
 
-def load_yinyang(args, device):
+def load_yinyang(label, ckpt_path, args, device):
     model = build_yinyang_model(
         ar_ckpt_path   = args.ar_ckpt,
         max_seq_len    = args.n_cycles * 4 + 10,
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,
-        use_lora       = False,   # load weights directly; LoRA state merged into checkpoint
+        use_lora       = False,
         force_fallback = args.force_fallback,
         device         = str(device),
     )
-    if os.path.exists(args.yinyang_ckpt):
-        state = torch.load(args.yinyang_ckpt, map_location=device)
+    if os.path.exists(ckpt_path):
+        state = torch.load(ckpt_path, map_location=device)
         yinyang_state = {k.removeprefix('yinyang_attn.'): v
                          for k, v in state.items() if k.startswith('yinyang_attn.')}
         model.yinyang_attn.load_state_dict(yinyang_state)
-        print(f"  Yinyang    : loaded AR={args.ar_ckpt}, yinyang={args.yinyang_ckpt}")
+        print(f"  {label:<12}: loaded yinyang_attn from {ckpt_path}")
     else:
-        print(f"  Yinyang    : WARNING {args.yinyang_ckpt} not found, using random weights")
+        print(f"  {label:<12}: WARNING {ckpt_path} not found")
     model.eval()
     return model
 
@@ -165,7 +165,9 @@ def run_evaluation(args):
     pretrain_model  = load_pretrain(args, device)
     finetune_model  = load_finetune(args, device)
     patched_model   = load_patched(args, device)
-    yinyang_model   = load_yinyang(args, device)
+    yinyang_opt1    = load_yinyang("YY-opt1", os.path.join(args.ckpt_dir, "yinyang_opt1.pt"), args, device)
+    yinyang_opt2    = load_yinyang("YY-opt2", os.path.join(args.ckpt_dir, "yinyang_opt2.pt"), args, device)
+    yinyang_opt3    = load_yinyang("YY-opt3", os.path.join(args.ckpt_dir, "yinyang_opt3.pt"), args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -190,7 +192,9 @@ def run_evaluation(args):
         ("Pretrain",  pretrain_model),
         ("Finetune",  finetune_model),
         ("Ft+Rule",   patched_model),
-        ("Yinyang",   yinyang_model),
+        ("YY-opt1",   yinyang_opt1),
+        ("YY-opt2",   yinyang_opt2),
+        ("YY-opt3",   yinyang_opt3),
     ]
 
     # Collect all results: results[cat_label][model_label] = (per_starter_dict, mean)
@@ -210,33 +214,28 @@ def run_evaluation(args):
     print("=" * 72)
 
     col_w = 10
-    hdr_labels = ["Data Split", "Starters", "Pretrain", "Finetune", "Ft+Rule", "Yinyang"]
-    print(f"{'Data Split':<20} {'Starters':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}} {'Yinyang':>{col_w}}")
-    print("-" * 82)
+    mdl_labels = [m[0] for m in models]
+    header = f"{'Data Split':<20} {'Starters':<18}" + "".join(f" {l:>{col_w}}" for l in mdl_labels)
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
     for cat_label, starters, starters_str in categories:
         r = all_results[cat_label]
-        print(
-            f"{cat_label:<20} {starters_str:<18}"
-            f" {r['Pretrain'][1]:>{col_w}.3f}"
-            f" {r['Finetune'][1]:>{col_w}.3f}"
-            f" {r['Ft+Rule'][1]:>{col_w}.3f}"
-            f" {r['Yinyang'][1]:>{col_w}.3f}"
-        )
-    print("-" * 82)
-    # Overall mean across all starters
+        row = f"{cat_label:<20} {starters_str:<18}"
+        for lbl in mdl_labels:
+            row += f" {r[lbl][1]:>{col_w}.3f}"
+        print(row)
+    print(sep)
     all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
     overall = {}
     for mdl_label, mdl in models:
-        res, mean = rule_following_acc(mdl, all_starters, args.n_cycles, n_prompt, device)
+        _, mean = rule_following_acc(mdl, all_starters, args.n_cycles, n_prompt, device)
         overall[mdl_label] = mean
-    print(
-        f"{'Overall':<20} {'all 12 starters':<18}"
-        f" {overall['Pretrain']:>{col_w}.3f}"
-        f" {overall['Finetune']:>{col_w}.3f}"
-        f" {overall['Ft+Rule']:>{col_w}.3f}"
-        f" {overall['Yinyang']:>{col_w}.3f}"
-    )
-    print("=" * 82)
+    row = f"{'Overall':<20} {'all 12 starters':<18}"
+    for lbl in mdl_labels:
+        row += f" {overall[lbl]:>{col_w}.3f}"
+    print(row)
+    print("=" * len(header))
 
     # -----------------------------------------------------------------------
     # Per-starter detail
@@ -244,20 +243,19 @@ def run_evaluation(args):
     if args.verbose:
         print()
         print("Per-starter breakdown")
-        print("-" * 82)
-        print(f"{'Starter':>8} {'Category':<18} {'Pretrain':>{col_w}} {'Finetune':>{col_w}} {'Ft+Rule':>{col_w}} {'Yinyang':>{col_w}}")
-        print("-" * 82)
+        per_header = f"{'Starter':>8} {'Category':<18}" + "".join(f" {l:>{col_w}}" for l in mdl_labels)
+        per_sep = "-" * len(per_header)
+        print(per_sep)
+        print(per_header)
+        print(per_sep)
         for cat_label, starters, _ in categories:
             r = all_results[cat_label]
             for x in starters:
-                print(
-                    f"{x:>8} {cat_label:<18}"
-                    f" {r['Pretrain'][0][x]:>{col_w}.3f}"
-                    f" {r['Finetune'][0][x]:>{col_w}.3f}"
-                    f" {r['Ft+Rule'][0][x]:>{col_w}.3f}"
-                    f" {r['Yinyang'][0][x]:>{col_w}.3f}"
-                )
-        print("-" * 82)
+                row = f"{x:>8} {cat_label:<18}"
+                for lbl in mdl_labels:
+                    row += f" {r[lbl][0][x]:>{col_w}.3f}"
+                print(row)
+        print(per_sep)
 
     # -----------------------------------------------------------------------
     # Qualitative generation examples (one per category)
@@ -277,18 +275,12 @@ def run_evaluation(args):
         prompt   = torch.tensor([seq[:n_prompt]], dtype=torch.long, device=device)
         expected = seq[n_prompt: n_prompt + show_len]
 
-        pt_gen = pretrain_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
-        ft_gen = finetune_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
-        pa_gen = patched_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
-        yy_gen = yinyang_model.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
-
         def mark(gen): return "✓" if gen == expected else "✗"
         print(f"  [{cat_label}] x={x}  prompt={seq[:n_prompt]}")
         print(f"    Expected : {expected}")
-        print(f"    Pretrain : {pt_gen}  {mark(pt_gen)}")
-        print(f"    Finetune : {ft_gen}  {mark(ft_gen)}")
-        print(f"    Ft+Rule  : {pa_gen}  {mark(pa_gen)}")
-        print(f"    Yinyang  : {yy_gen}  {mark(yy_gen)}")
+        for mdl_label, mdl in models:
+            gen = mdl.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
+            print(f"    {mdl_label:<12}: {gen}  {mark(gen)}")
         print()
 
 
@@ -304,8 +296,7 @@ def get_args():
                    help="Fine-tuned AR checkpoint (no rule alignment)")
     p.add_argument("--adapter_ckpt",   type=str,  default="checkpoints/adapter.pt",
                    help="Adapter checkpoint for fine-tuned + rule model")
-    p.add_argument("--yinyang_ckpt",   type=str,  default="checkpoints/yinyang.pt",
-                   help="Yinyang checkpoint")
+    p.add_argument("--ckpt_dir",       type=str,  default="checkpoints")
     p.add_argument("--d_model",        type=int,  default=128)
     p.add_argument("--n_layers",       type=int,  default=4)
     p.add_argument("--n_heads",        type=int,  default=4)

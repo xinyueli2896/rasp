@@ -162,6 +162,7 @@ class YinyangModel(nn.Module):
         adapter_rank:   int  = 32,
         n_skip:         int  = 2,
         use_lora:       bool = True,
+        lora_rank:      int  = 16,
         force_fallback: bool = False,
         device:         str  = 'cpu',
     ):
@@ -193,8 +194,8 @@ class YinyangModel(nn.Module):
                     "use_lora=True requires the 'peft' package: pip install peft"
                 )
             lora_config = LoraConfig(
-                r              = 16,
-                lora_alpha     = 32,
+                r              = lora_rank,
+                lora_alpha     = lora_rank * 2,
                 target_modules = ['qkv'],   # fused QKV linear in CausalSelfAttention
                 lora_dropout   = 0.1,
                 bias           = 'none',
@@ -307,6 +308,7 @@ def build_yinyang_model(
     adapter_rank:   int  = 32,
     n_skip:         int  = 2,
     use_lora:       bool = True,
+    lora_rank:      int  = 16,
     force_fallback: bool = False,
     device:         str  = 'cpu',
 ) -> YinyangModel:
@@ -320,6 +322,7 @@ def build_yinyang_model(
         adapter_rank   = adapter_rank,
         n_skip         = n_skip,
         use_lora       = use_lora,
+        lora_rank      = lora_rank,
         force_fallback = force_fallback,
         device         = device,
     )
