@@ -344,8 +344,9 @@ def build_patched_model(
     force_fallback: bool = False,
     device:         str = "cpu",
 ) -> PatchedModel:
+    from data.dataset import VOCAB_SIZE
     ar_model = AutoregressiveTransformer(
-        vocab_size=12, max_seq_len=max_seq_len,
+        vocab_size=VOCAB_SIZE, max_seq_len=max_seq_len,
         d_model=d_model, n_layers=n_layers, n_heads=n_heads,
     ).to(device)
 
@@ -358,7 +359,7 @@ def build_patched_model(
                                   rule_d_model=rule_d_model,
                                   force_fallback=force_fallback).to(device)
     adapter    = LowRankCrossAttentionAdapter(
-                     d_model=d_model, rule_d_model=rule_d_model, vocab_size=12,
+                     d_model=d_model, rule_d_model=rule_d_model, vocab_size=VOCAB_SIZE,
                      embed_dim=adapter_rank, n_heads=4,
                      cycle_length=cycle_length).to(device)
 

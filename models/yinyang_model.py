@@ -173,8 +173,9 @@ class YinyangModel(nn.Module):
         # ------------------------------------------------------------------ #
         # AR model
         # ------------------------------------------------------------------ #
+        from data.dataset import VOCAB_SIZE as _VOCAB_SIZE
         ar_model = AutoregressiveTransformer(
-            vocab_size  = VOCAB_SIZE,
+            vocab_size  = _VOCAB_SIZE,
             max_seq_len = max_seq_len,
             d_model     = d_model,
             n_layers    = n_layers,
