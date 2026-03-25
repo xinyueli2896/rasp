@@ -18,6 +18,7 @@ import argparse
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -79,8 +80,20 @@ def train(args):
         for inp, tgt in train_loader:
             inp, tgt = inp.to(device), tgt.to(device)
 
-            logits = model(inp)
-            loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+            rule_logits = model.rule_model(inp)                    # one-hot (B, T, V), leaf tensor
+            logits      = model(inp)
+
+            ce_loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+
+            # KL distillation: drive model output toward the rule model's one-hot distribution.
+            # Since rule_logits are one-hot this is equivalent to CE with rule targets,
+            # but explicitly teaches the model to follow the rule for every starter seen —
+            # including {6,7} where AR is wrong — which generalises to unseen starters {8-11}.
+            rule_probs   = torch.softmax(rule_logits, dim=-1).reshape(-1, VOCAB_SIZE)
+            model_lprobs = torch.log_softmax(logits,   dim=-1).reshape(-1, VOCAB_SIZE)
+            kl_loss = F.kl_div(model_lprobs, rule_probs, reduction='batchmean')
+
+            loss = ce_loss + args.kl_weight * kl_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -149,6 +162,8 @@ def get_args():
     p.add_argument('--ckpt_dir',           type=str,   default='checkpoints')
     p.add_argument('--use_lora',           action='store_true', default=True)
     p.add_argument('--no_lora',            action='store_false', dest='use_lora')
+    p.add_argument('--kl_weight',          type=float, default=1.0,
+                   help='Weight for KL distillation loss toward rule model')
     p.add_argument('--force_fallback',     action='store_true')
     return p.parse_args()
 
