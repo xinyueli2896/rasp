@@ -73,12 +73,17 @@ def load_yinyang(label, ckpt_path, args, device):
             lora_rank = v.shape[0]
             break
 
+    # Detect n_skip from number of yinyang_attn modules in checkpoint
+    n_adapters = len({k.split('.')[1] for k in state if k.startswith('yinyang_attn.')})
+    n_skip = args.n_layers // max(n_adapters, 1)
+
     model = build_yinyang_model(
         ar_ckpt_path   = args.ar_ckpt,
         max_seq_len    = args.n_cycles * 4 + 10,
         d_model        = args.d_model,
         n_layers       = args.n_layers,
         n_heads        = args.n_heads,
+        n_skip         = n_skip,
         use_lora       = has_lora,
         lora_rank      = lora_rank,
         force_fallback = args.force_fallback,
@@ -133,7 +138,9 @@ def run_evaluation(args):
     print("=" * 60)
     pretrain_model = load_pretrain(args, device)
     finetune_model = load_finetune(args, device)
-    yinyang_opt1   = load_yinyang("Finetune+rule", os.path.join(args.ckpt_dir, "yinyang_opt1.pt"), args, device)
+    yinyang_skip1  = load_yinyang("skip=1", os.path.join(args.ckpt_dir, "yinyang_skip1.pt"), args, device)
+    yinyang_skip2  = load_yinyang("skip=2", os.path.join(args.ckpt_dir, "yinyang_skip2.pt"), args, device)
+    yinyang_skip4  = load_yinyang("skip=4", os.path.join(args.ckpt_dir, "yinyang_skip4.pt"), args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -148,15 +155,17 @@ def run_evaluation(args):
 
     categories = [
         ("Pretrain-only", EVAL_PRETRAIN_ONLY,  "A\\B = {0,1}"),
-        ("Finetune-only", EVAL_FINETUNE_ONLY,  "B\\A = {6,7}"),
-        ("Both          ", EVAL_BOTH,           "A∩B = {2,3,4,5}"),
-        ("Neither       ", EVAL_NEITHER,        "{12,13,14,15}"),
+        ("Finetune-only", EVAL_FINETUNE_ONLY,  "B\\A = {6..15}"),
+        ("Both          ", EVAL_BOTH,           "A∩B = {2..5}"),
+        ("Neither       ", EVAL_NEITHER,        "{17,19,20,21}"),
     ]
 
     models = [
-        ("Pretrain",      pretrain_model),
-        ("Finetune",      finetune_model),
-        ("Finetune+rule", yinyang_opt1),
+        ("Pretrain",  pretrain_model),
+        ("Finetune",  finetune_model),
+        ("skip=1",    yinyang_skip1),
+        ("skip=2",    yinyang_skip2),
+        ("skip=4",    yinyang_skip4),
     ]
 
     all_results = {}
