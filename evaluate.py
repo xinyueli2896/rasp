@@ -193,10 +193,7 @@ def run_evaluation(args):
     print("=" * 60)
     pretrain_model  = load_pretrain(args, device)
     finetune_model  = load_finetune(args, device)
-    patched_model   = load_patched(args, device)
-    yinyang_opt1    = load_yinyang("YY-opt1", os.path.join(args.ckpt_dir, "yinyang_opt1.pt"), args, device)
-    yinyang_opt2    = load_yinyang("YY-opt2", os.path.join(args.ckpt_dir, "yinyang_opt2.pt"), args, device)
-    yinyang_opt3    = load_yinyang("YY-opt3", os.path.join(args.ckpt_dir, "yinyang_opt3.pt"), args, device)
+    yinyang_opt1    = load_yinyang("Finetune+rule", os.path.join(args.ckpt_dir, "yinyang_opt1.pt"), args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -218,12 +215,9 @@ def run_evaluation(args):
     ]
 
     models = [
-        ("Pretrain",  pretrain_model),
-        ("Finetune",  finetune_model),
-        ("Ft+Rule",   patched_model),
-        ("YY-opt1",   yinyang_opt1),
-        ("YY-opt2",   yinyang_opt2),
-        ("YY-opt3",   yinyang_opt3),
+        ("Pretrain",      pretrain_model),
+        ("Finetune",      finetune_model),
+        ("Finetune+rule", yinyang_opt1),
     ]
 
     # Collect all results: results[cat_label][model_label] = (per_starter_dict, mean)
