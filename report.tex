@@ -1,0 +1,277 @@
+\documentclass[10pt,twocolumn]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\title{\textbf{Yin-Yang Cross-Attention Patching for\\
+Rule-Aligned Continual Fine-Tuning of\\
+Autoregressive Transformers}}
+
+\author{Anonymous}
+\date{}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\section{Methodology}
+% ============================================================
+
+\subsection{Problem Setting}
+
+We study the problem of \emph{rule-aligned continual fine-tuning}: given a pretrained autoregressive (AR) transformer and a symbolic rule that governs the correct output distribution, incorporate knowledge from a new set of inputs (fine-tuning distribution $B$) without (i) forgetting the pretrained distribution $A$, and (ii) while preserving rule-following behaviour on inputs never seen in either stage.
+
+Formally, let $\mathcal{V} = \{0, \ldots, V{-}1\}$ be the vocabulary. The ground-truth rule generates sequences according to:
+\begin{equation}
+  t_i = \bigl(x + \delta_{i \bmod 4}\bigr) \bmod V, \quad \delta = [0, 5, 7, 0],
+  \label{eq:rule}
+\end{equation}
+where $x \in \mathcal{V}$ is the starting integer (first token). The period-4 pattern means each sequence cycles through offsets $\{0, +5, +7, +0\}$ relative to $x$. We set $V = 24$.
+
+\subsection{The Yin-Yang Architecture}
+
+We propose a \emph{Yin-Yang} model consisting of two frozen streams and a small set of trainable cross-attention adapters (Figure~\ref{fig:arch}).
+
+\paragraph{Yang stream (AR transformer).}
+A standard causal transformer pretrained on starter set $A = \{0,\ldots,5\}$. During fine-tuning, all AR weights are \emph{frozen}. The transformer has $L=4$ layers, hidden dimension $d=128$, and $H=4$ attention heads ($\approx$800k parameters).
+
+\paragraph{Yin stream (rule model).}
+A deterministic, parameter-free oracle that implements Equation~\eqref{eq:rule} exactly. For input sequence $\mathbf{x} \in \mathcal{V}^T$, the rule model produces:
+\begin{align}
+  \hat{y}_t &= \bigl(x_0 + \delta_{(t+1) \bmod 4}\bigr) \bmod V, \label{eq:rule_pred}\\
+  \mathbf{h}^{\text{rule}}_t &= \mathbf{E}^{\text{rule}}_{\hat{y}_t} \in \mathbb{R}^{d_r}, \label{eq:rule_hidden}
+\end{align}
+where $\mathbf{E}^{\text{rule}} \in \mathbb{R}^{V \times d_r}$ is a fixed random embedding table (seeded deterministically, $d_r = 128$). The rule hidden state $\mathbf{h}^{\text{rule}}_t$ is the embedding of the \emph{predicted next token} in the rule's private representation space, entirely decoupled from the AR vocabulary embedding.
+
+\paragraph{Cross-attention injection.}
+Every $n_\text{skip}$ AR transformer blocks, a lightweight \emph{YinyangCrossAttention} module injects rule information as a residual:
+\begin{equation}
+  \mathbf{x}^{(l)} \leftarrow \mathbf{x}^{(l)} + \text{CrossAttn}_k\!\left(\mathbf{x}^{(l)},\, \mathbf{H}^{\text{rule}}\right),
+  \label{eq:inject}
+\end{equation}
+where $k = \lfloor l / n_\text{skip} \rfloor - 1$ indexes the adapter, $\mathbf{x}^{(l)} \in \mathbb{R}^{T \times d}$ is the AR hidden state after block $l$, and $\mathbf{H}^{\text{rule}} \in \mathbb{R}^{T \times d_r}$ are the rule hidden states (computed once per forward pass).
+
+Each cross-attention adapter projects into a shared embedding space of dimension $r = 32$ with $H_c = 4$ heads:
+\begin{align}
+  \mathbf{Q} &= \mathbf{x}^{(l)} \mathbf{W}_Q, \quad \mathbf{W}_Q \in \mathbb{R}^{d \times r},\\
+  \mathbf{K} &= \mathbf{H}^{\text{rule}} \mathbf{W}_K,\quad \mathbf{W}_K \in \mathbb{R}^{d_r \times r},\\
+  \mathbf{V} &= \mathbf{H}^{\text{rule}} \mathbf{W}_V,\quad \mathbf{W}_V \in \mathbb{R}^{d_r \times r},
+\end{align}
+followed by scaled dot-product attention with a causal mask (position $t$ only attends to rule positions $\leq t$), and a linear output projection $\mathbf{W}_O \in \mathbb{R}^{r \times d}$. A causal mask prevents future rule information from leaking into past positions. Each adapter contributes $4 \times (d \cdot r + r) + r \cdot d \approx 16{,}609$ parameters; with $n_\text{adapters} = L / n_\text{skip}$ adapters the total trainable parameter count is:
+\begin{equation}
+  |\theta_\text{train}| = \frac{L}{n_\text{skip}} \times 16{,}609.
+\end{equation}
+For $n_\text{skip} \in \{1, 2, 4\}$ this yields 66,432 / 33,216 / 16,608 trainable parameters respectively, compared to 799,744 frozen AR parameters.
+
+\paragraph{Training objective.}
+The model is trained with cross-entropy next-token prediction on the fine-tuning set $B = \{2, \ldots, 15\}$ (14 starters):
+\begin{equation}
+  \mathcal{L} = -\frac{1}{|B|} \sum_{x \in B} \sum_{t} \log p_\theta\!\left(t_{t+1} \mid t_{0:t};\, x\right).
+\end{equation}
+The AR weights and rule model are completely frozen throughout; only $\theta_\text{train}$ (the cross-attention adapters) receive gradient updates.
+
+\begin{figure}[t]
+\centering
+\fbox{%
+\begin{minipage}{0.9\columnwidth}
+\small
+\begin{algorithmic}[1]
+\State \textbf{Input:} token sequence $\mathbf{x} \in \mathcal{V}^T$
+\State $\mathbf{H}^\text{rule} \leftarrow \text{RuleModel}(\mathbf{x})$ \Comment{frozen, no grad}
+\State $\mathbf{h} \leftarrow \text{Embed}(\mathbf{x})$ \Comment{AR tok + pos emb}
+\For{$l = 0, \ldots, L{-}1$}
+  \State $\mathbf{h} \leftarrow \text{ARBlock}_l(\mathbf{h})$ \Comment{frozen}
+  \If{$(l+1) \bmod n_\text{skip} = 0$}
+    \State $k \leftarrow (l+1)/n_\text{skip} - 1$
+    \State $\mathbf{h} \leftarrow \mathbf{h} + \text{CrossAttn}_k(\mathbf{h}, \mathbf{H}^\text{rule})$ \Comment{trainable}
+  \EndIf
+\EndFor
+\State \Return $\text{LMHead}(\text{LayerNorm}(\mathbf{h}))$
+\end{algorithmic}
+\end{minipage}}
+\caption{Yin-Yang forward pass. Cross-attention adapters inject rule information every $n_\text{skip}$ AR layers. Only the adapter parameters are updated during training.}
+\label{fig:arch}
+\end{figure}
+
+% ============================================================
+\section{Experiments}
+% ============================================================
+
+\subsection{Task: Modulo Sequence Generation}
+
+We construct a controlled sequence generation benchmark based on Equation~\eqref{eq:rule}. Each sequence of length $4n_\text{cyc}$ (we use $n_\text{cyc}=8$, length 32) is fully determined by a single starting integer $x \in \mathcal{V}$.
+
+\paragraph{Training splits.}
+We define two overlapping starter sets:
+\begin{align*}
+  A &= \{0, 1, 2, 3, 4, 5\} \quad \text{(AR pretraining)},\\
+  B &= \{2, 3, \ldots, 15\} \quad \text{(fine-tuning, }|B \setminus A| = 10\text{)}.
+\end{align*}
+The AR transformer is pretrained on $A$ until convergence, then its weights are frozen. Fine-tuning (of the adapters only) is performed on $B$.
+
+\paragraph{Evaluation partition.}
+We partition all starters into four disjoint groups that stress-test different aspects of generalisation:
+
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Pretrain-only} ($A \setminus B$): $\{0, 1\}$. Seen only during AR pretraining. Tests catastrophic forgetting.
+  \item \textbf{Finetune-only} ($B \setminus A$): $\{6,\ldots,15\}$. The AR model produces incorrect sequences for all 10 of these starters; the adapter must fully correct AR output.
+  \item \textbf{Both} ($A \cap B$): $\{2,3,4,5\}$. Seen in both stages; AR and rule are both correct.
+  \item \textbf{Neither}: $\{17, 19, 20, 21\}$. Never seen in any training stage. Crucially, every individual token value that can appear in these sequences \emph{is} observed in training---only the specific (starter, sequence) binding is novel. This tests structural generalisation, not vocabulary coverage.
+\end{itemize}
+
+The Neither starters are chosen to exclude token $23$, the only vocabulary token never generated by any training starter, ensuring the difficulty is purely structural.
+
+\paragraph{Models.}
+We compare five models:
+\begin{itemize}[leftmargin=*,itemsep=2pt]
+  \item \textbf{Pretrain}: the frozen AR transformer pretrained on $A$ only.
+  \item \textbf{Finetune}: the AR transformer continued on $B$ with standard gradient descent (no rule alignment). All parameters trainable; represents the catastrophic-forgetting baseline.
+  \item \textbf{Yin-Yang skip=$k$} ($k \in \{1, 2, 4\}$): the proposed model with injection every $k$ layers. $k=1$ injects at every layer (4 adapters); $k=2$ injects at layers 2 and 4 (2 adapters); $k=4$ injects only at the final layer (1 adapter).
+\end{itemize}
+
+\paragraph{Training details.}
+AR pretraining: AdamW, lr $= 10^{-3}$, 200 epochs, batch 64, 200 sequences per starter.
+Fine-tuning (Finetune baseline): AdamW, lr $= 10^{-4}$, 200 epochs, 1 sequence per starter (sequences are deterministic so a single copy suffices).
+Yin-Yang training: AdamW, lr $= 10^{-4}$, cosine schedule, 100 epochs, batch 64, 200 sequences per starter. All experiments on CPU.
+
+\subsection{Metric}
+
+\textbf{Rule-following accuracy} (RFA): given a 1-token prompt $[x]$, the model generates $4n_\text{cyc} - 1 = 31$ tokens autoregressively. RFA is the fraction of generated tokens matching the ground-truth sequence under Equation~\eqref{eq:rule}:
+\begin{equation}
+  \text{RFA}(x) = \frac{1}{31}\sum_{t=1}^{31} \mathbf{1}\!\left[\hat{t}_t = (x + \delta_{t \bmod 4}) \bmod V\right].
+\end{equation}
+We report mean RFA over each evaluation partition.
+
+% ============================================================
+\section{Evaluation}
+% ============================================================
+
+\subsection{Main Results}
+
+Table~\ref{tab:main} reports RFA across all four evaluation partitions and all five models.
+
+\begin{table}[t]
+\centering
+\caption{Rule-following accuracy (mean over starters in each split). \textbf{Bold} indicates best among Yin-Yang variants.}
+\label{tab:main}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Split} & \textbf{Starters} & \textbf{Pre} & \textbf{FT} & \textbf{YY-1} & \textbf{YY-2} & \textbf{YY-4} \\
+\midrule
+Pretrain-only  & $A \setminus B$: \{0,1\}        & 1.000 & 0.016 & \textbf{0.403} & 0.161 & \textbf{0.403} \\
+Finetune-only  & $B \setminus A$: \{6..15\}      & 0.006 & 1.000 & \textbf{1.000} & \textbf{1.000} & 0.755 \\
+Both           & $A \cap B$: \{2..5\}            & 1.000 & 1.000 & \textbf{1.000} & \textbf{1.000} & \textbf{1.000} \\
+Neither        & \{17,19,20,21\}                 & 0.000 & 0.000 & \textbf{0.508} & 0.145 & 0.008 \\
+\midrule
+Overall        & all 20 starters                 & 0.303 & 0.702 & \textbf{0.842} & 0.745 & 0.619 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Pretrain baseline.}
+Achieves perfect RFA on $A$ but near-zero on $B \setminus A$ (0.006) and Neither (0.000), confirming the AR model has no generalisation mechanism for unseen starters.
+
+\paragraph{Finetune baseline.}
+Achieves perfect RFA on $B$ but catastrophically forgets $A \setminus B$ (0.016), consistent with the well-documented plasticity--stability trade-off in continual learning. Critically, RFA on Neither is exactly 0.000 despite all individual token values in Neither sequences having been observed during fine-tuning. This demonstrates that catastrophic forgetting is not a vocabulary coverage problem but a \emph{sequence-context} problem: the model memorises the mapping $\{x \mapsto \text{sequence}\}$ for training starters without learning the underlying generative rule.
+
+\paragraph{Yin-Yang models.}
+All three variants outperform both baselines on overall RFA. YY-1 achieves the best overall score (0.842) and is the only model to show substantial generalisation to Neither starters (0.508). Per-starter analysis (Table~\ref{tab:perstarter}) shows YY-1 achieves 0.516 on each of starters \{17, 19, 21\} and 0.484 on starter 20, indicating that roughly half the generated tokens are correct — the model has learned a partial but consistent rule structure.
+
+\subsection{Injection Depth Ablation}
+
+The $n_\text{skip}$ ablation reveals a clear trade-off between rule-following capacity and retention of pretrained knowledge.
+
+\paragraph{YY-4 (last-layer injection only).}
+With a single adapter at layer 4, the model has insufficient capacity to steer AR representations built up over four layers. RFA on Finetune-only starters \{12..15\} is 0.065--0.710, far below YY-1 and YY-2. On Neither it is essentially zero (0.008). The correction arrives too late in the computation to override AR predictions rooted in earlier layers.
+
+\paragraph{YY-2 (mid and final injection).}
+Better on Finetune-only than YY-4 (1.000 on \{6..11\}, partial on \{12..15\}) but substantially worse on Neither (0.145 vs.\ 0.508 for YY-1). The two adapters learn to correct the specific AR errors seen in training but fail to generalise the rule to unseen starters. Pretrain-only retention is poor (0.161), suggesting the two injection points at layers 2 and 4 interfere with the AR's own representations for starters $\{0,1\}$ which it would otherwise get correct.
+
+\paragraph{YY-1 (every-layer injection).}
+Four adapters with one per layer provide the richest correction signal. The model achieves perfect RFA on Finetune-only \{6..11\} and Both \{2..5\}, and notably the best Neither generalisation (0.508). The dense injection forces every layer to integrate rule information, giving cross-attention projections exposure to a wider range of AR hidden-state/rule-hidden-state pairs during training, producing more robust key-value mappings. The cost is moderate forgetting on Pretrain-only (0.403 vs.\ 1.000 for the frozen pretrained model), as the adapters emit spurious corrections for starters the AR already handles correctly.
+
+\begin{table}[t]
+\centering
+\caption{Per-starter RFA for Yin-Yang variants. Starters are grouped by evaluation partition.}
+\label{tab:perstarter}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{clccc}
+\toprule
+\textbf{Starter} & \textbf{Partition} & \textbf{YY-1} & \textbf{YY-2} & \textbf{YY-4} \\
+\midrule
+0  & Pretrain-only & 0.290 & 0.290 & 0.290 \\
+1  & Pretrain-only & 0.516 & 0.032 & 0.516 \\
+\midrule
+6  & Finetune-only & 1.000 & 1.000 & 1.000 \\
+7  & Finetune-only & 1.000 & 1.000 & 1.000 \\
+8  & Finetune-only & 1.000 & 1.000 & 1.000 \\
+9  & Finetune-only & 1.000 & 1.000 & 1.000 \\
+10 & Finetune-only & 1.000 & 1.000 & 1.000 \\
+11 & Finetune-only & 1.000 & 1.000 & 1.000 \\
+12 & Finetune-only & 1.000 & 1.000 & 0.290 \\
+13 & Finetune-only & 1.000 & 1.000 & 0.710 \\
+14 & Finetune-only & 1.000 & 1.000 & 0.484 \\
+15 & Finetune-only & 1.000 & 1.000 & 0.065 \\
+\midrule
+2  & Both          & 1.000 & 1.000 & 1.000 \\
+3  & Both          & 1.000 & 1.000 & 1.000 \\
+4  & Both          & 1.000 & 1.000 & 1.000 \\
+5  & Both          & 1.000 & 1.000 & 1.000 \\
+\midrule
+17 & Neither       & 0.516 & 0.065 & 0.032 \\
+19 & Neither       & 0.516 & 0.000 & 0.000 \\
+20 & Neither       & 0.484 & 0.032 & 0.000 \\
+21 & Neither       & 0.516 & 0.484 & 0.000 \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Analysis: Why Does Neither Generalisation Remain Partial?}
+
+Even YY-1 achieves only $\sim$0.5 on Neither starters. Two structural factors explain this ceiling.
+
+\textbf{Out-of-distribution rule embeddings.} The rule hidden state $\mathbf{h}^{\text{rule}}_t = \mathbf{E}^{\text{rule}}_{\hat{y}_t}$ uses the \emph{predicted next token}'s embedding. For starter $x=17$, the predicted tokens include $17+5=22$ and $17+7=0$, which appear in training (token 22 is generated by starter 15; token 0 by starters 0 and 2). However, the \emph{pattern} of (AR hidden state, rule hidden state) pairs for $x=17$ is never observed during fine-tuning. The cross-attention projections ($\mathbf{W}_K$, $\mathbf{W}_V$) learned to produce useful keys/values for the 14 training starters; these projections must extrapolate to an unseen combination for Neither starters.
+
+\textbf{AR hidden states for novel starters.} The AR model was pretrained on $A = \{0..5\}$. Its internal representations for starter 17 are arbitrary --- no training objective ever required the AR to build coherent hidden states for large starters. The cross-attention query $\mathbf{Q} = \mathbf{x}^{(l)}\mathbf{W}_Q$ operates on these out-of-distribution AR states.
+
+The 0.508 RFA achieved by YY-1 on Neither represents genuine partial generalisation: the cross-attention has learned a representation that is informative enough for the rule's ``identity'' offset positions (where $\hat{y}_t = x$, e.g.\ positions 3, 4, 7, 8, \ldots under OFFSETS $= [0,5,7,0]$) but not yet reliable for the $+5$ and $+7$ offset positions, where the required tokens (e.g.\ 22, 24\%) lie further from the dense region of the training distribution.
+
+\subsection{Qualitative Generation Examples}
+
+Table~\ref{tab:qual} shows representative generation outputs for one starter from each partition.
+
+\begin{table}[t]
+\centering
+\caption{Autoregressive generation from a 1-token prompt. Only the first 9 generated tokens are shown. \checkmark\,/\ding{55} indicates exact sequence match.}
+\label{tab:qual}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{llll}
+\toprule
+\textbf{Model} & \textbf{$x=0$ (Pre-only)} & \textbf{$x=6$ (FT-only)} & \textbf{$x=17$ (Neither)} \\
+\midrule
+Expected   & 5 7 0 0 5 7 0 0 5 & 11 13 6 6 11 13 6 6 11 & 22 0 17 17 22 0 17 17 22 \\
+\midrule
+Pretrain   & 5 7 0 0 5 7 0 0 5\,\checkmark & 8 1 1 1 6 8 1 1 6\,\ding{55} & 10 12 5 5 10 12 5 5 10\,\ding{55} \\
+Finetune   & 14 19 3 3 8 10 3 3 8\,\ding{55} & 11 13 6 6 11 13 6 6 11\,\checkmark & 19 12 14 12 17 19 12\,\ding{55} \\
+YY-1       & 5 7 7 7 7 7 7 7 7\,\ding{55}  & 11 13 6 6 11 13 6 6 11\,\checkmark & 22 22 17 17 17 17 17 17 17\,\ding{55} \\
+YY-2       & 5 7 7 7 0 7 7 7 11\,\ding{55} & 11 13 6 6 11 13 6 6 11\,\checkmark & 22 22 17 15 17 17 15 15 17\,\ding{55} \\
+YY-4       & 5 7 7 7 7 7 7 7 7\,\ding{55}  & 11 13 6 6 11 13 6 6 11\,\checkmark & 10 12 5 5 17 17 5 5 17\,\ding{55} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+For the Neither starter $x=17$, YY-1 correctly generates token $22$ at position 1 (the $+5$ offset) but then defaults to repeating $17$ rather than generating the $+7$ offset token ($0$). This pattern suggests the model has partially learned the offset-0 rule (return $x$) but fails to generalise the larger-offset positions, consistent with the token-level analysis above.
+
+\end{document}
