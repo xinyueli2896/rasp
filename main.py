@@ -4,7 +4,8 @@ main.py  –  end-to-end pipeline runner
 Usage:
     python main.py                    # run all stages
     python main.py --stage pretrain   # pretrain AR transformer only
-    python main.py --stage adapter    # train adapter only (AR ckpt must exist)
+    python main.py --stage finetune   # fine-tune AR on set B (no rule)
+    python main.py --stage yinyang    # train Yin-Yang adapter (frozen AR + rule)
     python main.py --stage eval       # evaluate all models
 
 Flags are forwarded to the individual scripts; most defaults are set there.
@@ -18,7 +19,7 @@ import sys
 import os
 
 
-STAGES = ["pretrain", "adapter", "eval"]
+STAGES = ["pretrain", "finetune", "yinyang", "eval"]
 
 
 def run_stage(script: str, extra_args: list[str]):
@@ -33,17 +34,19 @@ def run_stage(script: str, extra_args: list[str]):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Modulo-sequence adapter pipeline")
-    p.add_argument("--stage",          type=str, choices=STAGES + ["all"], default="all")
-    p.add_argument("--epochs_pretrain",type=int, default=200)
-    p.add_argument("--epochs_adapter", type=int, default=100)
-    p.add_argument("--n_cycles",       type=int, default=8)
-    p.add_argument("--d_model",        type=int, default=128)
-    p.add_argument("--n_layers",       type=int, default=4)
-    p.add_argument("--n_heads",        type=int, default=4)
-    p.add_argument("--force_fallback", action="store_true",
-                   help="Use FallbackRuleModel (pure NumPy) even if tracr is available")
-    p.add_argument("--ckpt_dir",       type=str, default="checkpoints")
+    p = argparse.ArgumentParser(description="Modulo-sequence Yin-Yang pipeline")
+    p.add_argument("--stage",            type=str, choices=STAGES + ["all"], default="all")
+    p.add_argument("--epochs_pretrain",  type=int, default=200)
+    p.add_argument("--epochs_finetune",  type=int, default=200)
+    p.add_argument("--epochs_yinyang",   type=int, default=100)
+    p.add_argument("--n_skip",           type=int, default=1,
+                   help="Yin-Yang injection interval (1=every layer, 2=every 2, 4=last only)")
+    p.add_argument("--n_cycles",         type=int, default=8)
+    p.add_argument("--d_model",          type=int, default=128)
+    p.add_argument("--n_layers",         type=int, default=4)
+    p.add_argument("--n_heads",          type=int, default=4)
+    p.add_argument("--force_fallback",   action="store_true")
+    p.add_argument("--ckpt_dir",         type=str, default="checkpoints")
     args = p.parse_args()
 
     shared = [
@@ -62,18 +65,22 @@ def main():
         if stage == "pretrain":
             run_stage("training/pretrain.py",
                       shared + ["--epochs", str(args.epochs_pretrain)])
-        elif stage == "adapter":
-            run_stage("training/train_adapter.py",
-                      shared + [
-                          "--epochs",   str(args.epochs_adapter),
-                          "--ar_ckpt",  os.path.join(args.ckpt_dir, "ar_transformer.pt"),
-                      ])
+        elif stage == "finetune":
+            run_stage("training/finetune.py",
+                      shared + ["--epochs", str(args.epochs_finetune),
+                                "--ar_ckpt", os.path.join(args.ckpt_dir, "ar_transformer.pt")])
+        elif stage == "yinyang":
+            run_stage("training/train_yinyang.py",
+                      shared + ["--epochs",    str(args.epochs_yinyang),
+                                "--n_skip",    str(args.n_skip),
+                                "--no_lora",
+                                "--ckpt_name", f"yinyang_skip{args.n_skip}",
+                                "--ar_ckpt",   os.path.join(args.ckpt_dir, "ar_transformer.pt")])
         elif stage == "eval":
             run_stage("evaluate.py",
-                      shared + [
-                          "--ar_ckpt",      os.path.join(args.ckpt_dir, "ar_transformer.pt"),
-                          "--adapter_ckpt", os.path.join(args.ckpt_dir, "adapter.pt"),
-                      ])
+                      shared + ["--ar_ckpt", os.path.join(args.ckpt_dir, "ar_transformer.pt"),
+                                "--ft_ckpt",  os.path.join(args.ckpt_dir, "ar_finetuned.pt"),
+                                "--verbose"])
 
 
 if __name__ == "__main__":
