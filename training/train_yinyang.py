@@ -4,7 +4,9 @@ from __future__ import annotations
 import os
 import sys
 import argparse
+import random
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -99,7 +101,17 @@ def _load_yinyang_attn(model, path):
     print(f'Loaded yinyang_attn weights from {path}')
 
 
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
 def train(args):
+    set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Device: {device}')
     print(f'AR pretrain starters  : {AR_TRAIN_STARTERS}')
@@ -187,6 +199,7 @@ def get_args():
     p.add_argument('--use_lora',           action='store_true', default=True)
     p.add_argument('--no_lora',            action='store_false', dest='use_lora')
     p.add_argument('--force_fallback',     action='store_true')
+    p.add_argument('--seed',               type=int,   default=42)
     return p.parse_args()
 
 
