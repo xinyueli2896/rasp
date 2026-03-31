@@ -71,11 +71,11 @@ class TracrPyTorchRuleModel(nn.Module):
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         # idx: (B, T)
         # returns logits (B, T, VOCAB_SIZE) and optionally hidden (B, T, 28)
-        # hidden = h_out[q] = [e_{token[q]} + e_{predicted_next[q]}, e_{q%4}]
+        # hidden = h_out[q] = [e_{predicted_next[q]}, e_{q%4}]
+        # (only next-token embedding + position — unambiguous signal for cross-attention)
         #
         # Hidden states are computed analytically (not via attention) so they
         # are correct for any T, including T < 4 during autoregressive generation.
-        # The structure is identical to what the attention layer produces when T >= 4.
         B, T   = idx.shape
         device = idx.device
 
@@ -90,15 +90,14 @@ class TracrPyTorchRuleModel(nn.Module):
         logits = logits.detach().requires_grad_(True)
 
         if return_hidden:
-            # h_out[q] = [e_{token[q]} + e_{predicted_next[q]}, e_{q%4}]
-            # Token subspace (dims 0-23): one-hot of current + one-hot of predicted next
-            tok_curr = self.W_E[idx]        # (B, T, 28) — e_{token[q]} in dims 0-23
+            # h_out[q] = [e_{predicted_next[q]}, e_{q%4}]
+            # Token subspace (dims 0-23): one-hot of predicted next token only
             tok_next = self.W_E[next_t]     # (B, T, 28) — e_{predicted_next[q]} in dims 0-23
             # Position subspace (dims 24-27): one-hot of q % 4
             pos_idx = t_idx % 4
             pos_emb = self.W_pos[pos_idx]   # (T, 28) — e_{q%4} in dims 24-27
 
-            h_out = tok_curr + tok_next + pos_emb.unsqueeze(0)   # (B, T, 28)
+            h_out = tok_next + pos_emb.unsqueeze(0)   # (B, T, 28)
             return logits, h_out
 
         return logits

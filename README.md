@@ -29,7 +29,7 @@ RASP program — no JAX or Tracr dependency required.
 
 - `d_model = VOCAB_SIZE + 4 = 28` (24 token dims + 4 period-4 position dims)
 - 1 attention head, no MLP, no causal mask, all weights as fixed buffers
-- Returns true residual stream: `h_out[q] = [e_{token[q]} + e_{token[(q+1)%4]}, e_{q%4}]`
+- Returns unambiguous rule signal: `h_out[q] = [e_{predicted_next[q]}, e_{q%4}]`
 
 ### Cross-attention adapter (`YinyangCrossAttention`)
 
