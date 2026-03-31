@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import glob
 import argparse
 import torch
 import numpy as np
@@ -254,6 +255,58 @@ def run_evaluation(args):
 
 
 # ---------------------------------------------------------------------------
+# Multi-seed evaluation
+# ---------------------------------------------------------------------------
+
+def run_multiseed_evaluation(stem: str, args, device):
+    pattern = os.path.join(args.ckpt_dir, f"{stem}_seed*.pt")
+    ckpt_paths = sorted(glob.glob(pattern))
+    if not ckpt_paths:
+        print(f"  No seed checkpoints found matching: {pattern}")
+        return
+
+    all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
+    categories = [
+        ("Pretrain-only", EVAL_PRETRAIN_ONLY),
+        ("Finetune-only", EVAL_FINETUNE_ONLY),
+        ("Both          ", EVAL_BOTH),
+        ("Neither       ", EVAL_NEITHER),
+        ("Overall       ", all_starters),
+    ]
+
+    # acc_per_cat[cat_label] = list of per-seed mean accuracies
+    acc_per_cat = {cat: [] for cat, _ in categories}
+    seed_names  = []
+
+    for ckpt_path in ckpt_paths:
+        seed_name = os.path.basename(ckpt_path).replace('.pt', '')
+        seed_names.append(seed_name)
+        print(f"  Evaluating {seed_name} ...", end='  ', flush=True)
+        model = load_yinyang(seed_name, ckpt_path, args, device)
+        model.eval()
+        for cat_label, starters in categories:
+            _, mean = rule_following_acc(model, starters, args.n_cycles, args.prompt_len, device)
+            acc_per_cat[cat_label].append(mean)
+        print("  ".join(f"{acc_per_cat[cat][-1]:.3f}" for cat, _ in categories))
+
+    col_w = 16
+    print()
+    print(f"Multi-seed summary: {stem}  ({len(ckpt_paths)} seeds)")
+    header = f"  {'':25}" + "".join(f" {c[0]:>{col_w}}" for c in categories)
+    print("-" * len(header))
+    print(header)
+    print("-" * len(header))
+    for i, name in enumerate(seed_names):
+        row = f"  {name:<25}" + "".join(f" {acc_per_cat[c][i]:>{col_w}.4f}" for c, _ in categories)
+        print(row)
+    print("-" * len(header))
+    for stat_label, fn in [("mean", np.mean), ("std", np.std), ("min", np.min), ("max", np.max)]:
+        row = f"  {stat_label:<25}" + "".join(f" {fn(acc_per_cat[c]):>{col_w}.4f}" for c, _ in categories)
+        print(row)
+    print("-" * len(header))
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -269,8 +322,18 @@ def get_args():
     p.add_argument("--prompt_len",     type=int,  default=1)
     p.add_argument("--verbose",        action="store_true")
     p.add_argument("--force_fallback", action="store_true", default=True)
+    p.add_argument("--seed_stems",     type=str,  nargs="*", default=[],
+                   help="Checkpoint stems to evaluate across seeds, e.g. --seed_stems yinyang_skip1 yinyang_skip2")
     return p.parse_args()
 
 
 if __name__ == "__main__":
-    run_evaluation(get_args())
+    args = get_args()
+    run_evaluation(args)
+    for stem in args.seed_stems:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print()
+        print("=" * 72)
+        print(f"MULTI-SEED EVALUATION: {stem}")
+        print("=" * 72)
+        run_multiseed_evaluation(stem, args, device)
