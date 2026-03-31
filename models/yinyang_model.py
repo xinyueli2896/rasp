@@ -153,14 +153,6 @@ class YinyangModel(nn.Module):
             force_fallback = force_fallback,
         ).to(device)
 
-        from data.dataset import VOCAB_SIZE as _VOCAB_SIZE2
-        # Direct rule bypass: rule_hidden (dims 0-VOCAB_SIZE-1 = one-hot of next token)
-        # → logit space. Near-identity is the optimal solution, making generalization easy.
-        # Initialized small so early training is stable; gate grows as adapter learns.
-        self.rule_bypass      = nn.Linear(rule_d_model, _VOCAB_SIZE2, bias=False).to(device)
-        self.rule_bypass_gate = nn.Parameter(torch.zeros(1).to(device))  # starts at 0, grows
-        nn.init.zeros_(self.rule_bypass.weight)
-
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
@@ -204,11 +196,7 @@ class YinyangModel(nn.Module):
         logits, _      = self._forward_layerwise(idx, rule_hidden,
                                                   indices_query=indices_query,
                                                   indices_key=indices_key)
-        # Direct rule bypass: rule_hidden[:,:,:VOCAB_SIZE] is one-hot of predicted next token.
-        # This shortcut lets the adapter learn near-identity mapping without routing through
-        # the AR residual stream, greatly improving generalization to unseen starters.
-        bypass = self.rule_bypass(rule_hidden) * self.rule_bypass_gate   # (B, T, VOCAB_SIZE)
-        return logits + bypass
+        return logits
 
     @torch.no_grad()
     def generate(self, start_tokens: torch.Tensor, n_new: int) -> torch.Tensor:
