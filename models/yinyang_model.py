@@ -1,7 +1,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,6 +20,7 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 class YinyangCrossAttention(nn.Module):
     # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
+    # pos_proj removed: rule_hidden already encodes position in dims 24-27
 
     def __init__(
         self,
@@ -29,7 +29,6 @@ class YinyangCrossAttention(nn.Module):
         embed_dim:    int,
         n_heads:      int = 4,
         dropout:      float = 0.1,
-        max_seq_len:  int = 128,
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
@@ -40,7 +39,6 @@ class YinyangCrossAttention(nn.Module):
         self.q_proj   = nn.Linear(d_model,      embed_dim)
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
-        self.pos_proj = nn.Linear(d_model,      embed_dim)  # projects sinusoidal pos enc into Q
         self.out_proj = nn.Linear(embed_dim,    d_model)
 
         # gate=1 at init: full contribution from start, can scale up/down during training
@@ -48,18 +46,10 @@ class YinyangCrossAttention(nn.Module):
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # sinusoidal positional encoding (fixed, not trained)
-        pe  = torch.zeros(max_seq_len, d_model)
-        pos = torch.arange(max_seq_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer('pos_enc', pe.unsqueeze(0))  # (1, max_seq_len, d_model)
-
         self._init_weights()
 
     def _init_weights(self):
-        for linear in [self.q_proj, self.k_proj, self.v_proj, self.pos_proj, self.out_proj]:
+        for linear in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
@@ -74,8 +64,7 @@ class YinyangCrossAttention(nn.Module):
         if indices_key is None:
             indices_key = torch.arange(T_k, device=ar_hidden.device)
 
-        pos_q = self.pos_enc[:, indices_query, :]                         # (1, T_q, d_model)
-        Q = (self.q_proj(ar_hidden) + self.pos_proj(pos_q))               # (B, T_q, embed_dim)
+        Q = self.q_proj(ar_hidden)                                         # (B, T_q, embed_dim)
         K = self.k_proj(rule_hidden)                                       # (B, T_k, embed_dim)
         V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
@@ -164,6 +153,14 @@ class YinyangModel(nn.Module):
             force_fallback = force_fallback,
         ).to(device)
 
+        from data.dataset import VOCAB_SIZE as _VOCAB_SIZE2
+        # Direct rule bypass: rule_hidden (dims 0-VOCAB_SIZE-1 = one-hot of next token)
+        # → logit space. Near-identity is the optimal solution, making generalization easy.
+        # Initialized small so early training is stable; gate grows as adapter learns.
+        self.rule_bypass      = nn.Linear(rule_d_model, _VOCAB_SIZE2, bias=False).to(device)
+        self.rule_bypass_gate = nn.Parameter(torch.zeros(1).to(device))  # starts at 0, grows
+        nn.init.zeros_(self.rule_bypass.weight)
+
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
@@ -173,7 +170,6 @@ class YinyangModel(nn.Module):
                 rule_d_model = rule_d_model,
                 embed_dim    = adapter_rank,
                 n_heads      = 4,
-                max_seq_len  = max_seq_len,
             )
             for _ in range(n_adapters)
         ]).to(device)
@@ -208,7 +204,11 @@ class YinyangModel(nn.Module):
         logits, _      = self._forward_layerwise(idx, rule_hidden,
                                                   indices_query=indices_query,
                                                   indices_key=indices_key)
-        return logits
+        # Direct rule bypass: rule_hidden[:,:,:VOCAB_SIZE] is one-hot of predicted next token.
+        # This shortcut lets the adapter learn near-identity mapping without routing through
+        # the AR residual stream, greatly improving generalization to unseen starters.
+        bypass = self.rule_bypass(rule_hidden) * self.rule_bypass_gate   # (B, T, VOCAB_SIZE)
+        return logits + bypass
 
     @torch.no_grad()
     def generate(self, start_tokens: torch.Tensor, n_new: int) -> torch.Tensor:

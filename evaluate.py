@@ -234,12 +234,12 @@ def run_evaluation(args):
     print("Qualitative generation examples (prompt length =", n_prompt, ")")
     print("-" * 72)
     show_len = 9
-    for cat_label, x in [
-        ("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
-        ("Finetune-only", EVAL_FINETUNE_ONLY[0]),
-        ("Both          ", EVAL_BOTH[0]),
-        ("Neither       ", EVAL_NEITHER[0]),
-    ]:
+    for cat_label, x in (
+        [("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
+         ("Finetune-only", EVAL_FINETUNE_ONLY[0]),
+         ("Both          ", EVAL_BOTH[0])]
+        + [("Neither       ", x) for x in EVAL_NEITHER]
+    ):
         seq      = make_sequence(x, args.n_cycles)
         prompt   = torch.tensor([seq[:n_prompt]], dtype=torch.long, device=device)
         expected = seq[n_prompt: n_prompt + show_len]
