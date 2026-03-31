@@ -93,6 +93,9 @@ def load_yinyang(label, ckpt_path, args, device):
 
     yinyang_state = {k.removeprefix('yinyang_attn.'): v
                      for k, v in state.items() if k.startswith('yinyang_attn.')}
+    current = model.yinyang_attn.state_dict()
+    yinyang_state = {k: v for k, v in yinyang_state.items()
+                     if k in current and v.shape == current[k].shape}
     model.yinyang_attn.load_state_dict(yinyang_state, strict=False)
 
     if has_lora:
@@ -131,6 +134,36 @@ def rule_following_acc(model, starters, n_cycles, n_prompt, device):
 # Main evaluation
 # ---------------------------------------------------------------------------
 
+def _load_seed_models(stem: str, args, device):
+    """Load all seed checkpoints for a stem. Falls back to <stem>.pt if no seeds found."""
+    seed_paths = sorted(glob.glob(os.path.join(args.ckpt_dir, f"{stem}_seed*.pt")))
+    if seed_paths:
+        return [load_yinyang(f"{stem}/seed{i}", p, args, device) for i, p in enumerate(seed_paths)]
+    single = os.path.join(args.ckpt_dir, f"{stem}.pt")
+    return [load_yinyang(stem, single, args, device)]
+
+
+def _eval_models(models_list, starters, n_cycles, n_prompt, device):
+    """Return (per_starter_means, mean, std) across a list of models."""
+    all_means = []
+    all_per   = []
+    for mdl in models_list:
+        res, mean = rule_following_acc(mdl, starters, n_cycles, n_prompt, device)
+        all_means.append(mean)
+        all_per.append(res)
+    # per-starter: average across seeds
+    per = {x: float(np.mean([r[x] for r in all_per])) for x in starters}
+    return per, float(np.mean(all_means)), float(np.std(all_means))
+
+
+def _fmt(mean, std, col_w, is_multi):
+    """Format a cell as 'mean±std' (multi-seed) or 'mean' (single)."""
+    if is_multi:
+        s = f"{mean:.3f}±{std:.3f}"
+        return s.rjust(col_w)
+    return f"{mean:{col_w}.3f}"
+
+
 def run_evaluation(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -139,9 +172,10 @@ def run_evaluation(args):
     print("=" * 60)
     pretrain_model = load_pretrain(args, device)
     finetune_model = load_finetune(args, device)
-    yinyang_skip1  = load_yinyang("skip=1", os.path.join(args.ckpt_dir, "yinyang_skip1.pt"), args, device)
-    yinyang_skip2  = load_yinyang("skip=2", os.path.join(args.ckpt_dir, "yinyang_skip2.pt"), args, device)
-    yinyang_skip4  = load_yinyang("skip=4", os.path.join(args.ckpt_dir, "yinyang_skip4.pt"), args, device)
+
+    skip1_models = _load_seed_models("yinyang_skip1", args, device)
+    skip2_models = _load_seed_models("yinyang_skip2", args, device)
+    skip4_models = _load_seed_models("yinyang_skip4", args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -151,6 +185,7 @@ def run_evaluation(args):
     print(f"  Finetune-only (B\\A) = {EVAL_FINETUNE_ONLY}")
     print(f"  Both          (A∩B) = {EVAL_BOTH}")
     print(f"  Neither             = {EVAL_NEITHER}")
+    print(f"  skip=1 seeds: {len(skip1_models)}  skip=2 seeds: {len(skip2_models)}  skip=4 seeds: {len(skip4_models)}")
 
     n_prompt = args.prompt_len
 
@@ -161,80 +196,112 @@ def run_evaluation(args):
         ("Neither       ", EVAL_NEITHER,        "{17,19,20,21}"),
     ]
 
-    models = [
-        ("Pretrain",  pretrain_model),
-        ("Finetune",  finetune_model),
-        ("skip=1",    yinyang_skip1),
-        ("skip=2",    yinyang_skip2),
-        ("skip=4",    yinyang_skip4),
+    # Single-model entries (Pretrain, Finetune) + multi-seed adapter entries
+    single_models = [
+        ("Pretrain", [pretrain_model]),
+        ("Finetune", [finetune_model]),
+    ]
+    adapter_models = [
+        ("skip=1", skip1_models, len(skip1_models) > 1),
+        ("skip=2", skip2_models, len(skip2_models) > 1),
+        ("skip=4", skip4_models, len(skip4_models) > 1),
     ]
 
-    all_results = {}
-    for cat_label, starters, _ in categories:
-        all_results[cat_label] = {}
-        for mdl_label, mdl in models:
-            res, mean = rule_following_acc(mdl, starters, args.n_cycles, n_prompt, device)
-            all_results[cat_label][mdl_label] = (res, mean)
+    # Evaluate all
+    # results[label] = {cat_label: (per_starter, mean, std)}
+    results = {}
+    all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
+    for lbl, mdls in single_models:
+        results[lbl] = {}
+        for cat_label, starters, _ in categories:
+            per, mean, std = _eval_models(mdls, starters, args.n_cycles, n_prompt, device)
+            results[lbl][cat_label] = (per, mean, std)
+        per, mean, std = _eval_models(mdls, all_starters, args.n_cycles, n_prompt, device)
+        results[lbl]["Overall"] = (per, mean, std)
+    for lbl, mdls, _ in adapter_models:
+        results[lbl] = {}
+        for cat_label, starters, _ in categories:
+            per, mean, std = _eval_models(mdls, starters, args.n_cycles, n_prompt, device)
+            results[lbl][cat_label] = (per, mean, std)
+        per, mean, std = _eval_models(mdls, all_starters, args.n_cycles, n_prompt, device)
+        results[lbl]["Overall"] = (per, mean, std)
 
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
     print()
-    print("=" * 72)
+    print("=" * 80)
     print(f"RULE-FOLLOWING ACCURACY  (generation from {n_prompt}-token prompt)")
-    print("=" * 72)
+    print("=" * 80)
 
-    col_w = 14
-    mdl_labels = [m[0] for m in models]
-    header = f"{'Data Split':<20} {'Starters':<18}" + "".join(f" {l:>{col_w}}" for l in mdl_labels)
+    col_w     = 14   # single-value columns
+    col_w_ms  = 16   # mean±std columns (wider)
+    all_labels = [lbl for lbl, _ in single_models] + [lbl for lbl, _, _ in adapter_models]
+    is_multi   = {lbl: False for lbl, _ in single_models}
+    is_multi.update({lbl: multi for lbl, _, multi in adapter_models})
+
+    header = f"{'Data Split':<20} {'Starters':<18}"
+    for lbl in all_labels:
+        w = col_w_ms if is_multi[lbl] else col_w
+        header += f" {lbl:>{w}}"
     sep = "-" * len(header)
+
     print(header)
     print(sep)
-    for cat_label, starters, starters_str in categories:
-        r = all_results[cat_label]
+    for cat_label, _, starters_str in categories:
         row = f"{cat_label:<20} {starters_str:<18}"
-        for lbl in mdl_labels:
-            row += f" {r[lbl][1]:>{col_w}.3f}"
+        for lbl in all_labels:
+            w = col_w_ms if is_multi[lbl] else col_w
+            _, mean, std = results[lbl][cat_label]
+            row += " " + _fmt(mean, std, w, is_multi[lbl])
         print(row)
     print(sep)
-    all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
-    overall = {}
-    for mdl_label, mdl in models:
-        _, mean = rule_following_acc(mdl, all_starters, args.n_cycles, n_prompt, device)
-        overall[mdl_label] = mean
     row = f"{'Overall':<20} {'all 16 starters':<18}"
-    for lbl in mdl_labels:
-        row += f" {overall[lbl]:>{col_w}.3f}"
+    for lbl in all_labels:
+        w = col_w_ms if is_multi[lbl] else col_w
+        _, mean, std = results[lbl]["Overall"]
+        row += " " + _fmt(mean, std, w, is_multi[lbl])
     print(row)
     print("=" * len(header))
 
     # -----------------------------------------------------------------------
-    # Per-starter detail
+    # Per-starter detail (uses seed-averaged per-starter scores)
     # -----------------------------------------------------------------------
     if args.verbose:
         print()
         print("Per-starter breakdown")
-        per_header = f"{'Starter':>8} {'Category':<18}" + "".join(f" {l:>{col_w}}" for l in mdl_labels)
+        per_header = f"{'Starter':>8} {'Category':<18}"
+        for lbl in all_labels:
+            w = col_w_ms if is_multi[lbl] else col_w
+            per_header += f" {lbl:>{w}}"
         per_sep = "-" * len(per_header)
         print(per_sep)
         print(per_header)
         print(per_sep)
         for cat_label, starters, _ in categories:
-            r = all_results[cat_label]
             for x in starters:
                 row = f"{x:>8} {cat_label:<18}"
-                for lbl in mdl_labels:
-                    row += f" {r[lbl][0][x]:>{col_w}.3f}"
+                for lbl in all_labels:
+                    w = col_w_ms if is_multi[lbl] else col_w
+                    per, _, _ = results[lbl][cat_label]
+                    row += f" {per[x]:{w}.3f}"
                 print(row)
         print(per_sep)
 
     # -----------------------------------------------------------------------
-    # Qualitative generation examples (one per category)
+    # Qualitative generation examples (seed 0 for adapters)
     # -----------------------------------------------------------------------
     print()
     print("Qualitative generation examples (prompt length =", n_prompt, ")")
     print("-" * 72)
     show_len = 9
+    qual_models = [
+        ("Pretrain", pretrain_model),
+        ("Finetune", finetune_model),
+        ("skip=1",   skip1_models[0]),
+        ("skip=2",   skip2_models[0]),
+        ("skip=4",   skip4_models[0]),
+    ]
     for cat_label, x in (
         [("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
          ("Finetune-only", EVAL_FINETUNE_ONLY[0]),
@@ -248,7 +315,7 @@ def run_evaluation(args):
         def mark(gen): return "✓" if gen == expected else "✗"
         print(f"  [{cat_label}] x={x}  prompt={seq[:n_prompt]}")
         print(f"    Expected : {expected}")
-        for mdl_label, mdl in models:
+        for mdl_label, mdl in qual_models:
             gen = mdl.generate(prompt, show_len)[0, n_prompt:].cpu().tolist()
             print(f"    {mdl_label:<14}: {gen}  {mark(gen)}")
         print()
