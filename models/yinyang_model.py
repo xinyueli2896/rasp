@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,7 +20,7 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):
-    # query=AR hidden, key/value=rule hidden, causal mask, output added as residual
+    # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
 
     def __init__(
         self,
@@ -28,47 +29,60 @@ class YinyangCrossAttention(nn.Module):
         embed_dim:    int,
         n_heads:      int = 4,
         dropout:      float = 0.1,
+        max_seq_len:  int = 128,
     ):
         super().__init__()
-        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
-        self.n_heads  = n_heads
-        self.head_dim = embed_dim // n_heads
-        self.scale    = self.head_dim ** -0.5
+        assert embed_dim % n_heads == 0
+        self.n_heads   = n_heads
+        self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
         self.q_proj   = nn.Linear(d_model,      embed_dim)
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
+        self.pos_proj = nn.Linear(d_model,      embed_dim)  # projects sinusoidal pos enc into Q
         self.out_proj = nn.Linear(embed_dim,    d_model)
-        self.dropout  = nn.Dropout(dropout)
+
+        # gate=0 at init: output starts as zero, opens gradually during training
+        self.gate      = nn.Parameter(torch.zeros(1))
+        self.attn_drop = nn.Dropout(dropout)
+
+        # sinusoidal positional encoding (fixed, not trained)
+        pe  = torch.zeros(max_seq_len, d_model)
+        pos = torch.arange(max_seq_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))  # (1, max_seq_len, d_model)
+
         self._init_weights()
 
     def _init_weights(self):
-        for linear in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+        for linear in [self.q_proj, self.k_proj, self.v_proj, self.pos_proj, self.out_proj]:
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
     def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor) -> torch.Tensor:
         B, T, _ = ar_hidden.shape
 
-        Q = self.q_proj(ar_hidden)    # (B, T, embed_dim)
-        K = self.k_proj(rule_hidden)  # (B, T, embed_dim)
-        V = self.v_proj(rule_hidden)  # (B, T, embed_dim)
+        pos = self.pos_enc[:, :T, :]                              # (1, T, d_model)
+        Q = (self.q_proj(ar_hidden) + self.pos_proj(pos))        # (B, T, embed_dim)
+        K = self.k_proj(rule_hidden)                              # (B, T, embed_dim)
+        V = self.v_proj(rule_hidden)                              # (B, T, embed_dim)
 
-        def split_heads(x: torch.Tensor) -> torch.Tensor:
-            return x.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        Q = Q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
-        Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
-
-        scores = (Q @ K.transpose(-2, -1)) * self.scale   # (B, n_heads, T, T)
+        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, n_heads, T, T)
 
         causal = torch.ones(T, T, device=ar_hidden.device).tril().bool()
         scores = scores.masked_fill(~causal, float('-inf'))
 
-        attn = self.dropout(F.softmax(scores, dim=-1))    # (B, n_heads, T, T)
+        attn = self.attn_drop(F.softmax(scores, dim=-1))
 
         out = (attn @ V).transpose(1, 2).contiguous().view(B, T, self.embed_dim)
-        return self.out_proj(out)
+        return self.out_proj(out) * self.gate
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +164,7 @@ class YinyangModel(nn.Module):
                 rule_d_model = rule_d_model,
                 embed_dim    = adapter_rank,
                 n_heads      = 4,
+                max_seq_len  = max_seq_len,
             )
             for _ in range(n_adapters)
         ])
