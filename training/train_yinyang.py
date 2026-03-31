@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.dataset  import (get_adapter_dataloaders,
                             AR_TRAIN_STARTERS, ADAPTER_TRAIN_STARTERS,
                             TEST_STARTERS, VOCAB_SIZE)
-from models.yinyang_model import build_yinyang_model
+from models.yinyang_model            import build_yinyang_model, RULE_D_MODEL
 
 
 def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_path):
@@ -133,7 +133,7 @@ def train(args):
             d_model        = args.d_model,
             n_layers       = args.n_layers,
             n_heads        = args.n_heads,
-            rule_d_model   = args.d_model,
+            rule_d_model   = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
             adapter_rank   = args.adapter_rank,
             n_skip         = args.n_skip,
             use_lora       = use_lora,

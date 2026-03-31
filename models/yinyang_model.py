@@ -25,16 +25,15 @@ all original AR weights stay frozen.  Requires: pip install peft
 
 If use_lora=False the entire AR model is frozen.  Only yinyang_attn trains.
 
-Parameter counts (d_model=128, rule_d_model=128, adapter_rank=32, n_heads=4,
+Parameter counts (d_model=128, rule_d_model=28, adapter_rank=32, n_heads=4,
                   n_layers=4, n_skip=2  →  2 cross-attention adapters):
   Each YinyangCrossAttention:
-    q_proj  128×32 + 32  = 4,128
-    k_proj  128×32 + 32  = 4,128
-    v_proj  128×32 + 32  = 4,128
-    out_proj 32×128 + 128 = 4,224
-    gate     1            =     1
-    total                 = 16,609
-  2 adapters              = 33,218  (always trainable)
+    q_proj   128×32 + 32  = 4,128
+    k_proj    28×32 + 32  =   928   ← rule_d_model=28 (Tracr hidden dim)
+    v_proj    28×32 + 32  =   928
+    out_proj  32×128 + 128 = 4,224
+    total                  = 10,208
+  2 adapters               = 20,416  (always trainable)
   LoRA on qkv (r=16, 4 layers, 2 matrices each):
     4 × 2 × (128×16 + 16×384) = 4 × 2 × 8,192 = 65,536  (trainable with LoRA)
 """
@@ -49,9 +48,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.transformer import AutoregressiveTransformer
-from models.rule_model   import RuleModelWrapper
-from data.dataset        import VOCAB_SIZE
+from models.transformer              import AutoregressiveTransformer
+from models.rule_model               import RuleModelWrapper
+from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
+from data.dataset                    import VOCAB_SIZE
+
+# The rule model hidden dimension is fixed by the Tracr-equivalent architecture
+RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +161,7 @@ class YinyangModel(nn.Module):
         d_model:        int  = 128,
         n_layers:       int  = 4,
         n_heads:        int  = 4,
-        rule_d_model:   int  = 128,
+        rule_d_model:   int  = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
         adapter_rank:   int  = 32,
         n_skip:         int  = 2,
         use_lora:       bool = True,
@@ -305,7 +308,7 @@ def build_yinyang_model(
     d_model:        int  = 128,
     n_layers:       int  = 4,
     n_heads:        int  = 4,
-    rule_d_model:   int  = 128,
+    rule_d_model:   int  = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
     adapter_rank:   int  = 32,
     n_skip:         int  = 2,
     use_lora:       bool = True,

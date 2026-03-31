@@ -2,35 +2,37 @@
 PyTorch-compatible wrapper around the rule model.
 
 RuleModelWrapper.forward(idx, return_hidden=False):
-  idx    : (B, T) long tensor  – input token IDs (0-11)
+  idx    : (B, T) long tensor  – input token IDs
   returns: (B, T, VOCAB_SIZE) logits  (and optionally (B, T, rule_d_model) hidden)
 
-The rule model has its own token embedding table (rule_tok_emb) that is
-independent of the AR model's vocabulary.  Hidden states are the embeddings
-of the rule's predicted next tokens in this private space:
+Hidden states
+─────────────
+Hidden states come from TracrPyTorchRuleModel — a PyTorch transformer whose
+weights are analytically constructed to be equivalent to what Tracr compiles
+from the RASP program.  They are the TRUE residual stream after the single
+attention layer:
 
-  rule_hidden[b, t] = rule_tok_emb[predicted_next[b, t]]   # (rule_d_model,)
+  hidden[b, t] = h_out[t]  = [e_{token[t]} + e_{token[(t+1)%4]},  e_{t%4}]
 
-This decouples the rule model's representation from the AR model: no shared
-lm_head.weight projection is needed.
+where the first 24 dims carry the current-token one-hot PLUS the predicted-
+next-token one-hot, and the last 4 dims carry the period-4 position one-hot.
+
+This replaces the previous fixed random embedding table.
+
+rule_d_model
+────────────
+rule_d_model is always TracrPyTorchRuleModel.TRACR_D_MODEL = VOCAB_SIZE + 4 = 28.
+The YinyangCrossAttention k_proj/v_proj therefore project from 28 → adapter_rank.
 
 Gradient design
 ───────────────
-The rule model is "frozen" – it has no learnable parameters and its weights
-never change.  But its logit output IS part of the autograd computation graph:
-
-  rule_logits = rule_model(idx)   # requires_grad=True leaf tensor
-
-This means:
-  • ∂loss/∂rule_logits is computed during backward() and accumulates in
-    rule_logits.grad (useful for interpretability / gradient analysis).
-  • Gradient flows through rule_logits into the adapter's v_linear and
-    out_proj computations even though those layers are also frozen.
+The rule model has no trainable parameters and its logit output IS part of
+the autograd graph (requires_grad=True leaf tensor).
 
 The rule
 ────────
 Rule: at sequence position t, the predicted next token is
-      (x + OFFSETS[(t+1) % 4]) % 12
+      (x + OFFSETS[(t+1) % 4]) % VOCAB_SIZE
 where x = idx[:, 0] (starting integer) and OFFSETS = [0, 5, 7, 0].
 """
 
@@ -41,105 +43,81 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
+from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
+from rasp_program.sequence_rule import VOCAB_SIZE
 
 
 class RuleModelWrapper(nn.Module):
     """
-    Frozen rule model with autograd-compatible output and its own hidden space.
+    Frozen rule model with true transformer hidden states.
 
-    The rule is implemented in pure PyTorch (no numpy / JAX).
-    Logit output has requires_grad=True so it participates in the autograd graph.
+    Wraps TracrPyTorchRuleModel to provide the same API as the previous
+    RuleModelWrapper.  Hidden states are the actual residual stream of the
+    analytically-constructed Tracr-equivalent PyTorch transformer, not a
+    fixed random embedding table.
 
-    rule_tok_emb is a fixed (non-trainable) (VOCAB_SIZE, rule_d_model) buffer
-    that serves as the rule model's private token embedding table, independent
-    of the AR model's vocabulary.  Hidden states are embeddings of predicted
-    next tokens in this private space.
+    rule_d_model is always 28 (= VOCAB_SIZE + 4 = TracrPyTorchRuleModel.TRACR_D_MODEL).
 
-    parameters() returns empty – this module contributes no weights
-    to the optimizer.  The "frozen" constraint is enforced by having
-    nothing to update, not by disabling requires_grad on the output.
+    parameters() returns empty — no trainable parameters; excluded from optimizer.
     """
 
-    def __init__(self, max_seq_len: int = 128, rule_d_model: int = 128,
+    def __init__(self, max_seq_len: int = 128,
+                 rule_d_model: int = None,   # kept for API compat, ignored (always 28)
                  force_fallback: bool = False):
         super().__init__()
-        self.rule_d_model = rule_d_model
-        # Register OFFSETS as a non-trainable buffer so it moves with the model
-        self.register_buffer(
-            "_offsets", torch.tensor(OFFSETS, dtype=torch.long)
-        )
-        # Rule model's own token embeddings — independent of AR model.
-        # Deterministic (fixed seed) so the same matrix is produced on every
-        # construction with the same rule_d_model, keeping oracle init consistent
-        # across training and evaluation without requiring a separate checkpoint.
-        gen = torch.Generator()
-        gen.manual_seed(42 + rule_d_model)
-        rule_emb = torch.randn(VOCAB_SIZE, rule_d_model, generator=gen)
-        self.register_buffer("rule_tok_emb", rule_emb)
+        self._tracr = TracrPyTorchRuleModel(max_seq_len=max_seq_len)
+        self.rule_d_model = self._tracr.TRACR_D_MODEL   # 28
 
-    def forward(self, idx: torch.Tensor,
-                return_hidden: bool = False):
+        # OFFSETS buffer for the analytical logit computation (inside TracrPyTorchRuleModel)
+        # Kept here so existing code that accesses self._offsets still works
+        from rasp_program.sequence_rule import OFFSETS
+        self.register_buffer("_offsets", torch.tensor(OFFSETS, dtype=torch.long))
+
+    def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         """
         idx : (B, T) long tensor
         return_hidden : if True, returns (logits, hidden) where
-                        hidden (B, T, rule_d_model) = rule_tok_emb[predicted_next].
+                        hidden (B, T, 28) = true residual stream from
+                        the Tracr-equivalent PyTorch transformer.
 
         logits is a requires_grad=True leaf: gradients accumulate in .grad
-        during backward().  Call retain_grad() before backward() to inspect.
-        hidden is a plain tensor slice of the fixed rule_tok_emb buffer.
+        during backward().
         """
-        B, T   = idx.shape
-        device = idx.device
-
-        # next_token[b, t] = (x[b] + OFFSETS[(t+1) % 4]) % VOCAB_SIZE
-        t      = torch.arange(T, device=device)
-        o      = self._offsets[(t + 1) % len(self._offsets)]  # (T,) offsets
-        x      = idx[:, 0]                                     # (B,) starters
-        next_t = (x[:, None] + o[None, :]) % VOCAB_SIZE        # (B, T) long
-
-        logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()  # (B, T, V)
-
-        # Detach from integer arithmetic (which has no grad), then mark as a
-        # requires_grad leaf so the tensor participates in the autograd graph.
-        logits = logits.detach().requires_grad_(True)
-
-        if return_hidden:
-            # rule_hidden[b, t] = rule_tok_emb[next_t[b, t]]  (B, T, rule_d_model)
-            hidden = self.rule_tok_emb[next_t]
-            return logits, hidden
-        return logits
+        return self._tracr(idx, return_hidden=return_hidden)
 
     def parameters(self, recurse=True):
         return iter([])   # no trainable parameters; excluded from optimizer
 
-    def named_parameters(self, prefix="", recurse=True):
+    def named_parameters(self, prefix="", recurse=True, remove_duplicate=True):
         return iter([])
 
 
 if __name__ == "__main__":
-    model = RuleModelWrapper(rule_d_model=128)
+    model = RuleModelWrapper()
+    print(f"rule_d_model = {model.rule_d_model}")
+
     # x=0: period-4 sequence = 0, 5, 7, 0, 0, 5, 7, 0, ...
-    # next-token predictions:   5, 7, 0, 0, 5, 7, 0
-    inp = torch.tensor([[0, 5, 7, 0, 0, 5, 7]], dtype=torch.long)
+    # next-token predictions:   5, 7, 0, 0, 5, 7, 0, 0
+    inp = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
     logits, hidden = model(inp, return_hidden=True)
-    print("logits shape    :", logits.shape)
-    print("hidden shape    :", hidden.shape)
+    print("logits shape    :", logits.shape)    # (1, 8, 24)
+    print("hidden shape    :", hidden.shape)    # (1, 8, 28)
     print("requires_grad   :", logits.requires_grad)
-    print("grad_fn         :", logits.grad_fn, " (None = leaf tensor, grad in .grad)")
     preds = logits.argmax(-1)
     print("predictions     :", preds.tolist())
-    expected = [[5, 7, 0, 0, 5, 7, 0]]
-    print("expected        :", expected)
-    print("correct         :", preds.tolist() == expected)
+    print("expected        :", [[5, 7, 0, 0, 5, 7, 0, 0]])
+    print("correct         :", preds.tolist() == [[5, 7, 0, 0, 5, 7, 0, 0]])
 
-    # Verify gradient flows from downstream computation back to rule_logits
+    # Hidden state: q=0 should have 1 at token dim 0 (current) and 5 (next)
+    q0 = hidden[0, 0]
+    print("\nq=0 token dims  (expect 1 at 0 and 5):", q0[:24].tolist())
+    print("q=0 pos   dims  (expect 1 at pos 24)  :", q0[24:].tolist())
+
+    # Gradient flows from downstream computation back to rule_logits
     dummy_weight = torch.randn(VOCAB_SIZE, VOCAB_SIZE, requires_grad=True)
     loss = (logits @ dummy_weight).sum()
     loss.backward()
     print("\nGradient test:")
     print("  ∂loss/∂dummy_weight computed:", dummy_weight.grad is not None)
-    # Leaf tensors with requires_grad=True accumulate .grad automatically
     print("  rule_logits.grad shape:", logits.grad.shape)
