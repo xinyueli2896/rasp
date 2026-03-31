@@ -92,7 +92,7 @@ def load_yinyang(label, ckpt_path, args, device):
 
     yinyang_state = {k.removeprefix('yinyang_attn.'): v
                      for k, v in state.items() if k.startswith('yinyang_attn.')}
-    model.yinyang_attn.load_state_dict(yinyang_state)
+    model.yinyang_attn.load_state_dict(yinyang_state, strict=False)
 
     if has_lora:
         lora_state = {k.removeprefix('ar_model.'): v
