@@ -1,42 +1,3 @@
-"""
-Yin-Yang model: AR transformer patched with rule model via layer-wise cross-attention.
-
-Architecture
-────────────
-Both streams receive the same integer sequence as input.
-
-  Yin  = rule model (always frozen)     → rule_hidden (B, T, rule_d_model)
-  Yang = AR transformer (LoRA or frozen) → hidden states at each layer
-
-Every n_skip AR layers, the Yang stream cross-attends into the Yin stream:
-
-  x = ar_block(x)
-  if (layer + 1) % n_skip == 0:
-      x = x + yinyang_attn(query=x, key=rule_hidden, value=rule_hidden)
-
-The cross-attention gate is initialised to 0 so the model starts as the
-original AR transformer and opens the rule channel gradually during training.
-
-LoRA (optional)
-───────────────
-If use_lora=True, PEFT LoRA (r=16) is applied to the "qkv" projection of
-every CausalSelfAttention block.  The LoRA delta weights are trainable;
-all original AR weights stay frozen.  Requires: pip install peft
-
-If use_lora=False the entire AR model is frozen.  Only yinyang_attn trains.
-
-Parameter counts (d_model=128, rule_d_model=28, adapter_rank=32, n_heads=4,
-                  n_layers=4, n_skip=2  →  2 cross-attention adapters):
-  Each YinyangCrossAttention:
-    q_proj   128×32 + 32  = 4,128
-    k_proj    28×32 + 32  =   928   ← rule_d_model=28 (Tracr hidden dim)
-    v_proj    28×32 + 32  =   928
-    out_proj  32×128 + 128 = 4,224
-    total                  = 10,208
-  2 adapters               = 20,416  (always trainable)
-  LoRA on qkv (r=16, 4 layers, 2 matrices each):
-    4 × 2 × (128×16 + 16×384) = 4 × 2 × 8,192 = 65,536  (trainable with LoRA)
-"""
 
 from __future__ import annotations
 
@@ -57,21 +18,8 @@ from data.dataset                    import VOCAB_SIZE
 RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
-# ---------------------------------------------------------------------------
-# Cross-attention module
-# ---------------------------------------------------------------------------
-
 class YinyangCrossAttention(nn.Module):
-    """
-    Single cross-attention block injecting rule hidden states into AR hidden states.
-
-    Query  = AR hidden state   (d_model)
-    Key/V  = rule hidden state (rule_d_model)
-    Output = tanh(gate) * out_proj(attn @ V)   added as residual to AR stream
-
-    gate is initialised to 0 so injection starts at zero and opens gradually.
-    Causal mask is applied so position t only attends to rule positions ≤ t.
-    """
+    # query=AR hidden, key/value=rule hidden, causal mask, output added as residual
 
     def __init__(
         self,
@@ -101,11 +49,6 @@ class YinyangCrossAttention(nn.Module):
             nn.init.zeros_(linear.bias)
 
     def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor) -> torch.Tensor:
-        """
-        ar_hidden   : (B, T, d_model)
-        rule_hidden : (B, T, rule_d_model)
-        returns     : (B, T, d_model)  — correction to add to AR stream
-        """
         B, T, _ = ar_hidden.shape
 
         Q = self.q_proj(ar_hidden)    # (B, T, embed_dim)
@@ -133,26 +76,6 @@ class YinyangCrossAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class YinyangModel(nn.Module):
-    """
-    AR transformer (Yang) with layer-wise cross-attention from rule model (Yin).
-
-    The AR model forward pass is run block by block so that rule hidden states
-    can be injected after every n_skip layers.  The rule model is run once
-    upfront to produce rule_hidden for all positions.
-
-    Parameters
-    ----------
-    ar_ckpt_path   : path to pretrained AR checkpoint (None → random init)
-    max_seq_len    : maximum sequence length
-    d_model        : AR hidden dimension
-    n_layers       : number of AR transformer blocks
-    n_heads        : number of AR attention heads
-    rule_d_model   : rule model embedding dimension
-    adapter_rank   : embed_dim for each YinyangCrossAttention
-    n_skip         : inject every n_skip AR layers (one adapter per n_skip layers)
-    use_lora       : apply LoRA (r=16) to AR qkv projections if True; fully freeze otherwise
-    force_fallback : use FallbackRuleModel even if tracr is available
-    """
 
     def __init__(
         self,
@@ -173,9 +96,6 @@ class YinyangModel(nn.Module):
         self.n_layers = n_layers
         self.n_skip   = n_skip
 
-        # ------------------------------------------------------------------ #
-        # AR model
-        # ------------------------------------------------------------------ #
         from data.dataset import VOCAB_SIZE as _VOCAB_SIZE
         ar_model = AutoregressiveTransformer(
             vocab_size  = _VOCAB_SIZE,
@@ -215,18 +135,12 @@ class YinyangModel(nn.Module):
             self.ar_model = ar_model
             self._ar_base = ar_model
 
-        # ------------------------------------------------------------------ #
-        # Rule model — always fully frozen (no parameters)
-        # ------------------------------------------------------------------ #
         self.rule_model = RuleModelWrapper(
             max_seq_len    = max_seq_len,
             rule_d_model   = rule_d_model,
             force_fallback = force_fallback,
         ).to(device)
 
-        # ------------------------------------------------------------------ #
-        # Cross-attention adapters: one per n_skip AR layers
-        # ------------------------------------------------------------------ #
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
@@ -240,19 +154,7 @@ class YinyangModel(nn.Module):
             for _ in range(n_adapters)
         ])
 
-    # ---------------------------------------------------------------------- #
-    # Core layer-wise forward
-    # ---------------------------------------------------------------------- #
-
-    def _forward_layerwise(
-        self,
-        idx:         torch.Tensor,   # (B, T)
-        rule_hidden: torch.Tensor,   # (B, T, rule_d_model)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Run AR transformer block by block, injecting rule_hidden every n_skip layers.
-        Returns (logits, final_hidden) — shapes (B, T, vocab) and (B, T, d_model).
-        """
+    def _forward_layerwise(self, idx: torch.Tensor, rule_hidden: torch.Tensor):
         ar = self._ar_base
         B, T = idx.shape
 
@@ -262,7 +164,6 @@ class YinyangModel(nn.Module):
 
         for i, block in enumerate(ar.blocks):
             x = block(x)
-            # inject after every n_skip-th block (0-indexed: layers 1,3,5,... with n_skip=2)
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 x = x + self.yinyang_attn[adapter_idx](x, rule_hidden)
@@ -271,22 +172,13 @@ class YinyangModel(nn.Module):
         logits = ar.lm_head(hidden)
         return logits, hidden
 
-    # ---------------------------------------------------------------------- #
-    # Public interface
-    # ---------------------------------------------------------------------- #
-
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        """
-        idx : (B, T) long tensor
-        Returns logits (B, T, vocab_size).
-        """
         _, rule_hidden = self.rule_model(idx, return_hidden=True)
         logits, _      = self._forward_layerwise(idx, rule_hidden)
         return logits
 
     @torch.no_grad()
     def generate(self, start_tokens: torch.Tensor, n_new: int) -> torch.Tensor:
-        """Autoregressively generate n_new tokens after start_tokens."""
         self.eval()
         tokens  = start_tokens.clone()
         max_len = self._ar_base.max_seq_len
@@ -297,10 +189,6 @@ class YinyangModel(nn.Module):
             tokens   = torch.cat([tokens, next_tok], dim=1)
         return tokens
 
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 def build_yinyang_model(
     ar_ckpt_path:   str | None = None,

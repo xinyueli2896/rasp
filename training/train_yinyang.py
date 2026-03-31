@@ -1,15 +1,3 @@
-"""
-Train the Yin-Yang model.
-
-Three supported modes:
-  Option 1 (--no_lora):           AR frozen, only yinyang_attn trains
-  Option 2 (--lora_rank N):       AR gets LoRA of rank N alongside yinyang_attn
-  Option 3 (two-phase):           Phase 1 = no_lora for --epochs,
-                                  Phase 2 = add LoRA, warm-start yinyang_attn,
-                                            train for --phase2_epochs more
-
-The checkpoint name is controlled by --ckpt_name (default 'yinyang').
-"""
 
 from __future__ import annotations
 
