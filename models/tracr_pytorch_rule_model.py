@@ -69,38 +69,38 @@ class TracrPyTorchRuleModel(nn.Module):
         self.register_buffer("_offsets", torch.tensor(OFFSETS, dtype=torch.long))
 
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
-        # idx: (B, T), T >= 4
+        # idx: (B, T)
         # returns logits (B, T, VOCAB_SIZE) and optionally hidden (B, T, 28)
-        # hidden = true residual stream: h_out[q] = [e_{token[q]} + e_{token[(q+1)%4]}, e_{q%4}]
+        # hidden = h_out[q] = [e_{token[q]} + e_{predicted_next[q]}, e_{q%4}]
+        #
+        # Hidden states are computed analytically (not via attention) so they
+        # are correct for any T, including T < 4 during autoregressive generation.
+        # The structure is identical to what the attention layer produces when T >= 4.
         B, T   = idx.shape
         device = idx.device
 
-        tok_emb = self.W_E[idx]
-        pos_idx = torch.arange(T, device=device) % 4
-        pos_emb = self.W_pos[pos_idx]
-        h = tok_emb + pos_emb.unsqueeze(0)   # (B, T, 28)
-
-        Q = h @ self.W_Q.T   # e_{(q+1)%4} in dims 24-27
-        K = h @ self.W_K.T   # e_{k%4}     in dims 24-27
-        V = h @ self.W_V.T   # e_{token[k]} in dims 0-23
-
-        scores = (Q @ K.transpose(-2, -1)) * self.attn_scale
-        attn = F.softmax(scores, dim=-1)   # no causal mask
-
-        attn_out_raw = attn @ V
-        attn_out     = attn_out_raw @ self.W_O.T
-        h_out = h + attn_out   # (B, T, 28)
-
+        # Compute predicted next tokens analytically
         t_idx  = torch.arange(T, device=device)
         o      = self._offsets[(t_idx + 1) % 4]
         x      = idx[:, 0]
-        next_t = (x[:, None] + o[None, :]) % VOCAB_SIZE
+        next_t = (x[:, None] + o[None, :]) % VOCAB_SIZE   # (B, T)
 
+        # Logits: exact one-hot
         logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()
         logits = logits.detach().requires_grad_(True)
 
         if return_hidden:
+            # h_out[q] = [e_{token[q]} + e_{predicted_next[q]}, e_{q%4}]
+            # Token subspace (dims 0-23): one-hot of current + one-hot of predicted next
+            tok_curr = self.W_E[idx]        # (B, T, 28) — e_{token[q]} in dims 0-23
+            tok_next = self.W_E[next_t]     # (B, T, 28) — e_{predicted_next[q]} in dims 0-23
+            # Position subspace (dims 24-27): one-hot of q % 4
+            pos_idx = t_idx % 4
+            pos_emb = self.W_pos[pos_idx]   # (T, 28) — e_{q%4} in dims 24-27
+
+            h_out = tok_curr + tok_next + pos_emb.unsqueeze(0)   # (B, T, 28)
             return logits, h_out
+
         return logits
 
     def parameters(self, recurse=True):
