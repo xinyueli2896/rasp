@@ -167,7 +167,7 @@ class YinyangModel(nn.Module):
                 max_seq_len  = max_seq_len,
             )
             for _ in range(n_adapters)
-        ])
+        ]).to(device)
 
     def _forward_layerwise(self, idx: torch.Tensor, rule_hidden: torch.Tensor):
         ar = self._ar_base
@@ -189,6 +189,7 @@ class YinyangModel(nn.Module):
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         _, rule_hidden = self.rule_model(idx, return_hidden=True)
+        rule_hidden    = rule_hidden.to(idx.device)
         logits, _      = self._forward_layerwise(idx, rule_hidden)
         return logits
 
