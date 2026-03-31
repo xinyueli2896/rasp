@@ -43,8 +43,9 @@ class YinyangCrossAttention(nn.Module):
         self.pos_proj = nn.Linear(d_model,      embed_dim)  # projects sinusoidal pos enc into Q
         self.out_proj = nn.Linear(embed_dim,    d_model)
 
-        # gate=0 at init: output starts as zero, opens gradually during training
-        self.gate      = nn.Parameter(torch.zeros(1))
+        # gate=1 at init: full contribution from start, can scale up/down during training
+        # (do NOT init to 0 — with frozen AR, gate=0 kills gradients for all adapter weights)
+        self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
         # sinusoidal positional encoding (fixed, not trained)
