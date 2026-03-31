@@ -62,26 +62,34 @@ class YinyangCrossAttention(nn.Module):
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
-    def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor) -> torch.Tensor:
-        B, T, _ = ar_hidden.shape
+    def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor,
+                indices_query: torch.Tensor | None = None,
+                indices_key:   torch.Tensor | None = None) -> torch.Tensor:
+        B, T_q, _ = ar_hidden.shape
+        B, T_k, _ = rule_hidden.shape
 
-        pos = self.pos_enc[:, :T, :]                              # (1, T, d_model)
-        Q = (self.q_proj(ar_hidden) + self.pos_proj(pos))        # (B, T, embed_dim)
-        K = self.k_proj(rule_hidden)                              # (B, T, embed_dim)
-        V = self.v_proj(rule_hidden)                              # (B, T, embed_dim)
+        if indices_query is None:
+            indices_query = torch.arange(T_q, device=ar_hidden.device)
+        if indices_key is None:
+            indices_key = torch.arange(T_k, device=ar_hidden.device)
 
-        Q = Q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        K = K.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        V = V.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        pos_q = self.pos_enc[:, indices_query, :]                         # (1, T_q, d_model)
+        Q = (self.q_proj(ar_hidden) + self.pos_proj(pos_q))               # (B, T_q, embed_dim)
+        K = self.k_proj(rule_hidden)                                       # (B, T_k, embed_dim)
+        V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
-        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, n_heads, T, T)
+        Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        causal = torch.ones(T, T, device=ar_hidden.device).tril().bool()
+        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)       # (B, n_heads, T_q, T_k)
+
+        causal = torch.ones(T_q, T_k, device=ar_hidden.device).tril().bool()
         scores = scores.masked_fill(~causal, float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
 
-        out = (attn @ V).transpose(1, 2).contiguous().view(B, T, self.embed_dim)
+        out = (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.embed_dim)
         return self.out_proj(out) * self.gate
 
 
@@ -169,7 +177,9 @@ class YinyangModel(nn.Module):
             for _ in range(n_adapters)
         ]).to(device)
 
-    def _forward_layerwise(self, idx: torch.Tensor, rule_hidden: torch.Tensor):
+    def _forward_layerwise(self, idx: torch.Tensor, rule_hidden: torch.Tensor,
+                           indices_query: torch.Tensor | None = None,
+                           indices_key:   torch.Tensor | None = None):
         ar = self._ar_base
         B, T = idx.shape
 
@@ -181,16 +191,22 @@ class YinyangModel(nn.Module):
             x = block(x)
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
-                x = x + self.yinyang_attn[adapter_idx](x, rule_hidden)
+                x = x + self.yinyang_attn[adapter_idx](x, rule_hidden,
+                                                        indices_query=indices_query,
+                                                        indices_key=indices_key)
 
         hidden = ar.ln_f(x)
         logits = ar.lm_head(hidden)
         return logits, hidden
 
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+    def forward(self, idx: torch.Tensor,
+                indices_query: torch.Tensor | None = None,
+                indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         _, rule_hidden = self.rule_model(idx, return_hidden=True)
         rule_hidden    = rule_hidden.to(idx.device)
-        logits, _      = self._forward_layerwise(idx, rule_hidden)
+        logits, _      = self._forward_layerwise(idx, rule_hidden,
+                                                  indices_query=indices_query,
+                                                  indices_key=indices_key)
         return logits
 
     @torch.no_grad()
