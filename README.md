@@ -94,7 +94,7 @@ python training/train_yinyang.py \
     --ckpt_name yinyang_skip1 \
     --no_lora \
     --epochs 100
-```
+``6
 
 n_skip ablation (run all three to compare):
 
