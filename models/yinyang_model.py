@@ -19,15 +19,12 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):
-    # query=AR hidden, key/value=rule hidden, NO causal mask, output scaled by learnable gate
+    # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
+    # pos_proj removed: rule_hidden already encodes position in dims 24-27
     #
-    # The causal mask is intentionally absent: rule_hidden is computed analytically
-    # from only idx[:,0] (the starter token), so ALL positions are correct regardless
-    # of future tokens. Without the mask, the adapter at position q can attend to ALL
-    # rule_hidden positions — including future ones with the same cycle position —
-    # giving a stronger and more consistent training signal.
-    # During generation this makes no difference (we only use the last position's output,
-    # which already sees all keys under a causal mask anyway).
+    # Sinusoidal pos encoding (embed_dim-space) is added to BOTH Q and K so that
+    # Q[q] · K[q] is naturally high from initialization (diagonal attention bias).
+    # This fixes systematic failure at cycle positions where multiple keys compete.
 
     def __init__(
         self,
@@ -36,6 +33,7 @@ class YinyangCrossAttention(nn.Module):
         embed_dim:    int,
         n_heads:      int = 4,
         dropout:      float = 0.1,
+        max_seq_len:  int = 128,
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
@@ -52,6 +50,17 @@ class YinyangCrossAttention(nn.Module):
         # (do NOT init to 0 — with frozen AR, gate=0 kills gradients for all adapter weights)
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
+
+        # Sinusoidal pos encoding in embed_dim space — added to BOTH Q and K.
+        # Makes Q[q]·K[q] naturally larger than Q[q]·K[k≠q] from initialization,
+        # giving the adapter a diagonal attention prior without any learned projection.
+        import math
+        pe  = torch.zeros(max_seq_len, embed_dim)
+        pos = torch.arange(max_seq_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))  # (1, max_seq_len, embed_dim)
 
         self._init_weights()
 
@@ -71,8 +80,10 @@ class YinyangCrossAttention(nn.Module):
         if indices_key is None:
             indices_key = torch.arange(T_k, device=ar_hidden.device)
 
-        Q = self.q_proj(ar_hidden)                                         # (B, T_q, embed_dim)
-        K = self.k_proj(rule_hidden)                                       # (B, T_k, embed_dim)
+        pos_q = self.pos_enc[:, indices_query, :]                          # (1, T_q, embed_dim)
+        pos_k = self.pos_enc[:, indices_key,   :]                          # (1, T_k, embed_dim)
+        Q = self.q_proj(ar_hidden)   + pos_q                               # (B, T_q, embed_dim)
+        K = self.k_proj(rule_hidden) + pos_k                               # (B, T_k, embed_dim)
         V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
@@ -80,6 +91,9 @@ class YinyangCrossAttention(nn.Module):
         V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)       # (B, n_heads, T_q, T_k)
+
+        causal = torch.ones(T_q, T_k, device=ar_hidden.device).tril().bool()
+        scores = scores.masked_fill(~causal, float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
 
@@ -166,6 +180,7 @@ class YinyangModel(nn.Module):
                 rule_d_model = rule_d_model,
                 embed_dim    = adapter_rank,
                 n_heads      = 4,
+                max_seq_len  = max_seq_len,
             )
             for _ in range(n_adapters)
         ]).to(device)
