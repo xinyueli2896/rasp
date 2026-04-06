@@ -19,8 +19,15 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):
-    # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
-    # pos_proj removed: rule_hidden already encodes position in dims 24-27
+    # query=AR hidden, key/value=rule hidden, NO causal mask, output scaled by learnable gate
+    #
+    # The causal mask is intentionally absent: rule_hidden is computed analytically
+    # from only idx[:,0] (the starter token), so ALL positions are correct regardless
+    # of future tokens. Without the mask, the adapter at position q can attend to ALL
+    # rule_hidden positions — including future ones with the same cycle position —
+    # giving a stronger and more consistent training signal.
+    # During generation this makes no difference (we only use the last position's output,
+    # which already sees all keys under a causal mask anyway).
 
     def __init__(
         self,
@@ -73,9 +80,6 @@ class YinyangCrossAttention(nn.Module):
         V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)       # (B, n_heads, T_q, T_k)
-
-        causal = torch.ones(T_q, T_k, device=ar_hidden.device).tril().bool()
-        scores = scores.masked_fill(~causal, float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
 
