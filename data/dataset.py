@@ -25,8 +25,8 @@ VOCAB_SIZE = 24
 OFFSETS = [0, 5, 7, 0]       # rule offsets per cycle step (period 4)
 
 # Training splits
-AR_TRAIN_STARTERS      = list(range(6))           # 0-5   → AR pretrain (set A)
-FINETUNE_STARTERS      = list(range(2, 16))        # 2-15  → fine-tune set B
+AR_TRAIN_STARTERS      = list(range(6))
+FINETUNE_STARTERS      = list(range(2, 16))
                                                    #   {6-15}: AR wrong, rule right (10 starters)
                                                    #   {2-5}:  AR right, rule right
 TEST_STARTERS          = [17, 19, 20, 21]          # never-seen; all tokens individually seen

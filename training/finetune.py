@@ -103,10 +103,10 @@ def train(args):
 
         if train_acc > best_train_acc:
             best_train_acc = train_acc
-            path = os.path.join(args.ckpt_dir, "ar_finetuned.pt")
+            path = os.path.join(args.ckpt_dir, f"{args.ckpt_name}.pt")
             torch.save(model.state_dict(), path)
 
-    print(f"\nSaved fine-tuned AR checkpoint → {os.path.join(args.ckpt_dir, 'ar_finetuned.pt')}")
+    print(f"\nSaved fine-tuned AR checkpoint → {os.path.join(args.ckpt_dir, args.ckpt_name + '.pt')}")
     print(f"Best train accuracy on finetune set: {best_train_acc:.4f}")
 
 
@@ -125,6 +125,7 @@ def get_args():
     p.add_argument("--n_seqs_per_starter", type=int,   default=200)
     p.add_argument("--log_every",          type=int,   default=20)
     p.add_argument("--ckpt_dir",           type=str,   default="checkpoints")
+    p.add_argument("--ckpt_name",          type=str,   default="ar_finetuned")
     return p.parse_args()
 
 

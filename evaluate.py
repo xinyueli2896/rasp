@@ -173,9 +173,11 @@ def run_evaluation(args):
     pretrain_model = load_pretrain(args, device)
     finetune_model = load_finetune(args, device)
 
-    skip1_models = _load_seed_models("yinyang_skip1", args, device)
-    skip2_models = _load_seed_models("yinyang_skip2", args, device)
-    skip4_models = _load_seed_models("yinyang_skip4", args, device)
+    default_stems = ["yinyang_skip1", "yinyang_skip2", "yinyang_skip4"]
+    stems = args.adapter_stems if args.adapter_stems else default_stems
+    skip1_models = _load_seed_models(stems[0] if len(stems) > 0 else "yinyang_skip1", args, device)
+    skip2_models = _load_seed_models(stems[1] if len(stems) > 1 else "yinyang_skip2", args, device)
+    skip4_models = _load_seed_models(stems[2] if len(stems) > 2 else "yinyang_skip4", args, device)
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -202,9 +204,9 @@ def run_evaluation(args):
         ("Finetune", [finetune_model]),
     ]
     adapter_models = [
-        ("skip=1", skip1_models, len(skip1_models) > 1),
-        ("skip=2", skip2_models, len(skip2_models) > 1),
-        ("skip=4", skip4_models, len(skip4_models) > 1),
+        (stems[0] if len(stems) > 0 else "skip=1", skip1_models, len(skip1_models) > 1),
+        (stems[1] if len(stems) > 1 else "skip=2", skip2_models, len(skip2_models) > 1),
+        (stems[2] if len(stems) > 2 else "skip=4", skip4_models, len(skip4_models) > 1),
     ]
 
     # Evaluate all
@@ -296,11 +298,11 @@ def run_evaluation(args):
     print("-" * 72)
     show_len = 9
     qual_models = [
-        ("Pretrain", pretrain_model),
-        ("Finetune", finetune_model),
-        ("skip=1",   skip1_models[0]),
-        ("skip=2",   skip2_models[0]),
-        ("skip=4",   skip4_models[0]),
+        ("Pretrain",  pretrain_model),
+        ("Finetune",  finetune_model),
+        (stems[0] if len(stems) > 0 else "skip=1", skip1_models[0]),
+        (stems[1] if len(stems) > 1 else "skip=2", skip2_models[0]),
+        (stems[2] if len(stems) > 2 else "skip=4", skip4_models[0]),
     ]
     for cat_label, x in (
         [("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
@@ -391,6 +393,8 @@ def get_args():
     p.add_argument("--force_fallback", action="store_true", default=True)
     p.add_argument("--seed_stems",     type=str,  nargs="*", default=[],
                    help="Checkpoint stems to evaluate across seeds, e.g. --seed_stems yinyang_skip1 yinyang_skip2")
+    p.add_argument("--adapter_stems",  type=str,  nargs="*", default=None,
+                   help="Override adapter stems in main table (default: yinyang_skip1 yinyang_skip2 yinyang_skip4)")
     return p.parse_args()
 
 
