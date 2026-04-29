@@ -98,12 +98,18 @@ def load_yinyang(label, ckpt_path, args, device):
                      if k in current and v.shape == current[k].shape}
     model.yinyang_attn.load_state_dict(yinyang_state, strict=False)
 
+    ar_keys = {k: v for k, v in state.items()
+               if k.startswith('ar_model.') and 'lora_' not in k}
     if has_lora:
         lora_state = {k.removeprefix('ar_model.'): v
                       for k, v in state.items() if k.startswith('ar_model.')}
         model.ar_model.load_state_dict(lora_state, strict=False)
         lora_keys = [k for k in lora_state if 'lora_' in k]
         print(f"  {label:<12}: loaded yinyang_attn + LoRA (rank={lora_rank}, {len(lora_keys)} lora tensors) from {ckpt_path}")
+    elif ar_keys:
+        ar_state = {k.removeprefix('ar_model.'): v for k, v in ar_keys.items()}
+        model.ar_model.load_state_dict(ar_state)
+        print(f"  {label:<12}: loaded yinyang_attn + AR weights from {ckpt_path}")
     else:
         print(f"  {label:<12}: loaded yinyang_attn from {ckpt_path}")
 

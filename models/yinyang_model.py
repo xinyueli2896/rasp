@@ -121,6 +121,7 @@ class YinyangModel(nn.Module):
         lora_rank:      int  = 16,
         force_fallback: bool = False,
         device:         str  = 'cpu',
+        train_ar:       bool = False,
     ):
         super().__init__()
         self.n_layers = n_layers
@@ -160,8 +161,9 @@ class YinyangModel(nn.Module):
             # _ar_base.blocks[i](x) already uses the LoRA-adapted qkv.
             self._ar_base = self.ar_model.base_model.model
         else:
-            for p in ar_model.parameters():
-                p.requires_grad_(False)
+            if not train_ar:
+                for p in ar_model.parameters():
+                    p.requires_grad_(False)
             self.ar_model = ar_model
             self._ar_base = ar_model
 
@@ -243,6 +245,7 @@ def build_yinyang_model(
     lora_rank:      int  = 16,
     force_fallback: bool = False,
     device:         str  = 'cpu',
+    train_ar:       bool = False,
 ) -> YinyangModel:
     return YinyangModel(
         ar_ckpt_path   = ar_ckpt_path,
@@ -257,6 +260,7 @@ def build_yinyang_model(
         lora_rank      = lora_rank,
         force_fallback = force_fallback,
         device         = device,
+        train_ar       = train_ar,
     )
 
 
