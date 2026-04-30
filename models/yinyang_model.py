@@ -103,17 +103,20 @@ class YinyangCrossAttention(nn.Module):
 
 class BidirectionalYinyangAttention(nn.Module):
     """
-    Two-round bidirectional cross-attention. Rule model kept, no token input needed.
+    Bidirectional cross-attention where AR provides proxy input to rule model.
 
-    Round 1 (backward — AR queries rule's token embedding bank):
-      AR hidden states attend to W_E (rule model's 24 token embeddings as static KV memory).
-      No token sequence needed — AR learns to soft-select the right token embedding.
-      W_pos[q%4] is added from position alone (cycle position is always known).
-      Out = rule_hidden_inferred  (rule_d_model=28)
+    Step 1 (AR → rule):
+      AR hidden states are projected into rule space and augmented with the
+      frozen positional embeddings W_pos[q%4]. This proxy is then processed
+      by the rule model's own frozen attention matrices W_Q, W_K, W_V, W_O.
+      No token input to the rule model — AR's representation substitutes.
+      Because W_Q/W_K zero out the token dims of the proxy, the attention
+      pattern is purely positional (identical to the Tracr rule model).
+      W_V reads the token-subspace of the proxy — i.e. what AR put there.
 
-    Round 2 (forward — AR attends to inferred rule state, same as YinyangCrossAttention):
-      Q = AR hidden states, K/V = rule_hidden_inferred
-      Out = correction added to AR  (d_model)
+    Step 2 (rule → AR):
+      AR cross-attends to the rule model's output (causal mask, same as
+      the unidirectional YinyangCrossAttention).
     """
 
     def __init__(
@@ -127,17 +130,15 @@ class BidirectionalYinyangAttention(nn.Module):
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
-        self.n_heads   = n_heads
-        self.head_dim  = embed_dim // n_heads
-        self.embed_dim = embed_dim
+        self.n_heads          = n_heads
+        self.head_dim         = embed_dim // n_heads
+        self.embed_dim        = embed_dim
+        self.rule_attn_scale  = 20.0   # matches Tracr rule model attn_scale
 
-        # Round 1 — backward: AR (Q) queries W_E (K, V) to infer soft token embedding
-        self.back_q_proj   = nn.Linear(d_model,      embed_dim)   # AR → query
-        self.back_k_proj   = nn.Linear(rule_d_model, embed_dim)   # W_E → key
-        self.back_v_proj   = nn.Linear(rule_d_model, embed_dim)   # W_E → value
-        self.back_out_proj = nn.Linear(embed_dim,    rule_d_model) # → rule space
+        # Step 1: project AR hidden states into rule space
+        self.ar_to_rule = nn.Linear(d_model, rule_d_model)
 
-        # Round 2 — forward: AR (Q) attends to inferred rule state (K, V)
+        # Step 2: AR cross-attends to rule output (causal)
         self.fwd_q_proj   = nn.Linear(d_model,      embed_dim)
         self.fwd_k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.fwd_v_proj   = nn.Linear(rule_d_model, embed_dim)
@@ -146,68 +147,68 @@ class BidirectionalYinyangAttention(nn.Module):
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Sinusoidal pos encoding for forward round (diagonal attention prior)
         import math
         pe  = torch.zeros(max_seq_len, embed_dim)
         pos = torch.arange(max_seq_len).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer('pos_enc', pe.unsqueeze(0))   # (1, max_seq_len, embed_dim)
+        self.register_buffer('pos_enc', pe.unsqueeze(0))
 
         self._init_weights()
 
     def _init_weights(self):
-        for m in [self.back_q_proj, self.back_k_proj, self.back_v_proj, self.back_out_proj,
-                  self.fwd_q_proj,  self.fwd_k_proj,  self.fwd_v_proj,  self.fwd_out_proj]:
+        nn.init.xavier_uniform_(self.ar_to_rule.weight)
+        nn.init.zeros_(self.ar_to_rule.bias)
+        for m in [self.fwd_q_proj, self.fwd_k_proj, self.fwd_v_proj, self.fwd_out_proj]:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def _mha(self, Q, K, V, causal: bool = True) -> torch.Tensor:
+    def _fwd_mha(self, Q, K, V) -> torch.Tensor:
         B, T_q, _ = Q.shape
         _, T_k, _ = K.shape
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        if causal:
-            mask = torch.ones(T_q, T_k, device=Q.device).tril().bool()
-            scores = scores.masked_fill(~mask, float('-inf'))
-        attn = self.attn_drop(F.softmax(scores, dim=-1))
+        mask   = torch.ones(T_q, T_k, device=Q.device).tril().bool()
+        scores = scores.masked_fill(~mask, float('-inf'))
+        attn   = self.attn_drop(F.softmax(scores, dim=-1))
         return (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.n_heads * self.head_dim)
 
     def forward(self, ar_hidden: torch.Tensor,
-                W_E: torch.Tensor, W_pos: torch.Tensor) -> torch.Tensor:
+                W_pos: torch.Tensor,
+                W_Q: torch.Tensor, W_K: torch.Tensor,
+                W_V: torch.Tensor, W_O: torch.Tensor) -> torch.Tensor:
         """
         ar_hidden : (B, T, d_model)
-        W_E       : (vocab_size, rule_d_model)  — rule model token embeddings (frozen)
-        W_pos     : (4, rule_d_model)           — rule model position embeddings (frozen)
-        returns correction : (B, T, d_model)
+        W_pos     : (4, 28)   — frozen rule model position embeddings
+        W_Q/K/V/O : (28, 28) — frozen rule model attention matrices
         """
         B, T, _ = ar_hidden.shape
 
-        # --- Round 1: backward — AR soft-queries rule's token embedding bank ---
-        # Q: AR hidden projected to attention space
-        # K, V: W_E (24 token embeddings) — static vocabulary, no causal mask needed
-        Q1 = self.back_q_proj(ar_hidden)                           # (B, T, embed_dim)
-        K1 = self.back_k_proj(W_E).unsqueeze(0).expand(B, -1, -1) # (B, 24, embed_dim)
-        V1 = self.back_v_proj(W_E).unsqueeze(0).expand(B, -1, -1) # (B, 24, embed_dim)
-        soft_tok = self.back_out_proj(
-            self._mha(Q1, K1, V1, causal=False)
-        )                                                          # (B, T, rule_d_model)
-
-        # Add positional embedding from rule model (cycle position known from index alone)
+        # --- Step 1: AR → rule ---
+        # proxy = learned projection of AR + frozen position embedding
+        # W_pos ensures position subspace is filled so W_Q/W_K give the
+        # correct positional attention pattern (position q → position (q+1)%4)
+        proxy   = self.ar_to_rule(ar_hidden)                       # (B, T, 28)
         pos_idx = torch.arange(T, device=ar_hidden.device) % 4
-        rule_hidden = soft_tok + W_pos[pos_idx].unsqueeze(0)       # (B, T, rule_d_model)
+        proxy   = proxy + W_pos[pos_idx].unsqueeze(0)              # (B, T, 28)
 
-        # --- Round 2: forward — AR reads inferred rule state ---
-        pos = self.pos_enc[:, :T, :]
-        Q2 = self.fwd_q_proj(ar_hidden)   + pos                   # (B, T, embed_dim)
-        K2 = self.fwd_k_proj(rule_hidden) + pos                   # (B, T, embed_dim)
-        V2 = self.fwd_v_proj(rule_hidden)                         # (B, T, embed_dim)
-        correction = self.fwd_out_proj(
-            self._mha(Q2, K2, V2, causal=True)
-        )                                                          # (B, T, d_model)
+        # Run rule model's frozen attention on proxy (no causal mask)
+        Q_rule   = proxy @ W_Q.t()                                  # (B, T, 28)
+        K_rule   = proxy @ W_K.t()                                  # (B, T, 28)
+        V_rule   = proxy @ W_V.t()                                  # (B, T, 28)
+        scores   = (Q_rule @ K_rule.transpose(-1, -2)) * self.rule_attn_scale
+        attn     = F.softmax(scores, dim=-1)
+        rule_out = (attn @ V_rule) @ W_O.t()                       # (B, T, 28)
+
+        # --- Step 2: rule → AR ---
+        pos        = self.pos_enc[:, :T, :]
+        Q2         = self.fwd_q_proj(ar_hidden) + pos
+        K2         = self.fwd_k_proj(rule_out)  + pos
+        V2         = self.fwd_v_proj(rule_out)
+        correction = self.fwd_out_proj(self._fwd_mha(Q2, K2, V2))  # (B, T, d_model)
 
         return correction * self.gate
 
@@ -286,10 +287,14 @@ class YinyangModel(nn.Module):
             force_fallback = force_fallback,
         ).to(device)
 
-        # Cache rule model's frozen embedding matrices for bidirectional mode.
+        # Cache rule model's frozen weight matrices for bidirectional mode.
         # Registered as buffers so they move with .to(device) automatically.
         self.register_buffer('_W_E',   self.rule_model._tracr.W_E)    # (24, 28)
         self.register_buffer('_W_pos', self.rule_model._tracr.W_pos)  # (4, 28)
+        self.register_buffer('_W_Q',   self.rule_model._tracr.W_Q)    # (28, 28)
+        self.register_buffer('_W_K',   self.rule_model._tracr.W_K)    # (28, 28)
+        self.register_buffer('_W_V',   self.rule_model._tracr.W_V)    # (28, 28)
+        self.register_buffer('_W_O',   self.rule_model._tracr.W_O)    # (28, 28)
 
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
@@ -322,7 +327,9 @@ class YinyangModel(nn.Module):
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 if self.bidirectional:
-                    x = x + self.yinyang_attn[adapter_idx](x, self._W_E, self._W_pos)
+                    x = x + self.yinyang_attn[adapter_idx](
+                        x, self._W_pos, self._W_Q, self._W_K, self._W_V, self._W_O
+                    )
                 else:
                     x = x + self.yinyang_attn[adapter_idx](x, rule_hidden,
                                                             indices_query=indices_query,
@@ -336,7 +343,7 @@ class YinyangModel(nn.Module):
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         if self.bidirectional:
-            # Rule model not called — W_E and W_pos used directly as a static KV bank.
+            # Rule model not called — AR proxy drives rule attention via frozen W_Q/K/V/O.
             rule_hidden = None
         else:
             _, rule_hidden = self.rule_model(idx, return_hidden=True)
