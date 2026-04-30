@@ -101,13 +101,10 @@ OFFSETS = [0, 5, 7, 0]
 # ---------------------------------------------------------------------------
 
 def _bass_root(root_semitone: int) -> int:
-    """MIDI pitch of the bass root in the bass register."""
-    pitch = 24 + root_semitone   # start at C1
-    while pitch < BASS_MIN:
-        pitch += 12
-    while pitch > BASS_MAX:
-        pitch -= 12
-    return pitch
+    """MIDI pitch of the bass root, always in octave 2 (C2=36 … B2=47).
+    All 12 semitones land in the same register so the I-IV-V-I cycle is
+    perceived as a consistent pitch sequence, not register jumps."""
+    return 36 + root_semitone   # C2=36, D2=38, …, B2=47
 
 
 def _chord_tones(root_semitone: int, quality: str) -> list[int]:
@@ -209,8 +206,8 @@ def generate_song(
         chord_str = f'{ROOT_NAMES[root]}:{song_quality}'
         xf_chords.append([float(bar_start), chord_str])
 
-        pattern = random.choice(PATTERNS)
-        bass.notes.extend(_bar_notes(root, song_quality, bar_start, pattern))
+        # One whole note per bar = one clear root token, matching RASP's one token per position.
+        bass.notes.extend(_bar_notes(root, song_quality, bar_start, 'whole'))
 
     pm.instruments.append(bass)
     return pm, xf_chords
