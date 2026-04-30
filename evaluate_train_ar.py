@@ -9,6 +9,10 @@ For each dataset config (2to16 / 0to16 / 0to16_plus), compares:
   TrainAR    : adapter_train_ar_<config>_seed*
   ScratchAR  : adapter_train_ar_scratch_<config>_seed*
 
+Eval categories are computed dynamically from A (pretrain) and B (adapter)
+per config, so A\\B / B\\A / A∩B show correct starters for each config.
+Never-seen = {17,19,20,21} is fixed across all configs.
+
 Usage:
   python evaluate_train_ar.py
   python evaluate_train_ar.py --configs 2to16
@@ -36,29 +40,19 @@ from evaluate import (
     _fmt,
     make_sequence,
 )
-from data.dataset import (
-    EVAL_PRETRAIN_ONLY,
-    EVAL_FINETUNE_ONLY,
-    EVAL_BOTH,
-    EVAL_NEITHER,
-    VOCAB_SIZE,
-)
+from data.dataset import VOCAB_SIZE
 
 
+NEVER_SEEN = [17, 19, 20, 21]   # fixed across all configs
+
+# (config_name, ft_ckpt_stem, A=pretrain_starters, B=adapter_train_starters)
 ALL_CONFIGS = [
-    ('2to16',      'ar_finetuned_2to16'),
-    ('0to16',      'ar_finetuned_0to16'),
-    ('0to16_plus', 'ar_finetuned_0to16_plus'),
+    ('2to16',      'ar_finetuned_2to16',      list(range(6)),                       list(range(2, 17))),
+    ('0to16',      'ar_finetuned_0to16',       list(range(6)),                       list(range(0, 17))),
+    ('0to16_plus', 'ar_finetuned_0to16_plus',  list(range(6)),                       list(range(0, 17)) + [18, 22, 23]),
 ]
 
-CATEGORIES = [
-    ('Pretrain-only', EVAL_PRETRAIN_ONLY, 'A\\B={0,1}'),
-    ('Finetune-only', EVAL_FINETUNE_ONLY, 'B\\A={6..15}'),
-    ('Both          ', EVAL_BOTH,         'A∩B={2..5}'),
-    ('Neither       ', EVAL_NEITHER,      '{17,19,20,21}'),
-]
-
-ALL_STARTERS = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
+CAT_KEYS = ['A\\B', 'B\\A', 'A∩B', 'Never-seen', 'Overall']
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +63,21 @@ ALL_STARTERS = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHE
 def _silent():
     with open(os.devnull, 'w') as dn, contextlib.redirect_stdout(dn):
         yield
+
+
+def _cat_starters(A: list, B: list):
+    A_set, B_set = set(A), set(B)
+    a_only  = sorted(A_set - B_set)
+    b_only  = sorted(B_set - A_set)
+    a_and_b = sorted(A_set & B_set)
+    overall = sorted(set(a_only + b_only + a_and_b + NEVER_SEEN))
+    return {
+        'A\\B':       a_only  if a_only  else None,
+        'B\\A':       b_only  if b_only  else None,
+        'A∩B':        a_and_b if a_and_b else None,
+        'Never-seen': NEVER_SEEN,
+        'Overall':    overall,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +103,6 @@ def print_error_dist(models_dict: dict, starters: list, n_cycles: int, n_prompt:
         return
     all_counters = {l: error_distribution(m, starters, n_cycles, n_prompt, device)
                     for l, m in models_dict.items()}
-
     total = collections.Counter()
     for c in all_counters.values():
         total.update(c)
@@ -123,7 +131,7 @@ def print_examples(models_dict: dict, starters: list, cat_label: str,
     if not starters:
         return
     show_len = n_cycles * 4 - n_prompt
-    print(f'  [{cat_label.strip()}]')
+    print(f'  [{cat_label}]')
     for x in starters[:n_show]:
         seq      = make_sequence(x, n_cycles)
         prompt   = seq[:n_prompt]
@@ -141,10 +149,15 @@ def print_examples(models_dict: dict, starters: list, cat_label: str,
 # Per-config evaluation
 # ---------------------------------------------------------------------------
 
-def eval_config(config: str, ft_stem: str, pretrain_model, args, device):
+def eval_config(config: str, ft_stem: str, A: list, B: list,
+                pretrain_model, args, device):
     print(f'\n{"="*80}')
     print(f'CONFIG: {config}')
+    print(f'  A (pretrain)         = {sorted(A)}')
+    print(f'  B (adapter/finetune) = {sorted(B)}')
     print(f'{"="*80}')
+
+    cat_s = _cat_starters(A, B)
 
     args.ft_ckpt = os.path.join(args.ckpt_dir, f'{ft_stem}.pt')
     with _silent():
@@ -163,15 +176,17 @@ def eval_config(config: str, ft_stem: str, pretrain_model, args, device):
 
     print(f'  Seeds — FrozenAR:{len(frozen_models)}  TrainAR:{len(train_ar_models)}  ScratchAR:{len(scratch_models)}')
 
-    # Accuracy
+    # Evaluate accuracy per category
     results = {}
     for lbl, mdls, _ in model_groups:
         results[lbl] = {}
-        for cat_label, starters, _ in CATEGORIES:
-            per, mean, std = _eval_models(mdls, starters, args.n_cycles, args.prompt_len, device)
-            results[lbl][cat_label] = (per, mean, std)
-        per, mean, std = _eval_models(mdls, ALL_STARTERS, args.n_cycles, args.prompt_len, device)
-        results[lbl]['Overall'] = (per, mean, std)
+        for key in CAT_KEYS:
+            starters = cat_s[key]
+            if starters is None:
+                results[lbl][key] = None
+                continue
+            _, mean, std = _eval_models(mdls, starters, args.n_cycles, args.prompt_len, device)
+            results[lbl][key] = (mean, std)
 
     # ---- Rule-following accuracy table ----
     col_w    = 12
@@ -180,7 +195,7 @@ def eval_config(config: str, ft_stem: str, pretrain_model, args, device):
     all_labels = [lbl for lbl, _, _ in model_groups]
     is_multi   = {lbl: multi for lbl, _, multi in model_groups}
 
-    header = f"  {'Data Split':<20} {'Starters':<18}"
+    header = f"  {'Category':<16} {'Starters':<28}"
     for lbl in all_labels:
         w = col_w_ms if is_multi[lbl] else col_w
         header += f" {lbl:>{w}}"
@@ -189,40 +204,35 @@ def eval_config(config: str, ft_stem: str, pretrain_model, args, device):
     print()
     print(header)
     print(sep)
-    for cat_label, _, starters_str in CATEGORIES:
-        row = f"  {cat_label:<20} {starters_str:<18}"
+    for key in CAT_KEYS:
+        starters = cat_s[key]
+        s_str    = ('—' if starters is None
+                    else str(starters[:5]) + ('…' if len(starters) > 5 else ''))
+        row = f"  {key:<16} {s_str:<28}"
         for lbl in all_labels:
-            w = col_w_ms if is_multi[lbl] else col_w
-            _, mean, std = results[lbl][cat_label]
-            row += ' ' + _fmt(mean, std, w, is_multi[lbl])
+            w   = col_w_ms if is_multi[lbl] else col_w
+            val = results[lbl][key]
+            if val is None:
+                row += f" {'—':>{w}}"
+            else:
+                mean, std = val
+                row += ' ' + _fmt(mean, std, w, is_multi[lbl])
         print(row)
     print(sep)
-    row = f"  {'Overall':<20} {'all starters':<18}"
-    for lbl in all_labels:
-        w = col_w_ms if is_multi[lbl] else col_w
-        _, mean, std = results[lbl]['Overall']
-        row += ' ' + _fmt(mean, std, w, is_multi[lbl])
-    print(row)
-    print(sep)
 
-    # ---- Error distribution (on finetune-only starters — the hard partition) ----
+    # ---- Error distribution (on B\A — the "hard" generalization partition) ----
+    err_starters = cat_s['B\\A'] or cat_s['Overall']
     print()
-    print('  Error distribution  (pred - expected) % 24  [fraction of tokens]')
-    print('  Computed on Finetune-only starters (B\\A)')
-    qual_models = {
-        'Pretrain':  pretrain_model,
-        'Finetune':  ft_model,
-        'FrozenAR':  frozen_models[0],
-        'TrainAR':   train_ar_models[0] if train_ar_models else frozen_models[0],
-        'ScratchAR': scratch_models[0]  if scratch_models  else frozen_models[0],
-    }
-    print_error_dist(qual_models, EVAL_FINETUNE_ONLY, args.n_cycles, args.prompt_len, device)
+    print(f'  Error distribution  (pred - expected) % 24  [fraction of tokens]')
+    print(f'  Computed on: B\\A = {err_starters[:8]}{"…" if len(err_starters) > 8 else ""}')
+    qual_models = {lbl: mdls[0] for lbl, mdls, _ in model_groups}
+    print_error_dist(qual_models, err_starters[:10], args.n_cycles, args.prompt_len, device)
 
     # ---- Generated sequence examples ----
     print()
     print('  Generated sequence examples')
-    for cat_label, starters, starters_str in CATEGORIES:
-        print_examples(qual_models, starters, cat_label.strip(),
+    for key in CAT_KEYS[:-1]:   # skip Overall
+        print_examples(qual_models, cat_s[key] or [], key,
                        args.n_cycles, args.prompt_len, device, n_show=2)
 
     # ---- Per-seed detail ----
@@ -231,16 +241,15 @@ def eval_config(config: str, ft_stem: str, pretrain_model, args, device):
             if not multi:
                 continue
             print(f'  Per-seed: {lbl}')
-            cat_hdrs = '  '.join(f'{c[0].strip()[:12]:>12}' for c in CATEGORIES) + f'  {"Overall":>12}'
-            print(f"    {'seed':>4}  {cat_hdrs}")
-            print(f"    {'-'*4}  {'-'*len(cat_hdrs)}")
+            active = [(k, cat_s[k]) for k in CAT_KEYS if cat_s[k] is not None]
+            hdrs   = '  '.join(f'{k[:12]:>12}' for k, _ in active)
+            print(f"    {'seed':>4}  {hdrs}")
+            print(f"    {'-'*4}  {'-'*len(hdrs)}")
             for i, mdl in enumerate(mdls):
                 accs = []
-                for _, starters, _ in CATEGORIES:
+                for _, starters in active:
                     _, mean = rule_following_acc(mdl, starters, args.n_cycles, args.prompt_len, device)
                     accs.append(mean)
-                _, ov = rule_following_acc(mdl, ALL_STARTERS, args.n_cycles, args.prompt_len, device)
-                accs.append(ov)
                 print(f"    {i:>4}  " + '  '.join(f'{a:>12.4f}' for a in accs))
 
 
@@ -254,13 +263,13 @@ def run(args):
     with _silent():
         pretrain_model = load_pretrain(args, device)
 
-    selected = [(c, ft) for c, ft in ALL_CONFIGS if c in args.configs]
+    selected = [(c, ft, A, B) for c, ft, A, B in ALL_CONFIGS if c in args.configs]
     if not selected:
-        print(f'No matching configs. Available: {[c for c, _ in ALL_CONFIGS]}')
+        print(f'No matching configs. Available: {[c for c, *_ in ALL_CONFIGS]}')
         return
 
-    for config, ft_stem in selected:
-        eval_config(config, ft_stem, pretrain_model, args, device)
+    for config, ft_stem, A, B in selected:
+        eval_config(config, ft_stem, A, B, pretrain_model, args, device)
 
     print('\n\n=== EVALUATION COMPLETE ===')
 
