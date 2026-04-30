@@ -177,23 +177,19 @@ class BidirectionalYinyangAttention(nn.Module):
         return (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.n_heads * self.head_dim)
 
     def forward(self, ar_hidden: torch.Tensor,
-                W_pos: torch.Tensor,
                 W_Q: torch.Tensor, W_K: torch.Tensor,
                 W_V: torch.Tensor, W_O: torch.Tensor) -> torch.Tensor:
         """
         ar_hidden : (B, T, d_model)
-        W_pos     : (4, 28)   — frozen rule model position embeddings
         W_Q/K/V/O : (28, 28) — frozen rule model attention matrices
         """
         B, T, _ = ar_hidden.shape
 
         # --- Step 1: AR → rule ---
-        # proxy = learned projection of AR + frozen position embedding
-        # W_pos ensures position subspace is filled so W_Q/W_K give the
-        # correct positional attention pattern (position q → position (q+1)%4)
-        proxy   = self.ar_to_rule(ar_hidden)                       # (B, T, 28)
-        pos_idx = torch.arange(T, device=ar_hidden.device) % 4
-        proxy   = proxy + W_pos[pos_idx].unsqueeze(0)              # (B, T, 28)
+        # ar_to_rule learns the full d_model→rule_d_model mapping.
+        # AR hidden states already encode position; the linear can learn to
+        # populate the rule model's positional subspace (dims 24-27) from that.
+        proxy = self.ar_to_rule(ar_hidden)                         # (B, T, 28)
 
         # Run rule model's frozen attention on proxy (no causal mask)
         Q_rule   = proxy @ W_Q.t()                                  # (B, T, 28)
@@ -328,7 +324,7 @@ class YinyangModel(nn.Module):
                 adapter_idx = (i + 1) // self.n_skip - 1
                 if self.bidirectional:
                     x = x + self.yinyang_attn[adapter_idx](
-                        x, self._W_pos, self._W_Q, self._W_K, self._W_V, self._W_O
+                        x, self._W_Q, self._W_K, self._W_V, self._W_O
                     )
                 else:
                     x = x + self.yinyang_attn[adapter_idx](x, rule_hidden,
