@@ -50,7 +50,14 @@ def revert():
 # Runner
 # ---------------------------------------------------------------------------
 
-def run(cmd, desc):
+def ckpt_exists(name):
+    return os.path.exists(os.path.join(BASE, 'checkpoints', f'{name}.pt'))
+
+
+def run(cmd, desc, ckpt_name=None):
+    if ckpt_name and ckpt_exists(ckpt_name):
+        print(f'\n[SKIP] {desc}  ({ckpt_name}.pt already exists)')
+        return
     print(f'\n{"="*70}', flush=True)
     print(f'{desc}', flush=True)
     print(f'{"="*70}', flush=True)
@@ -69,6 +76,7 @@ patch(ar='list(range(7))')
 run(
     ['training/pretrain.py', '--epochs', '200', '--ckpt_name', 'ar_pretrain_0to6'],
     'PRETRAIN  starters={0..6}  →  ar_pretrain_0to6.pt',
+    ckpt_name='ar_pretrain_0to6',
 )
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,7 @@ for ft_expr, ckpt_name, label in FINETUNE_CONFIGS:
          '--ar_ckpt', AR_CKPT,
          '--ckpt_name', ckpt_name],
         f'FINETUNE  starters={label}  →  {ckpt_name}.pt',
+        ckpt_name=ckpt_name,
     )
 
 # ---------------------------------------------------------------------------
@@ -103,12 +112,15 @@ ADAPTER_CONFIGS = [
 
 for adapter_expr, stem, label in ADAPTER_CONFIGS:
     patch(adapter=adapter_expr)
+    # Skip only if all 5 seeds already exist
+    all_seeds_done = all(ckpt_exists(f'{stem}_seed{i}') for i in range(5))
     run(
         ['training/train_yinyang_multirun.py',
          '--n_seeds', '5', '--ckpt_stem', stem,
          '--', '--n_skip', '1', '--no_lora', '--epochs', '400',
          '--ar_ckpt', AR_CKPT],
         f'ADAPTER   starters={label}  →  {stem}_seed{{0..4}}.pt',
+        ckpt_name=f'{stem}_seed4' if all_seeds_done else None,
     )
 
 # ---------------------------------------------------------------------------

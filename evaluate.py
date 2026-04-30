@@ -75,8 +75,10 @@ def load_yinyang(label, ckpt_path, args, device):
             break
 
     # Detect n_skip from number of yinyang_attn modules in checkpoint
-    n_adapters = len({k.split('.')[1] for k in state if k.startswith('yinyang_attn.')})
-    n_skip = args.n_layers // max(n_adapters, 1)
+    n_adapters    = len({k.split('.')[1] for k in state if k.startswith('yinyang_attn.')})
+    n_skip        = args.n_layers // max(n_adapters, 1)
+    # Detect bidirectional: only BidirectionalYinyangAttention has back_q_proj
+    is_bidir      = any('back_q_proj' in k for k in state)
 
     model = build_yinyang_model(
         ar_ckpt_path   = args.ar_ckpt,
@@ -89,6 +91,7 @@ def load_yinyang(label, ckpt_path, args, device):
         lora_rank      = lora_rank,
         force_fallback = args.force_fallback,
         device         = str(device),
+        bidirectional  = is_bidir,
     )
 
     yinyang_state = {k.removeprefix('yinyang_attn.'): v

@@ -148,6 +148,7 @@ def train(args):
             force_fallback = args.force_fallback,
             device         = str(device),
             train_ar       = args.train_ar,
+            bidirectional  = args.bidirectional,
         )
 
     if args.phase2_epochs > 0:
@@ -176,9 +177,10 @@ def train(args):
         # ------------------------------------------------------------------ #
         model = _build(use_lora=args.use_lora)
         print(f'yinyang_attn modules: {len(model.yinyang_attn)}  (every {args.n_skip} layers)')
-        lora_tag = f'LoRA rank={args.lora_rank}' if args.use_lora else 'no LoRA'
-        ar_tag  = ' + trainable AR' if args.train_ar else ''
-        print(f'Mode: {lora_tag}{ar_tag}')
+        lora_tag  = f'LoRA rank={args.lora_rank}' if args.use_lora else 'no LoRA'
+        ar_tag    = ' + trainable AR' if args.train_ar else ''
+        bidir_tag = ' + bidirectional' if args.bidirectional else ''
+        print(f'Mode: {lora_tag}{ar_tag}{bidir_tag}')
         _run_training(model, train_loader, test_loader, args, device,
                       epochs=args.epochs, ckpt_path=ckpt_path, train_ar=args.train_ar)
 
@@ -210,6 +212,9 @@ def get_args():
     p.add_argument('--train_ar',           action='store_true', default=False,
                    help='Unfreeze AR model during training. If --ar_ckpt exists, '
                         'loads it as init; otherwise trains AR from scratch.')
+    p.add_argument('--bidirectional',      action='store_true', default=False,
+                   help='Use bidirectional cross-attention: AR informs rule (round 1), '
+                        'rule informs AR (round 2). Rule model input injection is skipped.')
     p.add_argument('--force_fallback',     action='store_true')
     p.add_argument('--seed',               type=int,   default=42)
     return p.parse_args()
