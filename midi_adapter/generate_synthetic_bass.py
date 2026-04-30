@@ -1,9 +1,20 @@
 """
 Generate synthetic bass MIDI dataset with paired bar-level chord annotations.
 
-Each song is a random chord progression with bass notes following the chords.
-All output files are directly compatible with the existing preprocessing
-pipeline (FramedDataset format) and ChordConditionedDataset.
+The chord progression follows a strict modular cycle rule, directly analogous
+to the RASP modular arithmetic experiment:
+
+    RASP:  output[i] = (starter + i * k) mod N
+    Bass:  chord_root[bar] = (key + bar * step) mod 12
+
+Every song has a key (= starter), a fixed step (default 5 = circle of fourths),
+and a fixed chord quality chosen once per song.  The bass plays the root of
+the cycle chord on every bar.
+
+This means:
+  - Base CP transformer trained on seen keys learns the cycle rule.
+  - Adapter (chord-conditioned) must generalise to unseen keys — exactly as
+    the RASP adapter must generalise to unseen starters.
 
 Outputs
 -------
@@ -14,26 +25,18 @@ Outputs
   <out_pt>.bar_chords.pt              bar-level chord tokens (list of int16 tensors)
   <out_pt>.txt                        song index → MIDI filename mapping
 
-RASP-analogy note
------------------
-Use --keys to restrict the pretrain set (e.g. --keys 0 2 4 5 7 9 11 for
-the white keys of C major) and train the CP transformer on that subset only.
-Then use all 12 keys for adapter training.  The adapter must then generalise
-chord conditioning to the 5 unseen keys, analogous to the RASP generalization
-experiment.
-
-Usage
------
-  # Full dataset (all keys, all chord types)
+RASP-analogy workflow
+---------------------
+  # Pretrain CP transformer on seen keys (white keys = starters {0,2,4,5,7,9,11})
   python -m midi_adapter.generate_synthetic_bass \\
-      --n_songs 5000 --n_bars 32 --out_dir data/synthetic_bass \\
-      --out_pt  data/synthetic_bass_cp4
-
-  # Pretrain-only subset (7 keys)
-  python -m midi_adapter.generate_synthetic_bass \\
-      --n_songs 3000 --n_bars 32 --out_dir data/synthetic_bass_pretrain \\
-      --out_pt  data/synthetic_bass_pretrain_cp4 \\
+      --n_songs 3000 --n_bars 32 --step 5 \\
+      --out_dir data/bass_pretrain --out_pt data/bass_pretrain_cp4 \\
       --keys 0 2 4 5 7 9 11
+
+  # Full dataset (all 12 keys) for adapter fine-tuning
+  python -m midi_adapter.generate_synthetic_bass \\
+      --n_songs 5000 --n_bars 32 --step 5 \\
+      --out_dir data/bass_all --out_pt data/bass_all_cp4
 """
 
 from __future__ import annotations
@@ -85,8 +88,9 @@ COMMON_CHORDS: dict[str, list[int]] = {
     'min7': [0, 3, 7, 10],
 }
 
-# Typical chord scale degrees (intervals above key root) for common progressions
-SCALE_DEGREES = [0, 5, 7, 9]   # I, IV, V, vi
+# Default cycle step: 5 semitones = circle of fourths (C→F→Bb→Eb→…)
+# Analogous to the step k in the RASP modular sequence rule.
+DEFAULT_CYCLE_STEP = 5
 
 
 # ---------------------------------------------------------------------------
@@ -161,14 +165,24 @@ PATTERNS = ['whole', 'half', 'quarter', 'walking']
 
 
 def generate_song(
-    n_bars:                 int        = 32,
-    key:                    int | None = None,    # root semitone, None = random
-    allowed_keys:           list[int]  | None = None,
-    allowed_qualities:      list[str]  | None = None,
-    bars_per_chord:         int        = 2,
-    bass_instrument_program: int       = 33,      # Electric Bass, finger
+    n_bars:                  int        = 32,
+    key:                     int | None = None,   # root semitone (= RASP starter)
+    allowed_keys:            list[int]  | None = None,
+    step:                    int        = DEFAULT_CYCLE_STEP,
+    quality:                 str | None = None,   # None = random once per song
+    bass_instrument_program: int        = 33,     # Electric Bass, finger
 ) -> tuple[pretty_midi.PrettyMIDI, list[list]]:
     """
+    Generate one song following the modular cycle rule:
+
+        chord_root[bar] = (key + bar * step) % 12
+
+    This is the direct musical analogy of the RASP rule:
+        output[i] = (starter + i * k) mod N
+
+    Quality is fixed for the whole song (chosen randomly if not specified).
+    Bass pattern is chosen randomly per bar.
+
     Returns
     -------
     pm        : PrettyMIDI object
@@ -177,35 +191,26 @@ def generate_song(
     """
     if allowed_keys is None:
         allowed_keys = list(range(12))
-    if allowed_qualities is None:
-        allowed_qualities = list(COMMON_CHORDS.keys())
-
     if key is None:
         key = random.choice(allowed_keys)
 
-    # Build a 4-chord progression
-    degrees   = random.sample(SCALE_DEGREES, min(4, len(SCALE_DEGREES)))
-    quality_choice = random.choices(allowed_qualities, k=len(degrees))
-    progression = [((key + d) % 12, q) for d, q in zip(degrees, quality_choice)]
-
-    # Assign one chord per bar (repeat progression)
-    chord_per_bar = [
-        progression[(b // bars_per_chord) % len(progression)]
-        for b in range(n_bars)
-    ]
+    # One quality for the whole song (analogous to a fixed rule parameter)
+    song_quality = quality if quality is not None else random.choice(list(COMMON_CHORDS.keys()))
 
     pm   = pretty_midi.PrettyMIDI(initial_tempo=CONSTANT_TEMPO)
     bass = pretty_midi.Instrument(program=bass_instrument_program, name='Bass')
 
     xf_chords: list[list] = []
 
-    for b, (root, quality) in enumerate(chord_per_bar):
+    for b in range(n_bars):
+        # THE cycle rule: root = (key + b * step) mod 12
+        root      = (key + b * step) % 12
         bar_start = b * SUBBEATS_PER_BAR
-        chord_str = f'{ROOT_NAMES[root]}:{quality}'
+        chord_str = f'{ROOT_NAMES[root]}:{song_quality}'
         xf_chords.append([float(bar_start), chord_str])
 
         pattern = random.choice(PATTERNS)
-        bass.notes.extend(_bar_notes(root, quality, bar_start, pattern))
+        bass.notes.extend(_bar_notes(root, song_quality, bar_start, pattern))
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -270,6 +275,7 @@ def generate_dataset(
     out_dir:       str,
     out_pt:        str,
     n_bars:        int       = 32,
+    step:          int       = DEFAULT_CYCLE_STEP,
     max_polyphony: int       = 4,
     allowed_keys:  list[int] | None = None,
     seed:          int       = 42,
@@ -296,6 +302,7 @@ def generate_dataset(
     for i in range(n_songs):
         pm, xf_chords = generate_song(
             n_bars       = n_bars,
+            step         = step,
             allowed_keys = allowed_keys,
         )
 
@@ -339,6 +346,9 @@ def main():
     p.add_argument('--n_songs',       type=int,   default=5000)
     p.add_argument('--n_bars',        type=int,   default=32,
                    help='Bars per song (must be >= target_length/16 for training)')
+    p.add_argument('--step',          type=int,   default=DEFAULT_CYCLE_STEP,
+                   help='Cycle step in semitones (default 5 = circle of fourths). '
+                        'Analogous to k in RASP output[i]=(starter+i*k) mod N.')
     p.add_argument('--out_dir',       type=str,   required=True,
                    help='Directory for individual MIDI files')
     p.add_argument('--out_pt',        type=str,   required=True,
@@ -350,6 +360,7 @@ def main():
     args = p.parse_args()
 
     print(f'Generating {args.n_songs} songs, {args.n_bars} bars each')
+    print(f'Cycle rule: chord_root[bar] = (key + bar * {args.step}) % 12')
     print(f'Keys: {args.keys if args.keys else "all 12"}')
 
     generate_dataset(
@@ -357,6 +368,7 @@ def main():
         out_dir       = args.out_dir,
         out_pt        = args.out_pt,
         n_bars        = args.n_bars,
+        step          = args.step,
         max_polyphony = args.max_polyphony,
         allowed_keys  = args.keys,
         seed          = args.seed,
