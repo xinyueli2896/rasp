@@ -32,7 +32,7 @@ FINETUNE_STARTERS      = list(range(0, 17)) + [18, 22, 23]
 TEST_STARTERS          = [17, 19, 20, 21]          # never-seen; all tokens individually seen
 
 # Backward-compat aliases
-ADAPTER_TRAIN_STARTERS = list(range(2, 17))
+ADAPTER_TRAIN_STARTERS = list(range(0, 17))
 TRAIN_STARTERS         = AR_TRAIN_STARTERS
 
 # Four evaluation categories

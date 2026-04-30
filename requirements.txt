@@ -1,12 +1,5 @@
 torch>=2.0.0
 numpy>=1.24.0
 
-# tracr (RASP→transformer compiler) and its JAX backend
-# Install from source: pip install git+https://github.com/google-deepmind/tracr.git
-# or: pip install tracr  (if available on PyPI)
-jax>=0.4.0
-jaxlib>=0.4.0
-# tracr (installed separately – see above)
-
-# Optional: for nicer training curves
-# tensorboard>=2.13.0
+# Optional: only needed for LoRA training (--use_lora flag)
+# peft>=0.9.0
