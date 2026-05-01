@@ -9,3 +9,4 @@ checkpoints/
 dist/
 build/
 .env
+data/
