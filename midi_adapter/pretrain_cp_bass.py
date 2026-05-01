@@ -1,0 +1,115 @@
+"""
+Pretrain RoFormerSymbolicTransformer on synthetic bass data.
+
+Usage
+-----
+  python -m midi_adapter.pretrain_cp_bass \\
+      --train_data data/bass_pretrain_cp4.pt \\
+      --val_data   data/bass_all_cp4.pt \\
+      --model_size 1 --batch_size 8
+
+The script is a thin wrapper around cp_transformer.py that accepts data paths
+as arguments instead of hardcoding them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+import torch
+import pytorch_lightning as L
+from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
+from torch.utils.data import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
+
+TRAIN_LENGTH = 384
+MAX_STEPS    = 200_000
+
+
+def main(args):
+    n_gpus     = max(torch.cuda.device_count(), 1)
+    max_lr     = 5e-5 if args.model_size >= 2 else 1e-4
+    run_name   = (
+        args.run_name
+        or f'cp_bass_size{args.model_size}_batch{args.batch_size * n_gpus}'
+    )
+
+    net = RoFormerSymbolicTransformer(
+        size         = args.model_size,
+        max_lr       = max_lr,
+        with_velocity= False,
+    )
+
+    train_loader = DataLoader(
+        FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size, split='all'),
+        batch_size=None, num_workers=1, persistent_workers=True,
+    )
+    val_loader = DataLoader(
+        FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+                      split='all', sample_step=16, repeat=False),
+        batch_size=None, num_workers=1, persistent_workers=True,
+    )
+
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    checkpoint_cb = L.callbacks.ModelCheckpoint(
+        monitor    = 'val_loss',
+        save_top_k = 5,
+        save_last  = True,
+        enable_version_counter = False,
+        dirpath    = os.path.join(args.ckpt_dir, run_name),
+        filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
+    )
+
+    gradient_clip = 1.0 if args.model_size >= 2 else None
+    precision     = 'bf16-mixed' if torch.cuda.is_available() else 32
+
+    if n_gpus > 1:
+        import datetime
+        from pytorch_lightning.strategies import DDPStrategy
+        strategy = DDPStrategy(timeout=datetime.timedelta(hours=2))
+    else:
+        strategy = 'auto'
+
+    trainer = L.Trainer(
+        devices            = -1,
+        accelerator        = 'gpu' if torch.cuda.is_available() else 'cpu',
+        precision          = precision,
+        max_steps          = args.max_steps,
+        callbacks          = [checkpoint_cb],
+        val_check_interval = 2500,
+        limit_val_batches  = 25,
+        check_val_every_n_epoch = None,
+        gradient_clip_val  = gradient_clip,
+        logger             = TensorBoardLogger('tb_logs', name=run_name),
+        num_sanity_val_steps = 2,
+        strategy           = strategy,
+    )
+
+    ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
+    trainer.fit(net, train_loader, val_loader, ckpt_path=ckpt_path)
+
+    out_pt = os.path.join(args.ckpt_dir, f'{run_name}.pt')
+    torch.save(net.state_dict(), out_pt)
+    print(f'Model saved → {out_pt}')
+
+
+def get_args():
+    p = argparse.ArgumentParser(description='Pretrain CP transformer on synthetic bass')
+    p.add_argument('--train_data',  required=True, help='Path to training .pt file')
+    p.add_argument('--val_data',    required=True, help='Path to validation .pt file')
+    p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
+    p.add_argument('--batch_size',  type=int, default=8)
+    p.add_argument('--max_steps',   type=int, default=MAX_STEPS)
+    p.add_argument('--ckpt_dir',    type=str, default='ckpt')
+    p.add_argument('--run_name',    type=str, default=None)
+    p.add_argument('--resume_ckpt', type=str, default=None)
+    return p.parse_args()
+
+
+if __name__ == '__main__':
+    main(get_args())
