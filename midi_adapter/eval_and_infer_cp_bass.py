@@ -206,6 +206,49 @@ def ar_generate(base, key, n_prompt_bars, n_gen_bars, temperature, device):
     return prompt_tokens + gen_tokens, T_p
 
 
+@torch.no_grad()
+def compute_ar_accuracy(base, keys, n_songs, n_prompt_bars, n_gen_bars,
+                        temperature, device):
+    """
+    Generate n_songs songs autoregressively and compute root accuracy on the
+    generated (non-prompt) bars.
+    """
+    tokenizer_eos = base.tokenizer.eos_token
+    correct = total = 0
+
+    for i in range(n_songs):
+        key = keys[i % len(keys)]
+        all_tokens, n_prompt_sub = ar_generate(
+            base, key, n_prompt_bars, n_gen_bars, temperature, device,
+        )
+        n_prompt_b = n_prompt_sub // SUBBEATS_PER_BAR
+        n_total_b  = len(all_tokens) // SUBBEATS_PER_BAR
+
+        for b in range(n_prompt_b, n_total_b):
+            expected_root = (key + OFFSETS[b % 4]) % 12
+            expected_pitch = 36 + expected_root
+
+            tok_batch = all_tokens[b * SUBBEATS_PER_BAR]
+            content   = tok_batch[0].tolist()
+            gen_pitch = None
+            for j in range(0, len(content) - 1, 2):
+                prog = content[j]
+                if prog == tokenizer_eos or prog >= 128:
+                    break
+                pd = content[j + 1] - 128
+                p  = pd % 128
+                d  = pd // 128
+                if 0 <= p < 128 and 0 <= d < len(DURATION_TEMPLATES):
+                    gen_pitch = p
+                    break
+
+            if gen_pitch is not None:
+                correct += int((gen_pitch % 12) == expected_root)
+                total   += 1
+
+    return correct / max(total, 1)
+
+
 # ---------------------------------------------------------------------------
 # Decode tokens → PrettyMIDI  (matches original repo decode_output)
 # ---------------------------------------------------------------------------
@@ -439,18 +482,30 @@ def run(args):
         print('=' * 72)
 
         # 1. Teacher-forced accuracy (optional)
+        tf_acc = None
         if not args.no_teacher_forcing:
             x, chord_tokens, pitch_shift = make_batch(
                 keys, n_songs=args.n_songs, n_bars=args.n_bars, device=device,
             )
-            acc = compute_accuracy(model, x, chord_tokens, pitch_shift, base)
-            results[group_name] = acc
-            print(f'  Teacher-forced accuracy: {acc:.4f}')
-            print()
-        else:
-            results[group_name] = None
+            tf_acc = compute_accuracy(model, x, chord_tokens, pitch_shift, base)
+            print(f'  Teacher-forced accuracy : {tf_acc:.4f}')
 
-        # 2. Autoregressive generation (one example, one key from group)
+        # 2. AR accuracy over n_songs songs
+        print(f'  Computing AR accuracy ({args.n_songs} songs) ...')
+        ar_acc = compute_ar_accuracy(
+            base, keys,
+            n_songs=args.n_songs,
+            n_prompt_bars=args.n_prompt_bars,
+            n_gen_bars=args.n_gen_bars,
+            temperature=args.temperature,
+            device=device,
+        )
+        print(f'  AR accuracy             : {ar_acc:.4f}')
+        print()
+
+        results[group_name] = (tf_acc, ar_acc)
+
+        # 3. Autoregressive generation demo (one example, one key from group)
         demo_key = keys[0]
         key_name = ROOT_NAMES[demo_key]
         print(f'  Generating {args.n_gen_bars} bars (key={key_name}, '
@@ -465,7 +520,7 @@ def run(args):
         )
         n_total_bars = args.n_prompt_bars + args.n_gen_bars
 
-        # 3. Root tracking table (prompt bars shown with brackets, not scored)
+        # 4. Root tracking table (prompt bars shown with brackets, not scored)
         print_root_table(
             all_tokens, demo_key,
             n_prompt_sub=n_prompt_sub,
@@ -473,14 +528,14 @@ def run(args):
             title=f'Root tracking (key={key_name}, group={group_name})',
         )
 
-        # 4. Decode + save MIDI (includes prompt so file starts on tonic)
+        # 5. Decode + save MIDI (includes prompt so file starts on tonic)
         pm = decode_to_midi(all_tokens, base.tokenizer,
                             fixed_program=args.fixed_program)
         midi_path = os.path.join(args.out_dir, f'{group_name}_key{demo_key}.mid')
         pm.write(midi_path)
         print(f'  Saved MIDI → {midi_path}')
 
-        # 5. ASCII piano roll
+        # 6. ASCII piano roll
         print_piano_roll(pm, n_total_bars,
                          title=f'{group_name} / key={key_name} (bar 0 = prompt)')
 
@@ -490,18 +545,18 @@ def run(args):
     print('SUMMARY — Teacher-forced chord-root accuracy')
     print('=' * 72)
     col_w = 18
-    print(f'{"Key group":<{col_w}}  {"Keys":<28}  {"n_songs":>8}  {"accuracy":>10}')
-    print('-' * 68)
+    print(f'{"Key group":<{col_w}}  {"Keys":<28}  {"n_songs":>8}  {"TF acc":>10}  {"AR acc":>10}')
+    print('-' * 82)
     for group_name, keys in KEY_GROUPS.items():
-        acc = results[group_name]
-        acc_str = f'{acc:>10.4f}' if acc is not None else '      n/a'
-        print(f'{group_name:<{col_w}}  {str(keys):<28}  {args.n_songs:>8}  {acc_str}')
+        tf_acc, ar_acc = results[group_name]
+        tf_str = f'{tf_acc:>10.4f}' if tf_acc is not None else '       n/a'
+        ar_str = f'{ar_acc:>10.4f}'
+        print(f'{group_name:<{col_w}}  {str(keys):<28}  {args.n_songs:>8}  {tf_str}  {ar_str}')
     print()
 
-    pretrain_acc = results['pretrain_keys']
-    unseen_acc   = results['unseen']
-    if pretrain_acc is not None and unseen_acc is not None:
-        print(f'  unseen / pretrain ratio: {unseen_acc / max(pretrain_acc, 1e-6):.4f}')
+    _, pretrain_ar = results['pretrain_keys']
+    _, unseen_ar   = results['unseen']
+    print(f'  AR unseen / pretrain ratio: {unseen_ar / max(pretrain_ar, 1e-6):.4f}')
     print()
 
 
