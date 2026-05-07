@@ -79,7 +79,7 @@ def main(args):
         filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
     )
 
-    gradient_clip = 1.0 if args.model_size >= 2 else None
+    gradient_clip = 1.0
     precision     = 'bf16-mixed' if torch.cuda.is_available() else 32
 
     if n_gpus > 1:
