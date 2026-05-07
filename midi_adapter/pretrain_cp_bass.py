@@ -20,6 +20,7 @@ import sys
 
 import torch
 import pytorch_lightning as L
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.loggers.tensorboard import TensorBoardLogger
 from torch.utils.data import DataLoader
 
@@ -75,6 +76,16 @@ def main(args):
     else:
         strategy = 'auto'
 
+    loggers = []
+    if args.wandb_project:
+        loggers.append(WandbLogger(
+            project = args.wandb_project,
+            entity  = args.wandb_entity,
+            name    = run_name,
+            config  = vars(args),
+        ))
+    loggers.append(TensorBoardLogger('tb_logs', name=run_name))
+
     trainer = L.Trainer(
         devices            = -1,
         accelerator        = 'gpu' if torch.cuda.is_available() else 'cpu',
@@ -85,7 +96,7 @@ def main(args):
         limit_val_batches  = 25,
         check_val_every_n_epoch = None,
         gradient_clip_val  = gradient_clip,
-        logger             = TensorBoardLogger('tb_logs', name=run_name),
+        logger             = loggers,
         num_sanity_val_steps = 2,
         strategy           = strategy,
     )
@@ -105,9 +116,12 @@ def get_args():
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',  type=int, default=8)
     p.add_argument('--max_steps',   type=int, default=MAX_STEPS)
-    p.add_argument('--ckpt_dir',    type=str, default='ckpt')
-    p.add_argument('--run_name',    type=str, default=None)
-    p.add_argument('--resume_ckpt', type=str, default=None)
+    p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
+    p.add_argument('--run_name',      type=str,  default=None)
+    p.add_argument('--resume_ckpt',   type=str,  default=None)
+    p.add_argument('--wandb_project', type=str,  default='cp_bass',
+                   help='W&B project name (set to empty string to disable wandb)')
+    p.add_argument('--wandb_entity',  type=str,  default=None)
     return p.parse_args()
 
 
