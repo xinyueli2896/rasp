@@ -144,10 +144,12 @@ class CPYinyangLightning(L.LightningModule):
             self.log('training/lr', scheduler.get_last_lr()[0], on_step=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, pitch_shift, chord_tokens = batch
         loss = self.model.loss(x, pitch_shift, chord_tokens)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
+        key  = 'val_loss' if dataloader_idx == 0 else 'unseen_loss'
+        self.log(key, loss, on_step=False, on_epoch=True,
+                 sync_dist=True, add_dataloader_idx=False)
         return loss
 
     def configure_optimizers(self):
@@ -206,6 +208,15 @@ def main(args):
         batch_size=None, num_workers=0,
     )
 
+    val_loaders = [val_loader]
+    if args.unseen_data and os.path.exists(args.unseen_data):
+        val_loaders.append(DataLoader(
+            ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
+                               split='all', sample_step=16, repeat=True),
+            batch_size=None, num_workers=0,
+        ))
+        print(f'Unseen eval data: {args.unseen_data}')
+
     os.makedirs(args.ckpt_dir, exist_ok=True)
     checkpoint_cb = L.callbacks.ModelCheckpoint(
         monitor    = 'val_loss',
@@ -250,7 +261,7 @@ def main(args):
     )
 
     ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
-    trainer.fit(lit, train_loader, val_loader, ckpt_path=ckpt_path)
+    trainer.fit(lit, train_loader, val_loaders, ckpt_path=ckpt_path)
 
     out_pt = os.path.join(args.ckpt_dir, f'{run_name}.pt')
     torch.save(adapter.state_dict(), out_pt)
@@ -276,6 +287,8 @@ def get_args():
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
+    p.add_argument('--unseen_data',        type=str, default=None,
+                   help='Path to unseen-keys .pt file for generalisation eval')
     p.add_argument('--wandb_project',      type=str, default='cp_bass')
     p.add_argument('--wandb_entity',       type=str, default=None)
     return p.parse_args()
