@@ -46,6 +46,18 @@ def main(args):
         with_velocity= False,
     )
 
+    # cp_transformer's configure_optimizers hardcodes total_steps=2_000_000.
+    # Override to use the actual training budget so the LR schedule is correct.
+    # Return legacy ([optimizer], [scheduler]) so PL steps per epoch (never, since we
+    # use max_steps), and training_step's manual scheduler.step() handles per-step LR.
+    def _configure_optimizers(self=net):
+        optimizer = torch.optim.AdamW(net.parameters(), lr=max_lr)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=max_lr, total_steps=args.max_steps, pct_start=0.005,
+        )
+        return [optimizer], [scheduler]
+    net.configure_optimizers = _configure_optimizers
+
     train_loader = DataLoader(
         FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size, split='all'),
         batch_size=None, num_workers=1, persistent_workers=True,
@@ -53,7 +65,7 @@ def main(args):
     val_loader = DataLoader(
         FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
                       split='all', sample_step=16, repeat=False),
-        batch_size=None, num_workers=1, persistent_workers=True,
+        batch_size=None, num_workers=1, persistent_workers=False,
     )
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
