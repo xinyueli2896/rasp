@@ -413,21 +413,27 @@ class YinyangModel(nn.Module):
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
         Encoder-injected pipeline:
-          tokens → learned encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
+          tokens → learned encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → +W_pos[pos%4] → rule_hidden
 
-        Replaces W_E[tokens] with a learned soft encoding before the frozen
-        attention block, keeping W_Q/K/V/O intact.
+        The second +W_pos restores the position information that the analytical
+        rule model includes in its output (h_out[q] = W_E[next_token] + W_pos[q%4])
+        but that gets consumed by the attention computation and dropped from the output.
+        Without it, rule_hidden is missing dims 24-27 compared to the analytical version.
         """
         B, T   = idx.shape
         h_in   = self.rule_input_encoder(idx)                         # (B, T, 28)
         pos    = torch.arange(T, device=idx.device) % 4
         h_in   = h_in + self._W_pos[pos].unsqueeze(0)                 # (B, T, 28)
-        Q      = h_in @ self._W_Q.t()                                  # (B, T, 28)
+        Q      = h_in @ self._W_Q.t()
         K      = h_in @ self._W_K.t()
         V      = h_in @ self._W_V.t()
-        scores = (Q @ K.transpose(-1, -2)) * 20.0                     # (B, T, T)
+        scores = (Q @ K.transpose(-1, -2)) * 20.0
         attn   = F.softmax(scores, dim=-1)
-        return (attn @ V) @ self._W_O.t()                             # (B, T, 28)
+        rule_out = (attn @ V) @ self._W_O.t()                        # (B, T, 28)
+        # Restore position info: analytical rule_hidden = W_E[next_token] + W_pos[q%4]
+        # but frozen attention only outputs the token part — add W_pos back.
+        rule_out = rule_out + self._W_pos[pos].unsqueeze(0)
+        return rule_out
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
