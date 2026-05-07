@@ -64,8 +64,8 @@ def main(args):
     )
     val_loader = DataLoader(
         FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                      split='all', sample_step=16, repeat=False),
-        batch_size=None, num_workers=1, persistent_workers=False,
+                      split='all', sample_step=16, repeat=True),
+        batch_size=None, num_workers=0,
     )
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
