@@ -101,6 +101,50 @@ class YinyangCrossAttention(nn.Module):
         return self.out_proj(out) * self.gate
 
 
+class LearnedRuleInputEncoder(nn.Module):
+    """
+    Replaces W_E[tokens] (the hard one-hot token embedding) as the input to
+    the rule model's frozen attention block.
+
+    Pipeline:
+        tokens → this encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
+
+    The rule model's frozen attention structure (W_Q/K/V/O) is preserved.
+    Only the token embedding step is replaced by a learned soft encoding.
+    Output dim must be rule_d_model (28) to be compatible with W_Q/K/V/O.
+    """
+
+    def __init__(
+        self,
+        vocab_size:   int,
+        rule_d_model: int   = RULE_D_MODEL,   # must be 28 to match W_Q/K/V/O
+        n_layers:     int   = 2,
+        n_heads:      int   = 4,
+        dropout:      float = 0.1,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, rule_d_model)
+        import warnings
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model         = rule_d_model,
+            nhead           = n_heads,
+            dim_feedforward = rule_d_model * 4,
+            dropout         = dropout,
+            batch_first     = True,
+            norm_first      = True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
+            )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        # tokens: (B, T) — same input as AR model
+        # returns (B, T, rule_d_model) — replaces W_E[tokens] before frozen attention
+        return self.encoder(self.embedding(tokens))
+
+
 class BidirectionalYinyangAttention(nn.Module):
     """
     Bidirectional cross-attention where AR provides proxy input to rule model.
@@ -217,25 +261,29 @@ class YinyangModel(nn.Module):
 
     def __init__(
         self,
-        ar_ckpt_path:   str  | None = None,
-        max_seq_len:    int  = 128,
-        d_model:        int  = 128,
-        n_layers:       int  = 4,
-        n_heads:        int  = 4,
-        rule_d_model:   int  = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
-        adapter_rank:   int  = 32,
-        n_skip:         int  = 2,
-        use_lora:       bool = True,
-        lora_rank:      int  = 16,
-        force_fallback: bool = False,
-        device:         str  = 'cpu',
-        train_ar:       bool = False,
-        bidirectional:  bool = False,
+        ar_ckpt_path:    str  | None = None,
+        max_seq_len:     int  = 128,
+        d_model:         int  = 128,
+        n_layers:        int  = 4,
+        n_heads:         int  = 4,
+        rule_d_model:    int  = RULE_D_MODEL,   # 28 for frozen rule; free for encoder_mode
+        adapter_rank:    int  = 32,
+        n_skip:          int  = 2,
+        use_lora:        bool = True,
+        lora_rank:       int  = 16,
+        force_fallback:  bool = False,
+        device:          str  = 'cpu',
+        train_ar:         bool = False,
+        bidirectional:    bool = False,
+        encoder_injected: bool = False,   # learned encoder replaces W_E before frozen W_Q/K/V/O
+        encoder_n_layers: int  = 2,
+        encoder_n_heads:  int  = 4,
     ):
         super().__init__()
-        self.n_layers      = n_layers
-        self.n_skip        = n_skip
-        self.bidirectional = bidirectional
+        self.n_layers         = n_layers
+        self.n_skip           = n_skip
+        self.bidirectional    = bidirectional
+        self.encoder_injected = encoder_injected
 
         from data.dataset import VOCAB_SIZE as _VOCAB_SIZE
         ar_model = AutoregressiveTransformer(
@@ -283,14 +331,23 @@ class YinyangModel(nn.Module):
             force_fallback = force_fallback,
         ).to(device)
 
-        # Cache rule model's frozen weight matrices for bidirectional mode.
-        # Registered as buffers so they move with .to(device) automatically.
+        # Cache rule model's frozen weight matrices (used by bidirectional and encoder_injected).
         self.register_buffer('_W_E',   self.rule_model._tracr.W_E)    # (24, 28)
         self.register_buffer('_W_pos', self.rule_model._tracr.W_pos)  # (4, 28)
         self.register_buffer('_W_Q',   self.rule_model._tracr.W_Q)    # (28, 28)
         self.register_buffer('_W_K',   self.rule_model._tracr.W_K)    # (28, 28)
         self.register_buffer('_W_V',   self.rule_model._tracr.W_V)    # (28, 28)
         self.register_buffer('_W_O',   self.rule_model._tracr.W_O)    # (28, 28)
+
+        if encoder_injected:
+            # Learned encoder replaces W_E[tokens] before the frozen W_Q/K/V/O block.
+            # rule_d_model must stay 28 so shapes match.
+            self.rule_input_encoder = LearnedRuleInputEncoder(
+                vocab_size   = VOCAB_SIZE,
+                rule_d_model = RULE_D_MODEL,   # must be 28
+                n_layers     = encoder_n_layers,
+                n_heads      = encoder_n_heads,
+            ).to(device)
 
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
@@ -335,18 +392,40 @@ class YinyangModel(nn.Module):
         logits = ar.lm_head(hidden)
         return logits, hidden
 
+    def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
+        """
+        Encoder-injected pipeline:
+          tokens → learned encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
+
+        Replaces W_E[tokens] with a learned soft encoding before the frozen
+        attention block, keeping W_Q/K/V/O intact.
+        """
+        B, T   = idx.shape
+        h_in   = self.rule_input_encoder(idx)                         # (B, T, 28)
+        pos    = torch.arange(T, device=idx.device) % 4
+        h_in   = h_in + self._W_pos[pos].unsqueeze(0)                 # (B, T, 28)
+        Q      = h_in @ self._W_Q.t()                                  # (B, T, 28)
+        K      = h_in @ self._W_K.t()
+        V      = h_in @ self._W_V.t()
+        scores = (Q @ K.transpose(-1, -2)) * 20.0                     # (B, T, T)
+        attn   = F.softmax(scores, dim=-1)
+        return (attn @ V) @ self._W_O.t()                             # (B, T, 28)
+
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         if self.bidirectional:
-            # Rule model not called — AR proxy drives rule attention via frozen W_Q/K/V/O.
+            # AR proxy drives rule attention via frozen W_Q/K/V/O — no rule token input.
             rule_hidden = None
+        elif self.encoder_injected:
+            # Learned encoder replaces W_E before frozen rule attention.
+            rule_hidden = self._encoder_injected_rule_hidden(idx)
         else:
             _, rule_hidden = self.rule_model(idx, return_hidden=True)
             rule_hidden    = rule_hidden.to(idx.device)
-        logits, _      = self._forward_layerwise(idx, rule_hidden,
-                                                  indices_query=indices_query,
-                                                  indices_key=indices_key)
+        logits, _ = self._forward_layerwise(idx, rule_hidden,
+                                             indices_query=indices_query,
+                                             indices_key=indices_key)
         return logits
 
     @torch.no_grad()
@@ -363,36 +442,42 @@ class YinyangModel(nn.Module):
 
 
 def build_yinyang_model(
-    ar_ckpt_path:   str | None = None,
-    max_seq_len:    int  = 128,
-    d_model:        int  = 128,
-    n_layers:       int  = 4,
-    n_heads:        int  = 4,
-    rule_d_model:   int  = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
-    adapter_rank:   int  = 32,
-    n_skip:         int  = 2,
-    use_lora:       bool = True,
-    lora_rank:      int  = 16,
-    force_fallback: bool = False,
-    device:         str  = 'cpu',
-    train_ar:       bool = False,
-    bidirectional:  bool = False,
+    ar_ckpt_path:    str | None = None,
+    max_seq_len:     int  = 128,
+    d_model:         int  = 128,
+    n_layers:        int  = 4,
+    n_heads:         int  = 4,
+    rule_d_model:    int  = RULE_D_MODEL,   # 28 for frozen rule; free for encoder_mode
+    adapter_rank:    int  = 32,
+    n_skip:          int  = 2,
+    use_lora:        bool = True,
+    lora_rank:       int  = 16,
+    force_fallback:  bool = False,
+    device:          str  = 'cpu',
+    train_ar:          bool = False,
+    bidirectional:     bool = False,
+    encoder_injected:  bool = False,
+    encoder_n_layers:  int  = 2,
+    encoder_n_heads:   int  = 4,
 ) -> YinyangModel:
     return YinyangModel(
-        ar_ckpt_path   = ar_ckpt_path,
-        max_seq_len    = max_seq_len,
-        d_model        = d_model,
-        n_layers       = n_layers,
-        n_heads        = n_heads,
-        rule_d_model   = rule_d_model,
-        adapter_rank   = adapter_rank,
-        n_skip         = n_skip,
-        use_lora       = use_lora,
-        lora_rank      = lora_rank,
-        force_fallback = force_fallback,
-        device         = device,
-        train_ar       = train_ar,
-        bidirectional  = bidirectional,
+        ar_ckpt_path     = ar_ckpt_path,
+        max_seq_len      = max_seq_len,
+        d_model          = d_model,
+        n_layers         = n_layers,
+        n_heads          = n_heads,
+        rule_d_model     = rule_d_model,
+        adapter_rank     = adapter_rank,
+        n_skip           = n_skip,
+        use_lora         = use_lora,
+        lora_rank        = lora_rank,
+        force_fallback   = force_fallback,
+        device           = device,
+        train_ar         = train_ar,
+        bidirectional    = bidirectional,
+        encoder_injected = encoder_injected,
+        encoder_n_layers = encoder_n_layers,
+        encoder_n_heads  = encoder_n_heads,
     )
 
 

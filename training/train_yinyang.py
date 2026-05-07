@@ -135,20 +135,23 @@ def train(args):
         if args.train_ar and ar_ckpt is None and args.ar_ckpt:
             print(f'WARNING: --train_ar set but {args.ar_ckpt} not found; training AR from scratch.')
         return build_yinyang_model(
-            ar_ckpt_path   = ar_ckpt,
-            max_seq_len    = args.n_cycles * 4 + 10,
-            d_model        = args.d_model,
-            n_layers       = args.n_layers,
-            n_heads        = args.n_heads,
-            rule_d_model   = RULE_D_MODEL,   # 28 — fixed by Tracr architecture
-            adapter_rank   = args.adapter_rank,
-            n_skip         = args.n_skip,
-            use_lora       = use_lora,
-            lora_rank      = args.lora_rank,
-            force_fallback = args.force_fallback,
-            device         = str(device),
-            train_ar       = args.train_ar,
-            bidirectional  = args.bidirectional,
+            ar_ckpt_path     = ar_ckpt,
+            max_seq_len      = args.n_cycles * 4 + 10,
+            d_model          = args.d_model,
+            n_layers         = args.n_layers,
+            n_heads          = args.n_heads,
+            rule_d_model     = RULE_D_MODEL,
+            adapter_rank     = args.adapter_rank,
+            n_skip           = args.n_skip,
+            use_lora         = use_lora,
+            lora_rank        = args.lora_rank,
+            force_fallback   = args.force_fallback,
+            device           = str(device),
+            train_ar         = args.train_ar,
+            bidirectional    = args.bidirectional,
+            encoder_injected = args.encoder_injected,
+            encoder_n_layers = args.encoder_n_layers,
+            encoder_n_heads  = args.encoder_n_heads,
         )
 
     if args.phase2_epochs > 0:
@@ -180,7 +183,8 @@ def train(args):
         lora_tag  = f'LoRA rank={args.lora_rank}' if args.use_lora else 'no LoRA'
         ar_tag    = ' + trainable AR' if args.train_ar else ''
         bidir_tag = ' + bidirectional' if args.bidirectional else ''
-        print(f'Mode: {lora_tag}{ar_tag}{bidir_tag}')
+        enc_tag   = ' + encoder_injected' if args.encoder_injected else ''
+        print(f'Mode: {lora_tag}{ar_tag}{bidir_tag}{enc_tag}')
         _run_training(model, train_loader, test_loader, args, device,
                       epochs=args.epochs, ckpt_path=ckpt_path, train_ar=args.train_ar)
 
@@ -212,6 +216,12 @@ def get_args():
     p.add_argument('--train_ar',           action='store_true', default=False,
                    help='Unfreeze AR model during training. If --ar_ckpt exists, '
                         'loads it as init; otherwise trains AR from scratch.')
+    p.add_argument('--encoder_injected',   action='store_true', default=False,
+                   help='Replace W_E[tokens] with a learned encoder before the frozen '
+                        'W_Q/K/V/O rule attention block. Rule model still called; only '
+                        'the token embedding step is learned.')
+    p.add_argument('--encoder_n_layers',   type=int, default=2)
+    p.add_argument('--encoder_n_heads',    type=int, default=4)
     p.add_argument('--bidirectional',      action='store_true', default=False,
                    help='Use bidirectional cross-attention: AR informs rule (round 1), '
                         'rule informs AR (round 2). Rule model input injection is skipped.')
