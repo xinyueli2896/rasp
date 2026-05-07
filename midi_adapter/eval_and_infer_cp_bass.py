@@ -169,7 +169,11 @@ def _local_sample(base, h, temperature, max_len=32):
 def ar_generate(base, key, n_prompt_bars, n_gen_bars, temperature, device):
     """
     Generate n_gen_bars bars autoregressively, conditioned on a synthetic prompt.
-    Returns list[(1, subseq_len)] token tensors for the generated portion only.
+
+    Returns
+    -------
+    all_tokens   : list[(1, subseq_len)] covering prompt + generated subbeats
+    n_prompt_sub : int  — number of subbeats that are prompt (for split marking)
     """
     n_total = (n_prompt_bars + n_gen_bars) * SUBBEATS_PER_BAR
 
@@ -187,6 +191,9 @@ def ar_generate(base, key, n_prompt_bars, n_gen_bars, temperature, device):
     h_enc, _ = base.local_encode(prompt)
     h_hist = torch.cat([sos, h_enc.view(1, T_p, -1)], dim=1)
 
+    # Keep prompt tokens so the MIDI starts from bar 0 (tonic)
+    prompt_tokens = [prompt[:, t, :] for t in range(T_p)]
+
     gen_tokens = []
     for step in range(T_p, n_total):
         h_out  = base.model(h_hist, attention_mask=base.buffered_future_mask(h_hist))[0]
@@ -196,7 +203,7 @@ def ar_generate(base, key, n_prompt_bars, n_gen_bars, temperature, device):
         h_enc2, _ = base.local_encode(y_next.unsqueeze(1))
         h_hist = torch.cat([h_hist, h_enc2.unsqueeze(1)], dim=1)
 
-    return gen_tokens   # list of (1, subseq_len), length = n_gen_bars * 16
+    return prompt_tokens + gen_tokens, T_p
 
 
 # ---------------------------------------------------------------------------
@@ -302,22 +309,24 @@ def print_piano_roll(pm, n_bars, title=''):
     print()
 
 
-def print_root_table(gen_tokens, key, n_bars_show=16, title=''):
+def print_root_table(all_tokens, key, n_prompt_sub=0, n_bars_show=16, title=''):
     """
     Show bar-by-bar expected root vs. the note played at the bar-start subbeat.
 
-    gen_tokens : list[(1, subseq_len)] covering n_gen_bars * 16 subbeats
+    all_tokens   : list[(1, subseq_len)] covering (prompt + generated) subbeats
+    n_prompt_sub : number of prompt subbeats (marked with '[' ']' in output)
     """
     tokenizer_eos  = 3329   # CPTokenizer eos_token value (n_normal_tokens + 1)
 
-    n_bars = min(len(gen_tokens) // SUBBEATS_PER_BAR, n_bars_show)
+    n_bars = min(len(all_tokens) // SUBBEATS_PER_BAR, n_bars_show)
+    n_prompt_bars = n_prompt_sub // SUBBEATS_PER_BAR
 
     expected_roots = [(key + OFFSETS[b % 4]) % 12 for b in range(n_bars)]
 
     # Extract pitch at every bar-start subbeat (index 0, 16, 32, …)
     gen_pitches = []
     for b in range(n_bars):
-        tok_batch = gen_tokens[b * SUBBEATS_PER_BAR]   # subbeat at bar start
+        tok_batch = all_tokens[b * SUBBEATS_PER_BAR]
         content   = tok_batch[0].tolist()
         pitch     = None
         for i in range(0, len(content) - 1, 2):
@@ -336,7 +345,12 @@ def print_root_table(gen_tokens, key, n_bars_show=16, title=''):
     if title:
         print(f'  {title}')
 
-    bar_line   = '  Bar   : ' + ''.join(f'{b:<5}' for b in range(n_bars))
+    # Mark prompt bars with brackets
+    def _bar_label(b):
+        s = str(b)
+        return f'[{s}]' if b < n_prompt_bars else s
+
+    bar_line   = '  Bar   : ' + ''.join(f'{_bar_label(b):<5}' for b in range(n_bars))
     exp_line   = '  Expect: ' + ''.join(f'{ROOT_NAMES[r]:<5}' for r in expected_roots)
 
     gen_names  = []
@@ -346,25 +360,30 @@ def print_root_table(gen_tokens, key, n_bars_show=16, title=''):
             gn, sym = '--', ' '
         else:
             gn  = ROOT_NAMES[gp % 12]
-            sym = '✓' if (gp % 12) == exp else '✗'
+            sym = '»' if b < n_prompt_bars else ('✓' if (gp % 12) == exp else '✗')
         gen_names.append(f'{gn:<5}')
         match_syms.append(f'{sym:<5}')
 
     gen_line   = '  Gen   : ' + ''.join(gen_names)
     match_line = '  Match : ' + ''.join(match_syms)
 
+    # Only score generated (non-prompt) bars
     n_correct = sum(
-        1 for exp, gp in zip(expected_roots, gen_pitches)
-        if gp is not None and (gp % 12) == exp
+        1 for b, (exp, gp) in enumerate(zip(expected_roots, gen_pitches))
+        if b >= n_prompt_bars and gp is not None and (gp % 12) == exp
     )
-    n_valid = sum(1 for gp in gen_pitches if gp is not None)
+    n_valid = sum(
+        1 for b, gp in enumerate(gen_pitches)
+        if b >= n_prompt_bars and gp is not None
+    )
     pct = n_correct / max(n_valid, 1) * 100
 
     print(bar_line)
     print(exp_line)
     print(gen_line)
     print(match_line)
-    print(f'  Root accuracy (AR): {n_correct}/{n_valid} = {pct:.1f}%')
+    print(f'  Root accuracy (AR, generated bars only): {n_correct}/{n_valid} = {pct:.1f}%')
+    print(f'  [brackets] = prompt bars  (» = given, not scored)')
     print()
 
 
@@ -434,31 +453,33 @@ def run(args):
         print(f'  Generating {args.n_gen_bars} bars (key={key_name}, '
               f'prompt={args.n_prompt_bars} bars, T={args.temperature}) ...')
 
-        gen_tokens = ar_generate(
+        all_tokens, n_prompt_sub = ar_generate(
             base, demo_key,
             n_prompt_bars=args.n_prompt_bars,
             n_gen_bars=args.n_gen_bars,
             temperature=args.temperature,
             device=device,
         )
+        n_total_bars = args.n_prompt_bars + args.n_gen_bars
 
-        # 3. Root tracking table
+        # 3. Root tracking table (prompt bars shown with brackets, not scored)
         print_root_table(
-            gen_tokens, demo_key,
-            n_bars_show=args.n_gen_bars,
+            all_tokens, demo_key,
+            n_prompt_sub=n_prompt_sub,
+            n_bars_show=n_total_bars,
             title=f'Root tracking (key={key_name}, group={group_name})',
         )
 
-        # 4. Decode + save MIDI
-        pm = decode_to_midi(gen_tokens, base.tokenizer,
+        # 4. Decode + save MIDI (includes prompt so file starts on tonic)
+        pm = decode_to_midi(all_tokens, base.tokenizer,
                             fixed_program=args.fixed_program)
         midi_path = os.path.join(args.out_dir, f'{group_name}_key{demo_key}.mid')
         pm.write(midi_path)
         print(f'  Saved MIDI → {midi_path}')
 
         # 5. ASCII piano roll
-        print_piano_roll(pm, args.n_gen_bars,
-                         title=f'{group_name} / key={key_name}')
+        print_piano_roll(pm, n_total_bars,
+                         title=f'{group_name} / key={key_name} (bar 0 = prompt)')
 
     # ---- summary table ----
     print()
@@ -498,8 +519,9 @@ def get_args():
                    help='Bars per song for accuracy eval (>= 24)')
     p.add_argument('--n_gen_bars',    type=int, default=16,
                    help='Bars to generate for the AR demo')
-    p.add_argument('--n_prompt_bars', type=int, default=4,
-                   help='Prompt bars before free generation')
+    p.add_argument('--n_prompt_bars', type=int, default=1,
+                   help='Prompt bars before free generation (1 = just the tonic bar, '
+                        'analogous to RASP prompt_len=1)')
     p.add_argument('--temperature',   type=float, default=1.0)
     p.add_argument('--fixed_program', type=int, default=32,
                    help='MIDI program for all notes (32 = acoustic bass)')
