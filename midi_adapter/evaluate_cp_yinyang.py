@@ -177,6 +177,8 @@ def evaluate(args):
     if use_adapter:
         model = CPYinyangTransformer(base, adapter_rank=args.adapter_rank, n_skip=args.n_skip)
         state = torch.load(args.adapter_ckpt, map_location='cpu')
+        if 'state_dict' in state:
+            state = state['state_dict']
         model.load_state_dict(state)
         print(f'Loaded adapter: {args.adapter_ckpt}')
     else:
