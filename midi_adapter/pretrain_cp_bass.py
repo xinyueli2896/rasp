@@ -105,7 +105,7 @@ def main(args):
         precision          = precision,
         max_steps          = args.max_steps,
         callbacks          = [checkpoint_cb],
-        val_check_interval = 2500,
+        val_check_interval = args.val_check_interval,
         limit_val_batches  = 25,
         check_val_every_n_epoch = None,
         gradient_clip_val  = gradient_clip,
@@ -128,7 +128,8 @@ def get_args():
     p.add_argument('--val_data',    required=True, help='Path to validation .pt file')
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',  type=int, default=8)
-    p.add_argument('--max_steps',   type=int, default=MAX_STEPS)
+    p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
+    p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
     p.add_argument('--run_name',      type=str,  default=None)
     p.add_argument('--resume_ckpt',   type=str,  default=None)
