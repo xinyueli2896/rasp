@@ -206,8 +206,9 @@ def generate_song(
         chord_str = f'{ROOT_NAMES[root]}:{song_quality}'
         xf_chords.append([float(bar_start), chord_str])
 
-        # One whole note per bar = one clear root token, matching RASP's one token per position.
-        bass.notes.extend(_bar_notes(root, song_quality, bar_start, 'whole'))
+        # Quarter-note pattern: root–fifth–root–fifth every beat,
+        # so the model sees note changes within bars and must learn harmony.
+        bass.notes.extend(_bar_notes(root, song_quality, bar_start, 'quarter'))
 
     pm.instruments.append(bass)
     return pm, xf_chords
