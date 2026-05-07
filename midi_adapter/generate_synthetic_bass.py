@@ -66,10 +66,11 @@ from midi_adapter.chord_tokenizer import (
 # Constants  (must match cp_transformer.py / preprocess_large_midi_dataset.py)
 # ---------------------------------------------------------------------------
 
-BEAT_DIV         = 4                           # subbeats per beat
-BEATS_PER_BAR    = 4                           # 4/4 time
-SUBBEATS_PER_BAR = BEAT_DIV * BEATS_PER_BAR   # 16
-CONSTANT_TEMPO   = 60.0 / BEAT_DIV             # 15.0 BPM → 1 subbeat = 1 second
+BEAT_DIV           = 4                              # subbeats per beat
+BEATS_PER_BAR      = 4                              # 4/4 time
+SUBBEATS_PER_BAR   = BEAT_DIV * BEATS_PER_BAR      # 16
+CONSTANT_TEMPO     = 120.0                          # BPM
+SECONDS_PER_SUBBEAT = 60.0 / CONSTANT_TEMPO / BEAT_DIV  # 0.125 s/subbeat
 
 DURATION_TEMPLATES = np.array([
     1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128,
@@ -120,8 +121,8 @@ def _make_note(pitch, start, duration_subbeats, velocity=70):
     return pretty_midi.Note(
         velocity=velocity,
         pitch=int(pitch),
-        start=float(start),
-        end=float(start + duration_subbeats),
+        start=float(start) * SECONDS_PER_SUBBEAT,
+        end=float(start + duration_subbeats) * SECONDS_PER_SUBBEAT,
     )
 
 
@@ -144,8 +145,9 @@ def _bar_notes(root_semitone: int, quality: str,
         ]
 
     if pattern == 'quarter':
-        pitches = [root, fifth, root, fifth]
-        step    = T // 4
+        step = T // 4
+        # I-IV-V-I within each bar: root_semitone is the song key
+        pitches = [_bass_root((root_semitone + offset) % 12) for offset in OFFSETS]
         return [_make_note(p, bar_start + i * step, step) for i, p in enumerate(pitches)]
 
     if pattern == 'walking':
@@ -195,20 +197,24 @@ def generate_song(
     song_quality = quality if quality is not None else random.choice(list(COMMON_CHORDS.keys()))
 
     pm   = pretty_midi.PrettyMIDI(initial_tempo=CONSTANT_TEMPO)
+    pm.time_signature_changes = [pretty_midi.TimeSignature(4, 4, 0.0)]
     bass = pretty_midi.Instrument(program=bass_instrument_program, name='Bass')
 
     xf_chords: list[list] = []
 
-    for b in range(n_bars):
-        # Exact RASP rule: (x + OFFSETS[i % 4]) % 12
-        root      = (key + OFFSETS[b % 4]) % 12
-        bar_start = b * SUBBEATS_PER_BAR
-        chord_str = f'{ROOT_NAMES[root]}:{song_quality}'
-        xf_chords.append([float(bar_start), chord_str])
+    beat_step = SUBBEATS_PER_BAR // BEATS_PER_BAR  # 4 subbeats per beat
 
-        # Quarter-note pattern: root–fifth–root–fifth every beat,
-        # so the model sees note changes within bars and must learn harmony.
-        bass.notes.extend(_bar_notes(root, song_quality, bar_start, 'quarter'))
+    for b in range(n_bars):
+        bar_start = b * SUBBEATS_PER_BAR
+        # I-IV-V-I within each bar — 4 chord entries per bar, one per beat
+        for j, offset in enumerate(OFFSETS):
+            beat_root  = (key + offset) % 12
+            beat_start = bar_start + j * beat_step
+            chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
+            xf_chords.append([float(beat_start), chord_str])
+        # All bars play the same I-IV-V-I pattern rooted on key:
+        # notes are: key, key+5, key+7, key  (one quarter note each)
+        bass.notes.extend(_bar_notes(key, song_quality, bar_start, 'quarter'))
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -240,9 +246,8 @@ def _preprocess_pm(
     for inst in pm.instruments:
         prog = inst.program
         for note in inst.notes:
-            # note.start is in seconds; at CONSTANT_TEMPO=15 BPM, 1 s = 1 subbeat
-            s = int(round(note.start))
-            e = int(round(note.end))
+            s = int(round(note.start / SECONDS_PER_SUBBEAT))
+            e = int(round(note.end   / SECONDS_PER_SUBBEAT))
             if 0 <= s < n_subbeats and polyphony_counts[s] < max_polyphony:
                 dur = int(np.searchsorted(DURATION_BOUNDARIES, e - s))
                 min_pitch = min(min_pitch, note.pitch)
