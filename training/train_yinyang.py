@@ -150,6 +150,7 @@ def train(args):
             train_ar         = args.train_ar,
             bidirectional    = args.bidirectional,
             encoder_injected = args.encoder_injected,
+            encoder_type     = args.encoder_type,
             encoder_n_layers = args.encoder_n_layers,
             encoder_n_heads  = args.encoder_n_heads,
         )
@@ -218,8 +219,11 @@ def get_args():
                         'loads it as init; otherwise trains AR from scratch.')
     p.add_argument('--encoder_injected',   action='store_true', default=False,
                    help='Replace W_E[tokens] with a learned encoder before the frozen '
-                        'W_Q/K/V/O rule attention block. Rule model still called; only '
-                        'the token embedding step is learned.')
+                        'W_Q/K/V/O rule attention block.')
+    p.add_argument('--encoder_type',       type=str, default='embedding',
+                   choices=['embedding', 'transformer'],
+                   help='embedding: plain token lookup (no context, better generalisation); '
+                        'transformer: embedding + bidirectional transformer (risks overfitting).')
     p.add_argument('--encoder_n_layers',   type=int, default=2)
     p.add_argument('--encoder_n_heads',    type=int, default=4)
     p.add_argument('--bidirectional',      action='store_true', default=False,

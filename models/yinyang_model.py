@@ -109,40 +109,52 @@ class LearnedRuleInputEncoder(nn.Module):
     Pipeline:
         tokens → this encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
 
-    The rule model's frozen attention structure (W_Q/K/V/O) is preserved.
-    Only the token embedding step is replaced by a learned soft encoding.
-    Output dim must be rule_d_model (28) to be compatible with W_Q/K/V/O.
+    encoder_type='embedding' : plain token embedding lookup (no context).
+                               Each token value gets one fixed representation
+                               regardless of surrounding context — forces
+                               token-level generalization.
+    encoder_type='transformer': embedding + bidirectional TransformerEncoder.
+                               Can exploit sequence context but risks learning
+                               seen-starter shortcuts that don't generalise.
     """
 
     def __init__(
         self,
-        vocab_size:   int,
-        rule_d_model: int   = RULE_D_MODEL,   # must be 28 to match W_Q/K/V/O
-        n_layers:     int   = 2,
-        n_heads:      int   = 4,
-        dropout:      float = 0.1,
+        vocab_size:    int,
+        rule_d_model:  int   = RULE_D_MODEL,
+        encoder_type:  str   = 'embedding',   # 'embedding' | 'transformer'
+        n_layers:      int   = 2,
+        n_heads:       int   = 4,
+        dropout:       float = 0.1,
     ):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, rule_d_model)
-        import warnings
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model         = rule_d_model,
-            nhead           = n_heads,
-            dim_feedforward = rule_d_model * 4,
-            dropout         = dropout,
-            batch_first     = True,
-            norm_first      = True,
-        )
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            self.encoder = nn.TransformerEncoder(
-                encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
+        self.encoder_type = encoder_type
+        self.embedding    = nn.Embedding(vocab_size, rule_d_model)
+
+        if encoder_type == 'transformer':
+            import warnings
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model         = rule_d_model,
+                nhead           = n_heads,
+                dim_feedforward = rule_d_model * 4,
+                dropout         = dropout,
+                batch_first     = True,
+                norm_first      = True,
             )
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                self.transformer = nn.TransformerEncoder(
+                    encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
+                )
+        elif encoder_type != 'embedding':
+            raise ValueError(f"encoder_type must be 'embedding' or 'transformer', got {encoder_type!r}")
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # tokens: (B, T) — same input as AR model
-        # returns (B, T, rule_d_model) — replaces W_E[tokens] before frozen attention
-        return self.encoder(self.embedding(tokens))
+        # tokens: (B, T)
+        h = self.embedding(tokens)   # (B, T, rule_d_model)
+        if self.encoder_type == 'transformer':
+            h = self.transformer(h)
+        return h
 
 
 class BidirectionalYinyangAttention(nn.Module):
@@ -276,6 +288,7 @@ class YinyangModel(nn.Module):
         train_ar:         bool = False,
         bidirectional:    bool = False,
         encoder_injected: bool = False,   # learned encoder replaces W_E before frozen W_Q/K/V/O
+        encoder_type:     str  = 'embedding',  # 'embedding' | 'transformer'
         encoder_n_layers: int  = 2,
         encoder_n_heads:  int  = 4,
     ):
@@ -344,7 +357,8 @@ class YinyangModel(nn.Module):
             # rule_d_model must stay 28 so shapes match.
             self.rule_input_encoder = LearnedRuleInputEncoder(
                 vocab_size   = VOCAB_SIZE,
-                rule_d_model = RULE_D_MODEL,   # must be 28
+                rule_d_model = RULE_D_MODEL,
+                encoder_type = encoder_type,
                 n_layers     = encoder_n_layers,
                 n_heads      = encoder_n_heads,
             ).to(device)
@@ -457,6 +471,7 @@ def build_yinyang_model(
     train_ar:          bool = False,
     bidirectional:     bool = False,
     encoder_injected:  bool = False,
+    encoder_type:      str  = 'embedding',
     encoder_n_layers:  int  = 2,
     encoder_n_heads:   int  = 4,
 ) -> YinyangModel:
@@ -476,6 +491,7 @@ def build_yinyang_model(
         train_ar         = train_ar,
         bidirectional    = bidirectional,
         encoder_injected = encoder_injected,
+        encoder_type     = encoder_type,
         encoder_n_layers = encoder_n_layers,
         encoder_n_heads  = encoder_n_heads,
     )
