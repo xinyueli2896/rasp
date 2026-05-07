@@ -59,12 +59,13 @@ def main(args):
     net.configure_optimizers = _configure_optimizers
 
     train_loader = DataLoader(
-        FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size, split='all'),
+        FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+                      split=args.train_split),
         batch_size=None, num_workers=1, persistent_workers=True,
     )
     val_loader = DataLoader(
         FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                      split='all', sample_step=16, repeat=True),
+                      split=args.val_split, sample_step=16, repeat=True),
         batch_size=None, num_workers=0,
     )
 
@@ -124,8 +125,14 @@ def main(args):
 
 def get_args():
     p = argparse.ArgumentParser(description='Pretrain CP transformer on synthetic bass')
-    p.add_argument('--train_data',  required=True, help='Path to training .pt file')
-    p.add_argument('--val_data',    required=True, help='Path to validation .pt file')
+    p.add_argument('--train_data',   required=True, help='Path to training .pt file')
+    p.add_argument('--val_data',     required=True, help='Path to validation .pt file')
+    p.add_argument('--train_split',  type=str, default='train',
+                   choices=['all', 'train', 'val', 'test'],
+                   help='FramedDataset split for train loader (default: train)')
+    p.add_argument('--val_split',    type=str, default='val',
+                   choices=['all', 'train', 'val', 'test'],
+                   help='FramedDataset split for val loader (default: val)')
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',  type=int, default=8)
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
