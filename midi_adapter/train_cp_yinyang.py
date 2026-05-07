@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
+from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
 
 TRAIN_LENGTH     = 384
 SUBBEATS_PER_BAR = 16
@@ -117,6 +118,62 @@ class ChordFramedDataset(FramedDataset):
 
             if not self.repeat:
                 break
+
+
+# ---------------------------------------------------------------------------
+# Unseen accuracy callback
+# ---------------------------------------------------------------------------
+
+class UnseenAccuracyCallback(L.Callback):
+    """
+    At each val check, compute chord root accuracy on unseen-key data.
+
+    Accuracy = fraction of bar-start positions where the model's predicted
+    bass pitch (argmax of pitch-slot logits % 128) matches the expected
+    MIDI pitch (36 + chord_root).
+
+    Requires sample_step=16 in the dataloader so windows start at bar
+    boundaries and chord_tokens[b, k] aligns with subbeat k*16.
+    """
+
+    def __init__(self, dataloader: DataLoader, n_batches: int = 25):
+        self.dataloader = dataloader
+        self.n_batches  = n_batches
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        model  = pl_module.model
+        device = pl_module.device
+        base   = model.base
+
+        correct = 0
+        total   = 0
+
+        model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(self.dataloader):
+                if batch_idx >= self.n_batches:
+                    break
+                x, pitch_shift, chord_tokens = [t.to(device) for t in batch]
+                B, seq_len, _ = x.shape
+
+                x_proc = base.preprocess(x, pitch_shift)          # (B, seq_len, 8)
+                logits  = model(x_proc, chord_tokens)              # (B*seq_len, 8, V)
+                logits  = logits.view(B, seq_len, 8, -1)          # (B, seq_len, 8, V)
+
+                # Slot 1 at bar-start subbeats (0, 16, 32, ...) predicts pitch encoding
+                pitch_logits = logits[:, ::16, 1, :]               # (B, n_bars, V)
+                pred_enc     = pitch_logits.argmax(-1)             # (B, n_bars)
+                pred_pitch   = pred_enc % 128                      # decode MIDI pitch
+
+                expected_root  = chord_tokens // N_QUALITIES       # (B, n_bars)
+                expected_pitch = 36 + expected_root                # MIDI pitch C2=36..B2=47
+
+                valid   = chord_tokens != NO_CHORD_TOKEN
+                correct += (pred_pitch == expected_pitch)[valid].sum().item()
+                total   += valid.sum().item()
+
+        acc = correct / max(total, 1)
+        pl_module.log('unseen_acc', acc, prog_bar=True)
 
 
 # ---------------------------------------------------------------------------
@@ -208,13 +265,16 @@ def main(args):
         batch_size=None, num_workers=0,
     )
 
-    val_loaders = [val_loader]
+    val_loaders   = [val_loader]
+    unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
-        val_loaders.append(DataLoader(
+        unseen_loader = DataLoader(
             ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
                                split='all', sample_step=16, repeat=True),
             batch_size=None, num_workers=0,
-        ))
+        )
+        val_loaders.append(unseen_loader)
+        unseen_acc_cb = UnseenAccuracyCallback(unseen_loader, n_batches=25)
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -245,12 +305,16 @@ def main(args):
     else:
         strategy = 'auto'
 
+    callbacks = [checkpoint_cb]
+    if unseen_acc_cb is not None:
+        callbacks.append(unseen_acc_cb)
+
     trainer = L.Trainer(
         devices            = -1 if use_gpu else 1,
         accelerator        = 'gpu' if use_gpu else 'cpu',
         precision          = 'bf16-mixed' if use_gpu else 32,
         max_steps          = args.max_steps,
-        callbacks          = [checkpoint_cb],
+        callbacks          = callbacks,
         val_check_interval = args.val_check_interval,
         limit_val_batches  = 25,
         check_val_every_n_epoch = None,
