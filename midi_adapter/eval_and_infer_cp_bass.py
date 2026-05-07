@@ -438,14 +438,17 @@ def run(args):
         print(f'  KEY GROUP : {group_name}  ({key_str})')
         print('=' * 72)
 
-        # 1. Teacher-forced accuracy
-        x, chord_tokens, pitch_shift = make_batch(
-            keys, n_songs=args.n_songs, n_bars=args.n_bars, device=device,
-        )
-        acc = compute_accuracy(model, x, chord_tokens, pitch_shift, base)
-        results[group_name] = acc
-        print(f'  Teacher-forced accuracy: {acc:.4f}')
-        print()
+        # 1. Teacher-forced accuracy (optional)
+        if not args.no_teacher_forcing:
+            x, chord_tokens, pitch_shift = make_batch(
+                keys, n_songs=args.n_songs, n_bars=args.n_bars, device=device,
+            )
+            acc = compute_accuracy(model, x, chord_tokens, pitch_shift, base)
+            results[group_name] = acc
+            print(f'  Teacher-forced accuracy: {acc:.4f}')
+            print()
+        else:
+            results[group_name] = None
 
         # 2. Autoregressive generation (one example, one key from group)
         demo_key = keys[0]
@@ -491,12 +494,14 @@ def run(args):
     print('-' * 68)
     for group_name, keys in KEY_GROUPS.items():
         acc = results[group_name]
-        print(f'{group_name:<{col_w}}  {str(keys):<28}  {args.n_songs:>8}  {acc:>10.4f}')
+        acc_str = f'{acc:>10.4f}' if acc is not None else '      n/a'
+        print(f'{group_name:<{col_w}}  {str(keys):<28}  {args.n_songs:>8}  {acc_str}')
     print()
 
     pretrain_acc = results['pretrain_keys']
     unseen_acc   = results['unseen']
-    print(f'  unseen / pretrain ratio: {unseen_acc / max(pretrain_acc, 1e-6):.4f}')
+    if pretrain_acc is not None and unseen_acc is not None:
+        print(f'  unseen / pretrain ratio: {unseen_acc / max(pretrain_acc, 1e-6):.4f}')
     print()
 
 
@@ -525,7 +530,9 @@ def get_args():
     p.add_argument('--temperature',   type=float, default=1.0)
     p.add_argument('--fixed_program', type=int, default=32,
                    help='MIDI program for all notes (32 = acoustic bass)')
-    p.add_argument('--out_dir',       type=str, default='output/midi_eval')
+    p.add_argument('--out_dir',             type=str, default='output/midi_eval')
+    p.add_argument('--no_teacher_forcing', action='store_true',
+                   help='Skip teacher-forced accuracy, only run AR generation')
     p.add_argument('--seed',          type=int, default=42)
     return p.parse_args()
 
