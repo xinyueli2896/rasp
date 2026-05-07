@@ -86,9 +86,10 @@ def main(args):
         ))
     loggers.append(TensorBoardLogger('tb_logs', name=run_name))
 
+    use_gpu = torch.cuda.is_available()
     trainer = L.Trainer(
-        devices            = -1,
-        accelerator        = 'gpu' if torch.cuda.is_available() else 'cpu',
+        devices            = -1 if use_gpu else 1,
+        accelerator        = 'gpu' if use_gpu else 'cpu',
         precision          = precision,
         max_steps          = args.max_steps,
         callbacks          = [checkpoint_cb],
