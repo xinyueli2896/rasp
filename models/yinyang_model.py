@@ -362,6 +362,10 @@ class YinyangModel(nn.Module):
                 n_layers     = encoder_n_layers,
                 n_heads      = encoder_n_heads,
             ).to(device)
+            # Initialize embedding to W_E so the pipeline is analytically correct
+            # from epoch 0. Training refines rather than re-discovers the solution.
+            with torch.no_grad():
+                self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
