@@ -41,11 +41,16 @@ Dataset note
 from __future__ import annotations
 
 import math
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from midi_adapter.chord_tokenizer import N_CHORD_TOKENS, NO_CHORD_TOKEN
+from midi_adapter.chord_tokenizer import N_CHORD_TOKENS, NO_CHORD_TOKEN, N_QUALITIES
+from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
 
 SUBBEATS_PER_BAR = 16   # 4/4, beat_div=4
 
@@ -197,15 +202,14 @@ class CPYinyangTransformer(nn.Module):
     def __init__(
         self,
         base_model,
-        rule_d_model:     int = 128,
         adapter_rank:     int = 256,
         n_skip:           int = 4,
         subbeats_per_bar: int = SUBBEATS_PER_BAR,
     ):
         super().__init__()
-        self.base          = base_model
+        self.base             = base_model
         self.subbeats_per_bar = subbeats_per_bar
-        self.n_skip        = n_skip
+        self.n_skip           = n_skip
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -216,12 +220,13 @@ class CPYinyangTransformer(nn.Module):
             f"n_global_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
 
-        self.chord_rule_model = ChordRuleModel(rule_d_model=rule_d_model)
+        # Frozen analytical rule model — no trainable parameters
+        self.rule_model = BassTracrRuleModel()
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
                 d_model          = self.base.hidden_size,
-                rule_d_model     = rule_d_model,
+                rule_d_model     = TRACR_D_MODEL,
                 embed_dim        = adapter_rank,
                 n_heads          = 8,
                 subbeats_per_bar = subbeats_per_bar,
@@ -233,6 +238,13 @@ class CPYinyangTransformer(nn.Module):
     # Training forward  (full sequence, layer-by-layer injection)
     # ------------------------------------------------------------------
 
+    def _rule_hidden(self, chord_tokens: torch.Tensor) -> torch.Tensor:
+        """Extract roots from chord tokens and run frozen TracR rule model."""
+        roots = chord_tokens // N_QUALITIES          # (B, n_bars) in 0-11
+        roots = roots.clamp(0, 11)
+        _, h  = self.rule_model(roots, return_hidden=True)   # (B, n_bars, 16)
+        return h
+
     def forward(self, x: torch.Tensor, chord_tokens: torch.Tensor) -> torch.Tensor:
         """
         x            : (B, seq_len, subseq_len)  preprocessed CP tokens
@@ -242,7 +254,7 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        rule_hidden = self.chord_rule_model(chord_tokens)   # (B, n_bars, rule_d_model)
+        rule_hidden = self._rule_hidden(chord_tokens)   # (B, n_bars, 16)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -288,7 +300,7 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seed_len, _ = x.shape
 
-        rule_hidden = self.chord_rule_model(chord_tokens)  # (B, n_bars, rule_d_model)
+        rule_hidden = self._rule_hidden(chord_tokens)  # (B, n_bars, 16)
 
         # Encode seed subbeats
         h_seed, _ = base.local_encode(x)

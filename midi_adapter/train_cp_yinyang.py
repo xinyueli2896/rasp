@@ -185,7 +185,6 @@ def main(args):
 
     adapter = CPYinyangTransformer(
         base_model   = base,
-        rule_d_model = args.rule_d_model,
         adapter_rank = args.adapter_rank,
         n_skip       = args.n_skip,
     )
@@ -272,7 +271,6 @@ def get_args():
     p.add_argument('--batch_size',         type=int, default=8)
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
     p.add_argument('--val_check_interval', type=int, default=500)
-    p.add_argument('--rule_d_model',       type=int, default=128)
     p.add_argument('--adapter_rank',       type=int, default=256)
     p.add_argument('--n_skip',             type=int, default=4)
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
