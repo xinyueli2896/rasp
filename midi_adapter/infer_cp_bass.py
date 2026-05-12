@@ -130,17 +130,19 @@ def _prompt_from_midi(path: str, n_prompt_bars: int, device: torch.device,
 
 
 def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
-                     base: RoFormerSymbolicTransformer) -> torch.Tensor:
-    """Generate a synthetic prompt of n_prompt_bars bars in the given key."""
-    if n_prompt_bars == 0:
-        # No prompt — return a single zero subbeat so global_sampling has
-        # something to encode before generating.
-        dummy = torch.zeros(1, 1, 16, dtype=torch.long, device=device)
+                     base: RoFormerSymbolicTransformer,
+                     n_prompt_beats: int | None = None) -> torch.Tensor:
+    """Generate a synthetic prompt in the given key.
+    n_prompt_beats overrides n_prompt_bars if given (finer granularity)."""
+    n_subbeats = (n_prompt_beats if n_prompt_beats is not None
+                  else n_prompt_bars * SUBBEATS_PER_BAR)
+    if n_subbeats == 0:
+        dummy = torch.zeros(1, 1, 16, dtype=torch.uint8, device=device)
         pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
-        return base.preprocess(dummy.to(torch.uint8), pitch_shift)
+        return base.preprocess(dummy, pitch_shift)
 
-    pm, _ = generate_song(n_bars=n_prompt_bars, key=key)
-    data, _ = _preprocess_pm(pm, n_prompt_bars * SUBBEATS_PER_BAR)
+    pm, _ = generate_song(n_bars=max(1, -(-n_subbeats // SUBBEATS_PER_BAR)), key=key)
+    data, _ = _preprocess_pm(pm, n_subbeats)
     data = data.unsqueeze(0).to(device)
     pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
     return base.preprocess(data, pitch_shift)
@@ -272,7 +274,8 @@ def infer(args):
     else:
         key_name = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][args.key % 12]
         print(f'Generating synthetic prompt: key={key_name} ({args.n_prompt_bars} prompt bars)')
-        prompt = _prompt_from_key(args.key, args.n_prompt_bars, device, base)
+        prompt = _prompt_from_key(args.key, args.n_prompt_bars, device, base,
+                                  n_prompt_beats=args.n_prompt_beats)
 
     prompt_len  = prompt.shape[1]
     total_subbeats = prompt_len + args.n_bars * SUBBEATS_PER_BAR
@@ -299,8 +302,10 @@ def get_args():
                    help='Output MIDI path')
     p.add_argument('--n_bars',        type=int, default=8,
                    help='Number of bars to generate (after prompt)')
-    p.add_argument('--n_prompt_bars', type=int, default=4,
+    p.add_argument('--n_prompt_bars', type=int, default=1,
                    help='Bars of prompt to condition on (0 = unconditioned)')
+    p.add_argument('--n_prompt_beats', type=int, default=None,
+                   help='Beats (notes) of prompt — overrides --n_prompt_bars. Use 1 for single-note prompt.')
     p.add_argument('--key',           type=int, default=0,
                    help='Key root 0-11 for synthetic prompt (ignored if --prompt_mid given)')
     p.add_argument('--prompt_mid',    type=str, default=None,
