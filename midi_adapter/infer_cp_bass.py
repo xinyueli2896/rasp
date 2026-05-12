@@ -36,7 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer, CPTokenizer
 from midi_adapter.generate_synthetic_bass import (
     generate_song, _preprocess_pm,
-    SUBBEATS_PER_BAR, CONSTANT_TEMPO, DURATION_TEMPLATES, DURATION_BOUNDARIES,
+    SUBBEATS_PER_BAR, CONSTANT_TEMPO, SECONDS_PER_SUBBEAT,
+    DURATION_TEMPLATES, DURATION_BOUNDARIES,
 )
 
 try:
@@ -65,7 +66,7 @@ def decode_output(
       pitch_enc = pitch + (duration+1)*128, so pitch_enc - 128 = pitch + duration*128
     """
     pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    time_step_length = 60.0 / tempo / 4   # seconds per subbeat
+    time_step_length = SECONDS_PER_SUBBEAT
 
     instrument_map: dict[int, pretty_midi.Instrument] = {}
 
@@ -220,7 +221,7 @@ def _sample(
     gen_tokens: list[torch.Tensor] = []
 
     for step in range(prompt_len, total_subbeats):
-        if step % 16 == 0:
+        if step % SUBBEATS_PER_BAR == 0:
             print(f'  subbeat {step}/{total_subbeats}')
 
         # Global transformer over everything seen so far

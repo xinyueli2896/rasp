@@ -38,7 +38,8 @@ from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
 from midi_adapter.generate_synthetic_bass import (
     generate_song, _preprocess_pm,
-    SUBBEATS_PER_BAR, CONSTANT_TEMPO, DURATION_TEMPLATES, OFFSETS,
+    SUBBEATS_PER_BAR, CONSTANT_TEMPO, SECONDS_PER_SUBBEAT,
+    DURATION_TEMPLATES, OFFSETS,
 )
 
 try:
@@ -256,7 +257,7 @@ def compute_ar_accuracy(base, keys, n_songs, n_prompt_bars, n_gen_bars,
 def decode_to_midi(sampled, tokenizer, tempo=CONSTANT_TEMPO, velocity=100,
                    fixed_program=None):
     pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    time_step = 60.0 / tempo / 4
+    time_step = SECONDS_PER_SUBBEAT
     inst_map: dict[int, pretty_midi.Instrument] = {}
 
     for t, tok_batch in enumerate(sampled):
@@ -314,7 +315,7 @@ def print_piano_roll(pm, n_bars, title=''):
     Each bar column is one char: the note-name of the first note in that bar,
     or '.' if silent.
     """
-    time_step = 60.0 / CONSTANT_TEMPO / 4   # seconds per subbeat
+    time_step = SECONDS_PER_SUBBEAT
     bar_duration = SUBBEATS_PER_BAR * time_step
 
     lo, hi = PITCH_RANGE
