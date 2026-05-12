@@ -198,10 +198,11 @@ def _local_sample(
 @torch.no_grad()
 def _sample(
     base: RoFormerSymbolicTransformer,
-    prompt: torch.Tensor,       # (1, T_prompt, 8) preprocessed
+    prompt: torch.Tensor,
     total_subbeats: int,
     temperature: float,
     device: torch.device,
+    show_progress: bool = True,
 ) -> list[torch.Tensor]:
     """
     Returns a list of (1, subseq_len) token tensors, one per subbeat,
@@ -223,7 +224,7 @@ def _sample(
     gen_tokens: list[torch.Tensor] = []
 
     for step in range(prompt_len, total_subbeats):
-        if step % SUBBEATS_PER_BAR == 0:
+        if show_progress and step % SUBBEATS_PER_BAR == 0:
             print(f'  subbeat {step}/{total_subbeats}')
 
         # Global transformer over everything seen so far
