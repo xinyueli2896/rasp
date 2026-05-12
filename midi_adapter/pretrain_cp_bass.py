@@ -107,7 +107,7 @@ def main(args):
         max_steps          = args.max_steps,
         callbacks          = [checkpoint_cb],
         val_check_interval = args.val_check_interval,
-        limit_val_batches  = 25,
+        limit_val_batches  = 200,
         check_val_every_n_epoch = None,
         gradient_clip_val  = gradient_clip,
         logger             = loggers,
