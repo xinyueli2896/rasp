@@ -66,11 +66,11 @@ from midi_adapter.chord_tokenizer import (
 # Constants  (must match cp_transformer.py / preprocess_large_midi_dataset.py)
 # ---------------------------------------------------------------------------
 
-BEAT_DIV           = 4                              # subbeats per beat
+BEAT_DIV           = 1                              # 1 subbeat = 1 beat (quarter note)
 BEATS_PER_BAR      = 4                              # 4/4 time
-SUBBEATS_PER_BAR   = BEAT_DIV * BEATS_PER_BAR      # 16
+SUBBEATS_PER_BAR   = BEAT_DIV * BEATS_PER_BAR      # 4
 CONSTANT_TEMPO     = 120.0                          # BPM
-SECONDS_PER_SUBBEAT = 60.0 / CONSTANT_TEMPO / BEAT_DIV  # 0.125 s/subbeat
+SECONDS_PER_SUBBEAT = 60.0 / CONSTANT_TEMPO / BEAT_DIV  # 0.5 s/subbeat (= 1 beat)
 
 DURATION_TEMPLATES = np.array([
     1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128,
@@ -259,11 +259,8 @@ def _preprocess_pm(
         if polyphony_counts[i] < max_polyphony:
             rolls[i, polyphony_counts[i], 0] = 254   # EOS token
 
-    ps_min = int(np.clip(-min_pitch,       -127, 127))
-    ps_max = int(np.clip(127 - max_pitch,  -127, 127))
-    # clamp pitch shift to [-5, 6] as in FramedDataset
-    ps_min = max(ps_min, -5)
-    ps_max = min(ps_max,  6)
+    ps_min = 0
+    ps_max = 0
 
     data = torch.tensor(rolls.reshape(n_subbeats, max_polyphony * 4), dtype=torch.uint8)
     return data, torch.tensor([ps_min, ps_max], dtype=torch.int8)
@@ -345,8 +342,8 @@ def generate_dataset(
 def main():
     p = argparse.ArgumentParser(description='Generate synthetic bass MIDI dataset')
     p.add_argument('--n_songs',       type=int,   default=5000)
-    p.add_argument('--n_bars',        type=int,   default=32,
-                   help='Bars per song (must be >= target_length/16 for training)')
+    p.add_argument('--n_bars',        type=int,   default=128,
+                   help='Bars per song (must be >= TRAIN_LENGTH/SUBBEATS_PER_BAR=96 for training)')
     p.add_argument('--out_dir',       type=str,   required=True,
                    help='Directory for individual MIDI files')
     p.add_argument('--out_pt',        type=str,   required=True,
