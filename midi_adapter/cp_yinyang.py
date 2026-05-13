@@ -50,9 +50,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from midi_adapter.chord_tokenizer import N_CHORD_TOKENS, NO_CHORD_TOKEN, N_QUALITIES
+from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
-
-SUBBEATS_PER_BAR = 16   # 4/4, beat_div=4
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +195,7 @@ class CPYinyangTransformer(nn.Module):
     rule_d_model     : hidden dim of the chord rule model
     adapter_rank     : embed_dim for cross-attention projections
     n_skip           : inject adapter every n_skip global transformer layers
-    subbeats_per_bar : 16 for 4/4, beat_div=4
+    subbeats_per_bar : beats per bar (imported from generate_synthetic_bass)
     """
 
     def __init__(

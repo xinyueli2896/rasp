@@ -32,10 +32,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
+from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR
 
-TRAIN_LENGTH     = 384
-SUBBEATS_PER_BAR = 16
-MAX_STEPS        = 100_000
+TRAIN_LENGTH = 384
+MAX_STEPS    = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ class UnseenAccuracyCallback(L.Callback):
     bass pitch (argmax of pitch-slot logits % 128) matches the expected
     MIDI pitch (36 + chord_root).
 
-    Requires sample_step=16 in the dataloader so windows start at bar
+    Requires sample_step=SUBBEATS_PER_BAR in the dataloader so windows start at bar
     boundaries and chord_tokens[b, k] aligns with subbeat k*16.
     """
 
@@ -161,7 +161,7 @@ class UnseenAccuracyCallback(L.Callback):
                 logits  = logits.view(B, seq_len, 8, -1)          # (B, seq_len, 8, V)
 
                 # Slot 1 at bar-start subbeats (0, 16, 32, ...) predicts pitch encoding
-                pitch_logits = logits[:, ::16, 1, :]               # (B, n_bars, V)
+                pitch_logits = logits[:, ::SUBBEATS_PER_BAR, 1, :]  # (B, n_bars, V)
                 pred_enc     = pitch_logits.argmax(-1)             # (B, n_bars)
                 pred_pitch   = pred_enc % 128                      # decode MIDI pitch
 
@@ -261,7 +261,7 @@ def main(args):
     )
     val_loader = DataLoader(
         ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.val_split, sample_step=16, repeat=True),
+                           split=args.val_split, sample_step=SUBBEATS_PER_BAR, repeat=True),
         batch_size=None, num_workers=0,
     )
 
@@ -270,7 +270,7 @@ def main(args):
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_loader = DataLoader(
             ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
-                               split='all', sample_step=16, repeat=True),
+                               split='all', sample_step=SUBBEATS_PER_BAR, repeat=True),
             batch_size=None, num_workers=0,
         )
         val_loaders.append(unseen_loader)
