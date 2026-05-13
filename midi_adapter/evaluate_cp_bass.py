@@ -82,13 +82,14 @@ def _extract_pc(tok: torch.Tensor, tokenizer) -> int | None:
 @torch.no_grad()
 def _gen_pcs(base: RoFormerSymbolicTransformer,
              key: int, n_gen: int,
-             device: torch.device, temperature: float) -> list[int | None]:
-    """Generate n_gen beats from a 1-beat prompt and return pitch classes."""
+             device: torch.device, temperature: float,
+             n_prompt_beats: int = 1) -> list[int | None]:
+    """Generate n_gen beats from an n_prompt_beats prompt and return pitch classes."""
     prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                               base=base, n_prompt_beats=1)
-    sampled = _sample(base, prompt, 1 + n_gen, temperature, device,
+                               base=base, n_prompt_beats=n_prompt_beats)
+    sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                       show_progress=False)
-    return [_extract_pc(t, base.tokenizer) for t in sampled[1:]]   # skip prompt
+    return [_extract_pc(t, base.tokenizer) for t in sampled[n_prompt_beats:]]
 
 
 @torch.no_grad()
@@ -99,6 +100,7 @@ def rule_following_acc(
     n_trials: int,
     device: torch.device,
     temperature: float,
+    n_prompt_beats: int = 2,
 ) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
     """
     Returns
@@ -112,10 +114,10 @@ def rule_following_acc(
     for key in keys:
         trial_accs = []
         for _ in range(n_trials):
-            pcs = _gen_pcs(base, key, n_gen, device, temperature)
+            pcs = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats)
             n_correct = 0
             for pos, pc in enumerate(pcs):
-                exp = _expected_pc(key, pos + 1)   # pos+1 because pos=0 is the prompt
+                exp = _expected_pc(key, pos + n_prompt_beats)
                 if pc == exp:
                     n_correct += 1
                 else:
@@ -130,14 +132,14 @@ def rule_following_acc(
 # Output formatters
 # ---------------------------------------------------------------------------
 
-def _print_summary_table(rows: list, n_trials: int) -> None:
+def _print_summary_table(rows: list, n_trials: int, n_prompt_beats: int = 2) -> None:
     multi = n_trials > 1
     w = 10
     header = f"{'Key group':<20} {'Keys':<22} {'Accuracy':>{w}}"
     sep    = '-' * len(header)
     print()
     print('=' * len(header))
-    print(f"RULE-FOLLOWING ACCURACY  (1-beat prompt {'greedy' if not multi else f't={n_trials} trials'})")
+    print(f"RULE-FOLLOWING ACCURACY  ({n_prompt_beats}-beat prompt, {'greedy' if not multi else f't={n_trials} trials'})")
     print('=' * len(header))
     print(header)
     print(sep)
@@ -162,24 +164,32 @@ def _print_per_key(rows: list) -> None:
 
 
 def _print_qualitative(base, keys, cat_label, n_gen, device, temperature,
-                       show_beats=16) -> None:
+                       n_prompt_beats: int = 2, show_beats=16) -> None:
     print(f'\n  [{cat_label}]')
     for key in keys:
-        pcs  = _gen_pcs(base, key, n_gen, device, temperature)
+        pcs  = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats)
         show = min(show_beats, n_gen)
 
+        prompt_notes = [ROOT_NAMES[_expected_pc(key, i)] for i in range(n_prompt_beats)]
+        prompt_str   = ', '.join(prompt_notes)
+
         beat_row = '  '.join(f'{i+1:>4}' for i in range(show))
-        exp_row  = '  '.join(f'{ROOT_NAMES[_expected_pc(key, i+1)]:>4}' for i in range(show))
+        exp_row  = '  '.join(
+            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats)]:>4}' for i in range(show)
+        )
         got_row  = '  '.join(f'{ROOT_NAMES[pc] if pc is not None else "?":>4}'
                              for pc in pcs[:show])
         mark_row = '  '.join(
-            f'{"P" if i == -1 else ("✓" if pcs[i] == _expected_pc(key, i+1) else "✗"):>4}'
+            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats) else "✗":>4}'
             for i in range(show)
         )
-        acc = sum(1 for i, pc in enumerate(pcs) if pc == _expected_pc(key, i+1)) / len(pcs)
+        acc = sum(
+            1 for i, pc in enumerate(pcs)
+            if pc == _expected_pc(key, i + n_prompt_beats)
+        ) / len(pcs)
 
         print(f'    Key={ROOT_NAMES[key]:<3}  acc={acc:.3f}  '
-              f'(prompt=[{ROOT_NAMES[key]}])')
+              f'(prompt=[{prompt_str}])')
         print(f'      Beat   : {beat_row}')
         print(f'      Expect : {exp_row}')
         print(f'      Got    : {got_row}')
@@ -246,11 +256,11 @@ def run_evaluation(args) -> None:
     print('=' * 60)
     print('CP Bass Transformer — Rule-Following Evaluation')
     print('=' * 60)
-    print(f'  checkpoint  : {args.base_ckpt}')
-    print(f'  n_gen_beats : {args.n_gen_beats}  ({args.n_gen_beats // SUBBEATS_PER_BAR} bars)')
-    print(f'  n_trials    : {args.n_trials}')
-    print(f'  temperature : {args.temperature}')
-    print(f'  prompt      : 1 note (starter x only — mirrors RASP prompt_len=1)')
+    print(f'  checkpoint    : {args.base_ckpt}')
+    print(f'  n_gen_beats   : {args.n_gen_beats}  ({args.n_gen_beats // SUBBEATS_PER_BAR} bars)')
+    print(f'  n_prompt_beats: {args.n_prompt_beats}  (x, x+5 uniquely pins position in cycle)')
+    print(f'  n_trials      : {args.n_trials}')
+    print(f'  temperature   : {args.temperature}')
     print()
     print(f'  Pretrain keys : {PRETRAIN_KEYS}')
     print(f'  Finetune-new  : {FINETUNE_NEW}')
@@ -263,25 +273,27 @@ def run_evaluation(args) -> None:
 
     for cat, keys, keys_str in CATEGORIES:
         per_key, errors = rule_following_acc(
-            base, keys, args.n_gen_beats, args.n_trials, device, args.temperature
+            base, keys, args.n_gen_beats, args.n_trials, device, args.temperature,
+            n_prompt_beats=args.n_prompt_beats,
         )
         all_errors.extend(errors)
         vals = list(per_key.values())
         rows.append((cat, per_key, keys_str,
                      float(np.mean(vals)), float(np.std(vals))))
 
-    _print_summary_table(rows, args.n_trials)
+    _print_summary_table(rows, args.n_trials, n_prompt_beats=args.n_prompt_beats)
 
     if args.verbose:
         _print_per_key(rows)
 
     # Qualitative examples (first 2 keys per category)
     print()
-    print('Qualitative generation examples  (1-beat prompt, first 16 beats shown)')
+    print(f'Qualitative generation examples  ({args.n_prompt_beats}-beat prompt, first 16 beats shown)')
     print('-' * 72)
     for cat, keys, _ in CATEGORIES:
         _print_qualitative(base, keys[:2], cat,
-                           args.n_gen_beats, device, args.temperature)
+                           args.n_gen_beats, device, args.temperature,
+                           n_prompt_beats=args.n_prompt_beats)
 
     _print_error_dist(all_errors)
 
@@ -299,6 +311,8 @@ def get_args():
                    help='Trials per key (useful with temperature > 0)')
     p.add_argument('--temperature', type=float, default=0,
                    help='0 = greedy (default), >0 = stochastic')
+    p.add_argument('--n_prompt_beats', type=int, default=2,
+                   help='Beats to use as prompt (default 2: x, x+5 — uniquely pins cycle phase)')
     p.add_argument('--verbose',     action='store_true',
                    help='Print per-key accuracy breakdown')
     return p.parse_args()
