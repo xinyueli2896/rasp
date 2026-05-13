@@ -1,28 +1,19 @@
 """
-Evaluate chord root accuracy on four key groups:
+Evaluate rule-following accuracy of the CPYinyangTransformer (base + adapter).
 
-  pretrain_keys  {0,2,4,5,7,9,11}       seen in CP pretraining only
-  finetune_new   {1,3,10}               first seen in adapter finetuning
-  all_seen       {0,1,2,3,4,5,7,9,10,11} seen in any training phase
-  unseen         {6,8}                   never seen in training
-
-Accuracy = fraction of bar-start positions (every 16th subbeat) where
-  argmax(pitch-slot logits) % 128  ==  36 + chord_root
-
-Can evaluate:
-  - Base CP transformer alone (no adapter)
-  - CPYinyangTransformer with adapter weights
+Mirrors evaluate_cp_bass.py but uses chord-conditioned autoregressive
+generation via global_sampling_chord.
 
 Usage
 -----
-  # base model only
   python -m midi_adapter.evaluate_cp_yinyang \\
-      --base_ckpt checkpoints/cp_bass_size1_pretrain.pt
+      --base_ckpt    ckpt/cp_bass_ft_size1_batch8/last.ckpt \\
+      --adapter_ckpt ckpt/cp_yinyang_size1_rank256/cp_yinyang_size1_rank256.pt
 
-  # with adapter
+  # stochastic, save MIDI
   python -m midi_adapter.evaluate_cp_yinyang \\
-      --base_ckpt    checkpoints/cp_bass_size1_pretrain.pt \\
-      --adapter_ckpt checkpoints/cp_yinyang_size1_rank256.pt
+      --base_ckpt    ckpt/... --adapter_ckpt ckpt/... \\
+      --temperature 0.8 --n_trials 8 --save_midi_dir eval_midi_adapter/
 """
 
 from __future__ import annotations
@@ -31,201 +22,269 @@ import argparse
 import os
 import sys
 
-import torch
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
-from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
-from midi_adapter.generate_synthetic_bass import (
-    generate_song, _preprocess_pm, SUBBEATS_PER_BAR, OFFSETS,
+from midi_adapter.chord_tokenizer import chord_str_to_token
+from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
+from midi_adapter.infer_cp_bass import _prompt_from_key, decode_output
+
+# Re-use shared helpers from evaluate_cp_bass
+from midi_adapter.evaluate_cp_bass import (
+    ROOT_NAMES,
+    PRETRAIN_KEYS, FINETUNE_NEW, ALL_SEEN, UNSEEN, CATEGORIES,
+    _expected_pc, _extract_pc,
+    _print_summary_table, _print_per_key, _print_error_dist,
 )
 
-# ---------------------------------------------------------------------------
-# Key groups
-# ---------------------------------------------------------------------------
-
-KEY_GROUPS = {
-    'pretrain_keys': [0, 2, 4, 5, 7, 9, 11],
-    'finetune_new':  [1, 3, 10],
-    'all_seen':      [0, 1, 2, 3, 4, 5, 7, 9, 10, 11],
-    'unseen':        [6, 8],
-}
-
-TRAIN_LENGTH     = 384   # subbeats per window
-N_BARS_PER_WIN   = TRAIN_LENGTH // SUBBEATS_PER_BAR   # 24
-
 
 # ---------------------------------------------------------------------------
-# Generate a batch of test songs for a given key list
+# Chord token helpers
 # ---------------------------------------------------------------------------
 
-def make_batch(keys: list[int], n_songs: int, n_bars: int, device: torch.device):
-    """
-    Generate n_songs songs (one per key, cycling through keys) and return:
-      x            (n_songs, n_bars*16, 16)  uint8 CP data
-      chord_tokens (n_songs, n_bars)         int64 bar-level chord tokens
-      pitch_shift  (n_songs,)                zeros (no augmentation at eval)
-    """
-    from midi_adapter.chord_tokenizer import chord_str_to_token
-    from midi_adapter.generate_synthetic_bass import ROOT_NAMES, COMMON_CHORDS
-
-    n_subbeats = n_bars * SUBBEATS_PER_BAR
-    x_list, ct_list = [], []
-
-    for i in range(n_songs):
-        key = keys[i % len(keys)]
-        pm, xf_chords = generate_song(n_bars=n_bars, key=key)
-        data, _ = _preprocess_pm(pm, n_subbeats)
-        x_list.append(data)
-
-        # Build chord tokens for each bar
-        bar_tokens = []
-        for b in range(n_bars):
-            root = (key + OFFSETS[b % 4]) % 12
-            # quality is random per song in generate_song; extract from xf_chords
-            chord_str = xf_chords[b][1]
-            tok = chord_str_to_token(chord_str)
-            bar_tokens.append(tok)
-        ct_list.append(torch.tensor(bar_tokens, dtype=torch.long))
-
-    x            = torch.stack(x_list, dim=0).to(device)          # (B, T, 16)
-    chord_tokens = torch.stack(ct_list, dim=0).to(device)         # (B, n_bars)
-    pitch_shift  = torch.zeros(n_songs, dtype=torch.long, device=device)
-    return x, chord_tokens, pitch_shift
+def _make_chord_tokens(key: int, n_beats: int, device: torch.device) -> torch.Tensor:
+    """Build beat-level chord token tensor for a given key and length."""
+    tokens = [
+        chord_str_to_token(f'{ROOT_NAMES[(key + OFFSETS[t % 4]) % 12]}:maj')
+        for t in range(n_beats)
+    ]
+    return torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)  # (1, n_beats)
 
 
 # ---------------------------------------------------------------------------
-# Accuracy computation (teacher-forced)
+# Core generation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_accuracy(model, x, chord_tokens, pitch_shift, base, window_size=TRAIN_LENGTH):
-    """
-    Slide a window of `window_size` subbeats over each song (step = SUBBEATS_PER_BAR)
-    and accumulate chord-root accuracy.
+def _gen_pcs(model: CPYinyangTransformer,
+             key: int, n_gen: int,
+             device: torch.device, temperature: float,
+             n_prompt_beats: int = 2) -> list[int | None]:
+    """Generate n_gen beats with chord conditioning and return pitch classes."""
+    prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                              base=model.base, n_prompt_beats=n_prompt_beats)
 
-    For each bar-start subbeat within the window (positions 0, 16, 32, ...):
-      pred_pitch   = argmax(logits[:, ::16, slot=1, :]) % 128
-      target_pitch = 36 + chord_tokens // N_QUALITIES
-    """
-    B, T, _ = x.shape
-    n_song_bars = T // SUBBEATS_PER_BAR
-    n_win_bars  = window_size // SUBBEATS_PER_BAR
+    total     = n_prompt_beats + n_gen
+    chord_tok = _make_chord_tokens(key, total, device)   # (1, total)
 
-    correct = 0
-    total   = 0
+    sampled = model.global_sampling_chord(
+        prompt, chord_tok, max_seq_len=total, temperature=temperature,
+    )
+    return [_extract_pc(t, model.base.tokenizer) for t in sampled[n_prompt_beats:]]
 
-    for start_sub in range(0, T - window_size + 1, SUBBEATS_PER_BAR):
-        start_bar = start_sub // SUBBEATS_PER_BAR
-        end_bar   = start_bar + n_win_bars
 
-        x_win  = x[:, start_sub:start_sub + window_size, :]        # (B, W, 16)
-        ct_win = chord_tokens[:, start_bar:end_bar]                 # (B, n_win_bars)
-        ps     = pitch_shift
+# ---------------------------------------------------------------------------
+# Accuracy
+# ---------------------------------------------------------------------------
 
-        x_proc = base.preprocess(x_win, ps)                        # (B, W, 8)
+@torch.no_grad()
+def rule_following_acc(
+    model: CPYinyangTransformer,
+    keys: list[int],
+    n_gen: int,
+    n_trials: int,
+    device: torch.device,
+    temperature: float,
+    n_prompt_beats: int = 2,
+) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
+    per_key: dict[int, float] = {}
+    errors:  list[tuple[int, int | None]] = []
 
-        if isinstance(model, CPYinyangTransformer):
-            logits = model(x_proc, ct_win)                         # (B*W, 8, V)
-        else:
-            # base CP transformer — no chord conditioning
-            logits = base(x_proc)                                   # (B*W, 8, V)
+    for key in keys:
+        trial_accs = []
+        for _ in range(n_trials):
+            pcs = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
+            n_correct = 0
+            for pos, pc in enumerate(pcs):
+                exp = _expected_pc(key, pos + n_prompt_beats)
+                if pc == exp:
+                    n_correct += 1
+                else:
+                    errors.append((exp, pc))
+            trial_accs.append(n_correct / len(pcs))
+        per_key[key] = float(np.mean(trial_accs))
 
-        logits = logits.view(B, window_size, 8, -1)                # (B, W, 8, V)
+    return per_key, errors
 
-        # Pitch predictions at bar-start subbeats
-        pitch_logits   = logits[:, ::16, 1, :]                     # (B, n_win_bars, V)
-        pred_enc       = pitch_logits.argmax(-1)                   # (B, n_win_bars)
-        pred_pitch     = pred_enc % 128
 
-        expected_root  = ct_win // N_QUALITIES                     # (B, n_win_bars)
-        expected_pitch = 36 + expected_root
+# ---------------------------------------------------------------------------
+# Qualitative output
+# ---------------------------------------------------------------------------
 
-        valid   = ct_win != NO_CHORD_TOKEN
-        correct += (pred_pitch == expected_pitch)[valid].sum().item()
-        total   += valid.sum().item()
+def _print_qualitative(model, keys, cat_label, n_gen, device, temperature,
+                       n_prompt_beats: int = 2, show_beats: int = 16) -> None:
+    print(f'\n  [{cat_label}]')
+    for key in keys:
+        pcs  = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
+        show = min(show_beats, n_gen)
 
-    return correct / max(total, 1)
+        prompt_notes = [ROOT_NAMES[_expected_pc(key, i)] for i in range(n_prompt_beats)]
+        prompt_str   = ', '.join(prompt_notes)
+
+        beat_row = '  '.join(f'{i+1:>4}' for i in range(show))
+        exp_row  = '  '.join(
+            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats)]:>4}' for i in range(show)
+        )
+        got_row  = '  '.join(
+            f'{ROOT_NAMES[pc] if pc is not None else "?":>4}' for pc in pcs[:show]
+        )
+        mark_row = '  '.join(
+            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats) else "✗":>4}'
+            for i in range(show)
+        )
+        acc = sum(
+            1 for i, pc in enumerate(pcs)
+            if pc == _expected_pc(key, i + n_prompt_beats)
+        ) / len(pcs)
+
+        print(f'    Key={ROOT_NAMES[key]:<3}  acc={acc:.3f}  (prompt=[{prompt_str}])')
+        print(f'      Beat   : {beat_row}')
+        print(f'      Expect : {exp_row}')
+        print(f'      Got    : {got_row}')
+        print(f'      Match  : {mark_row}')
+
+
+# ---------------------------------------------------------------------------
+# MIDI export
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_dir) -> None:
+    os.makedirs(out_dir, exist_ok=True)
+    all_keys = sorted(set(PRETRAIN_KEYS + FINETUNE_NEW + UNSEEN))
+    for key in all_keys:
+        prompt    = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                                     base=model.base, n_prompt_beats=n_prompt_beats)
+        total     = n_prompt_beats + n_gen
+        chord_tok = _make_chord_tokens(key, total, device)
+        sampled   = model.global_sampling_chord(
+            prompt, chord_tok, max_seq_len=total, temperature=temperature,
+        )
+        path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
+        decode_output(sampled, model.base.tokenizer, save_path=path)
+        print(f'  saved {path}')
+
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_model(base_ckpt: str, adapter_ckpt: str,
+               model_size: int, adapter_rank: int, n_skip: int,
+               device: torch.device) -> CPYinyangTransformer:
+    max_lr = 5e-5 if model_size >= 2 else 1e-4
+    base   = RoFormerSymbolicTransformer(
+        size=model_size, max_lr=max_lr, with_velocity=False,
+    )
+
+    if base_ckpt and os.path.exists(base_ckpt):
+        state = torch.load(base_ckpt, map_location='cpu')
+        if 'state_dict' in state:
+            state = state['state_dict']
+        base.load_state_dict(state)
+        print(f'  Base model   : {base_ckpt}')
+    else:
+        print(f'  WARNING: base ckpt not found ({base_ckpt}) — random weights')
+
+    model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip)
+
+    if adapter_ckpt and os.path.exists(adapter_ckpt):
+        state = torch.load(adapter_ckpt, map_location='cpu')
+        if 'state_dict' in state:
+            state = {k[len('model.'):]: v for k, v in state['state_dict'].items()
+                     if k.startswith('model.')}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f'  WARNING missing keys: {missing[:3]}')
+        print(f'  Adapter      : {adapter_ckpt}')
+    else:
+        print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random adapter weights')
+
+    return model.to(device).eval()
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def evaluate(args):
+def run_evaluation(args) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f'Device: {device}')
-
-    max_lr = 5e-5 if args.model_size >= 2 else 1e-4
-    base   = RoFormerSymbolicTransformer(
-        size=args.model_size, max_lr=max_lr, with_velocity=False,
-    )
-
-    if args.base_ckpt and os.path.exists(args.base_ckpt):
-        state = torch.load(args.base_ckpt, map_location='cpu')
-        if 'state_dict' in state:
-            state = state['state_dict']
-        base.load_state_dict(state)
-        print(f'Loaded base CP transformer: {args.base_ckpt}')
-    else:
-        print('WARNING: no base checkpoint — using random weights.')
-
-    use_adapter = args.adapter_ckpt and os.path.exists(args.adapter_ckpt)
-    if use_adapter:
-        model = CPYinyangTransformer(base, adapter_rank=args.adapter_rank, n_skip=args.n_skip)
-        state = torch.load(args.adapter_ckpt, map_location='cpu')
-        if 'state_dict' in state:
-            state = state['state_dict']
-        model.load_state_dict(state)
-        print(f'Loaded adapter: {args.adapter_ckpt}')
-    else:
-        model = base
-        print('Evaluating base CP transformer (no adapter).')
-
-    model = model.to(device).eval()
-    base  = base.to(device).eval()
-
-    # Header
-    col_w = 18
+    print('=' * 60)
+    print('CPYinyangTransformer — Rule-Following Evaluation')
+    print('=' * 60)
+    print(f'  base_ckpt     : {args.base_ckpt}')
+    print(f'  adapter_ckpt  : {args.adapter_ckpt}')
+    print(f'  n_gen_beats   : {args.n_gen_beats}  ({args.n_gen_beats // SUBBEATS_PER_BAR} bars)')
+    print(f'  n_prompt_beats: {args.n_prompt_beats}')
+    print(f'  n_trials      : {args.n_trials}')
+    print(f'  temperature   : {args.temperature}')
+    print(f'  adapter_rank  : {args.adapter_rank}   n_skip={args.n_skip}')
     print()
-    print(f'{"Key group":<{col_w}}  {"Keys":<30}  {"n_songs":>8}  {"accuracy":>10}')
-    print('-' * 72)
+    print(f'  Pretrain keys : {PRETRAIN_KEYS}')
+    print(f'  Finetune-new  : {FINETUNE_NEW}')
+    print(f'  Unseen        : {UNSEEN}')
 
-    results = {}
-    for group_name, keys in KEY_GROUPS.items():
-        x, chord_tokens, pitch_shift = make_batch(
-            keys, n_songs=args.n_songs, n_bars=args.n_bars, device=device,
+    model = load_model(args.base_ckpt, args.adapter_ckpt,
+                       args.model_size, args.adapter_rank, args.n_skip, device)
+
+    rows       = []
+    all_errors = []
+
+    for cat, keys, keys_str in CATEGORIES:
+        per_key, errors = rule_following_acc(
+            model, keys, args.n_gen_beats, args.n_trials,
+            device, args.temperature, args.n_prompt_beats,
         )
-        acc = compute_accuracy(model, x, chord_tokens, pitch_shift, base,
-                               window_size=TRAIN_LENGTH)
-        results[group_name] = acc
-        print(f'{group_name:<{col_w}}  {str(keys):<30}  {args.n_songs:>8}  {acc:>10.4f}')
+        all_errors.extend(errors)
+        vals = list(per_key.values())
+        rows.append((cat, per_key, keys_str,
+                     float(np.mean(vals)), float(np.std(vals))))
+
+    _print_summary_table(rows, args.n_trials, n_prompt_beats=args.n_prompt_beats)
+
+    if args.verbose:
+        _print_per_key(rows)
 
     print()
-    print('unseen / all_seen ratio: '
-          f'{results["unseen"] / max(results["all_seen"], 1e-6):.4f}')
+    print(f'Qualitative generation examples  ({args.n_prompt_beats}-beat prompt, first 16 beats shown)')
+    print('-' * 72)
+    for cat, keys, _ in CATEGORIES:
+        _print_qualitative(model, keys[:2], cat,
+                           args.n_gen_beats, device, args.temperature,
+                           n_prompt_beats=args.n_prompt_beats)
 
-    return results
+    _print_error_dist(all_errors)
+
+    if args.save_midi_dir:
+        print(f'\nSaving MIDI for all 12 keys → {args.save_midi_dir}')
+        _save_midi_all_keys(model, args.n_gen_beats, device, args.temperature,
+                            args.n_prompt_beats, args.save_midi_dir)
 
 
 def get_args():
-    p = argparse.ArgumentParser(description='Evaluate CPYinyangTransformer chord accuracy')
-    p.add_argument('--base_ckpt',    type=str, required=True,
-                   help='Path to pretrained CP transformer .pt file')
-    p.add_argument('--adapter_ckpt', type=str, default=None,
-                   help='Path to adapter .pt file (omit to eval base model only)')
-    p.add_argument('--model_size',   type=int, default=1, choices=[0, 1, 2, 3])
-    p.add_argument('--adapter_rank', type=int, default=256)
-    p.add_argument('--n_skip',       type=int, default=4)
-    p.add_argument('--n_songs',      type=int, default=50,
-                   help='Songs per key group')
-    p.add_argument('--n_bars',       type=int, default=32,
-                   help='Bars per song (>= 24 for at least one full window)')
+    p = argparse.ArgumentParser(
+        description='Evaluate CPYinyangTransformer rule-following accuracy'
+    )
+    p.add_argument('--base_ckpt',     required=True,
+                   help='Base CP transformer .pt or .ckpt')
+    p.add_argument('--adapter_ckpt',  required=True,
+                   help='Adapter .pt saved by train_cp_yinyang.py')
+    p.add_argument('--model_size',    type=int, default=1, choices=[0, 1, 2, 3])
+    p.add_argument('--adapter_rank',  type=int, default=256)
+    p.add_argument('--n_skip',        type=int, default=4)
+    p.add_argument('--n_gen_beats',   type=int, default=32,
+                   help='Beats to generate per trial (default 32 = 8 bars)')
+    p.add_argument('--n_prompt_beats', type=int, default=2)
+    p.add_argument('--n_trials',      type=int, default=1)
+    p.add_argument('--temperature',   type=float, default=0)
+    p.add_argument('--verbose',       action='store_true')
+    p.add_argument('--save_midi_dir', type=str, default=None)
     return p.parse_args()
 
 
 if __name__ == '__main__':
-    evaluate(get_args())
+    run_evaluation(get_args())
