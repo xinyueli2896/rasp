@@ -113,3 +113,19 @@ def bar_tokens_tensor(
     """Convenience wrapper — returns a 1-D int64 tensor of bar chord tokens."""
     tokens = chords_to_bar_tokens(xf_chords, n_subbeats, subbeats_per_bar)
     return torch.tensor(tokens, dtype=torch.long, device=device)
+
+
+def chords_to_beat_tokens(
+    xf_chords: list[list],
+    n_subbeats: int,
+) -> list[int]:
+    """
+    One chord token per subbeat (beat-level granularity).
+
+    With BEAT_DIV=1 every subbeat is one quarter note, so each beat gets its
+    own chord token.  This is correct for our synthetic data where the chord
+    changes on every beat (I-IV-V-I within each bar).
+
+    Equivalent to chords_to_bar_tokens(..., subbeats_per_bar=1).
+    """
+    return chords_to_bar_tokens(xf_chords, n_subbeats, subbeats_per_bar=1)

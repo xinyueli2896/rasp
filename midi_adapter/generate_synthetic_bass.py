@@ -25,7 +25,7 @@ Outputs
   <out_pt>.pt                         CP tensor data (all songs concatenated)
   <out_pt>.length.pt                  per-song lengths in subbeats
   <out_pt>.pitch_shift_range.pt       per-song pitch shift range (int8)
-  <out_pt>.bar_chords.pt              bar-level chord tokens (list of int16 tensors)
+  <out_pt>.beat_chords.pt             beat-level chord tokens (list of int16 tensors)
   <out_pt>.txt                        song index → MIDI filename mapping
 
 RASP-analogy workflow
@@ -315,10 +315,10 @@ def generate_dataset(
         all_data.append(data)
         all_shift.append(shift)
 
-        # Convert chord annotations to bar tokens
-        from midi_adapter.chord_tokenizer import chords_to_bar_tokens
-        bar_tokens = chords_to_bar_tokens(xf_chords, n_subbeats, SUBBEATS_PER_BAR)
-        all_chords.append(torch.tensor(bar_tokens, dtype=torch.int16))
+        # Convert chord annotations to beat-level tokens (one per beat)
+        from midi_adapter.chord_tokenizer import chords_to_beat_tokens
+        beat_tokens = chords_to_beat_tokens(xf_chords, n_subbeats)
+        all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
 
         if (i + 1) % 500 == 0:
             print(f'  {i + 1}/{n_songs} songs generated')
@@ -327,12 +327,12 @@ def generate_dataset(
     torch.save(torch.cat(all_data, dim=0),     f'{out_pt}.pt')
     torch.save(torch.tensor([n_subbeats] * n_songs), f'{out_pt}.length.pt')
     torch.save(torch.stack(all_shift, dim=0),  f'{out_pt}.pitch_shift_range.pt')
-    torch.save(all_chords,                     f'{out_pt}.bar_chords.pt')
+    torch.save(all_chords,                     f'{out_pt}.beat_chords.pt')
 
     with open(f'{out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
 
-    print(f'Saved {n_songs} songs to {out_pt}.{{pt,length.pt,pitch_shift_range.pt,bar_chords.pt,txt}}')
+    print(f'Saved {n_songs} songs to {out_pt}.{{pt,length.pt,pitch_shift_range.pt,beat_chords.pt,txt}}')
 
 
 # ---------------------------------------------------------------------------

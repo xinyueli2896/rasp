@@ -60,28 +60,28 @@ from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
 
 class CPYinyangCrossAttention(nn.Module):
     """
-    Query  : subbeat AR hidden states    (B, T_sub, d_model)
-    Key/Val: bar-level rule hidden states (B, n_bars, rule_d_model)
-    Causal : subbeat t attends to bar b  iff  t // subbeats_per_bar >= b
+    Query  : beat-level AR hidden states  (B, T_beat, d_model)
+    Key/Val: beat-level rule hidden states (B, T_beat, rule_d_model)
+
+    Q and K are in the same index space (one entry per beat), so a single
+    positional encoding covers both and the causal mask is a plain lower
+    triangular: beat t may attend to beats 0..t.
     """
 
     def __init__(
         self,
-        d_model:          int,
-        rule_d_model:     int,
-        embed_dim:        int,
-        n_heads:          int   = 8,
-        dropout:          float = 0.1,
-        max_subbeats:     int   = 512,
-        max_bars:         int   = 64,
-        subbeats_per_bar: int   = SUBBEATS_PER_BAR,
+        d_model:      int,
+        rule_d_model: int,
+        embed_dim:    int,
+        n_heads:      int   = 8,
+        dropout:      float = 0.1,
+        max_beats:    int   = 512,
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
-        self.n_heads          = n_heads
-        self.head_dim         = embed_dim // n_heads
-        self.embed_dim        = embed_dim
-        self.subbeats_per_bar = subbeats_per_bar
+        self.n_heads  = n_heads
+        self.head_dim = embed_dim // n_heads
+        self.embed_dim = embed_dim
 
         self.q_proj   = nn.Linear(d_model,      embed_dim)
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
@@ -90,18 +90,13 @@ class CPYinyangCrossAttention(nn.Module):
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Separate positional encodings for subbeat (Q) and bar (K) spaces
-        # so that Q[t] and K[b] have compatible scales without conflating indices.
-        def _make_pe(length, dim):
-            pe  = torch.zeros(length, dim)
-            pos = torch.arange(length).unsqueeze(1).float()
-            div = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
-            pe[:, 0::2] = torch.sin(pos * div)
-            pe[:, 1::2] = torch.cos(pos * div)
-            return pe.unsqueeze(0)   # (1, length, dim)
-
-        self.register_buffer('pe_sub', _make_pe(max_subbeats, embed_dim))  # subbeat positions
-        self.register_buffer('pe_bar', _make_pe(max_bars,     embed_dim))  # bar positions
+        # Single sinusoidal PE shared by Q and K (same beat index space)
+        pe  = torch.zeros(max_beats, embed_dim)
+        pos = torch.arange(max_beats).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))   # (1, max_beats, embed_dim)
 
         for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
             nn.init.xavier_uniform_(m.weight)
@@ -109,33 +104,31 @@ class CPYinyangCrossAttention(nn.Module):
 
     def forward(
         self,
-        ar_hidden:   torch.Tensor,          # (B, T_sub, d_model)
-        rule_hidden: torch.Tensor,          # (B, n_bars, rule_d_model)
-        sub_offset:  int = 0,               # first subbeat index (for incremental sampling)
+        ar_hidden:   torch.Tensor,   # (B, T_q, d_model)
+        rule_hidden: torch.Tensor,   # (B, T_k, rule_d_model)
+        sub_offset:  int = 0,        # absolute beat index of ar_hidden[:, 0, :]
     ) -> torch.Tensor:
-        B, T_sub, _ = ar_hidden.shape
-        _, n_bars, _ = rule_hidden.shape
+        B, T_q, _ = ar_hidden.shape
+        _, T_k, _ = rule_hidden.shape
 
-        Q = self.q_proj(ar_hidden) + self.pe_sub[:, sub_offset:sub_offset + T_sub, :]
-        K = self.k_proj(rule_hidden) + self.pe_bar[:, :n_bars, :]
+        Q = self.q_proj(ar_hidden)   + self.pe[:, sub_offset:sub_offset + T_q, :]
+        K = self.k_proj(rule_hidden) + self.pe[:, :T_k, :]
         V = self.v_proj(rule_hidden)
 
-        Q = Q.view(B, T_sub,  self.n_heads, self.head_dim).transpose(1, 2)
-        K = K.view(B, n_bars, self.n_heads, self.head_dim).transpose(1, 2)
-        V = V.view(B, n_bars, self.n_heads, self.head_dim).transpose(1, 2)
+        Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
+        K = K.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
+        V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, H, T_sub, n_bars)
+        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, H, T_q, T_k)
 
-        # Bar-aligned causal mask: subbeat t (absolute index sub_offset+i)
-        # may attend to bar b iff (sub_offset + i) // subbeats_per_bar >= b
-        abs_sub = torch.arange(sub_offset, sub_offset + T_sub, device=ar_hidden.device)
-        bar_of  = abs_sub // self.subbeats_per_bar                             # (T_sub,)
-        bar_rng = torch.arange(n_bars, device=ar_hidden.device)                # (n_bars,)
-        causal  = bar_of.unsqueeze(1) >= bar_rng.unsqueeze(0)                  # (T_sub, n_bars)
-        scores  = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float('-inf'))
+        # Plain causal mask: beat (sub_offset + i) may attend to beat j iff j <= sub_offset + i
+        abs_q = torch.arange(sub_offset, sub_offset + T_q, device=ar_hidden.device)
+        k_rng = torch.arange(T_k, device=ar_hidden.device)
+        causal = abs_q.unsqueeze(1) >= k_rng.unsqueeze(0)              # (T_q, T_k)
+        scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
-        out  = (attn @ V).transpose(1, 2).contiguous().view(B, T_sub, self.embed_dim)
+        out  = (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.embed_dim)
         return self.out_proj(out) * self.gate
 
 
@@ -191,24 +184,20 @@ class CPYinyangTransformer(nn.Module):
 
     Parameters
     ----------
-    base_model       : pretrained RoFormerSymbolicTransformer instance
-    rule_d_model     : hidden dim of the chord rule model
-    adapter_rank     : embed_dim for cross-attention projections
-    n_skip           : inject adapter every n_skip global transformer layers
-    subbeats_per_bar : beats per bar (imported from generate_synthetic_bass)
+    base_model   : pretrained RoFormerSymbolicTransformer instance
+    adapter_rank : embed_dim for cross-attention projections
+    n_skip       : inject adapter every n_skip global transformer layers
     """
 
     def __init__(
         self,
         base_model,
-        adapter_rank:     int = 256,
-        n_skip:           int = 4,
-        subbeats_per_bar: int = SUBBEATS_PER_BAR,
+        adapter_rank: int = 256,
+        n_skip:       int = 4,
     ):
         super().__init__()
-        self.base             = base_model
-        self.subbeats_per_bar = subbeats_per_bar
-        self.n_skip           = n_skip
+        self.base   = base_model
+        self.n_skip = n_skip
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -224,11 +213,10 @@ class CPYinyangTransformer(nn.Module):
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
-                d_model          = self.base.hidden_size,
-                rule_d_model     = TRACR_D_MODEL,
-                embed_dim        = adapter_rank,
-                n_heads          = 8,
-                subbeats_per_bar = subbeats_per_bar,
+                d_model      = self.base.hidden_size,
+                rule_d_model = TRACR_D_MODEL,
+                embed_dim    = adapter_rank,
+                n_heads      = 8,
             )
             for _ in range(n_adapters)
         ])
@@ -238,36 +226,34 @@ class CPYinyangTransformer(nn.Module):
     # ------------------------------------------------------------------
 
     def _rule_hidden(self, chord_tokens: torch.Tensor) -> torch.Tensor:
-        """Extract roots from chord tokens and run frozen TracR rule model."""
-        roots = chord_tokens // N_QUALITIES          # (B, n_bars) in 0-11
+        """Extract roots from beat-level chord tokens and run frozen TracR rule model."""
+        roots = chord_tokens // N_QUALITIES   # (B, n_beats) in 0-11
         roots = roots.clamp(0, 11)
-        _, h  = self.rule_model(roots, return_hidden=True)   # (B, n_bars, 16)
+        _, h  = self.rule_model(roots, return_hidden=True)   # (B, n_beats, 16)
         return h
 
     def forward(self, x: torch.Tensor, chord_tokens: torch.Tensor) -> torch.Tensor:
         """
         x            : (B, seq_len, subseq_len)  preprocessed CP tokens
-        chord_tokens : (B, n_bars)               bar-level chord token indices
+        chord_tokens : (B, seq_len)              beat-level chord token indices
         Returns logits of shape (B, seq_len, subseq_len, vocab_size) via local_decode.
         """
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        rule_hidden = self._rule_hidden(chord_tokens)   # (B, n_bars, 16)
+        rule_hidden = self._rule_hidden(chord_tokens)   # (B, seq_len, 16)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
         sos = base.global_sos.view(1, 1, -1).expand(batch_size, 1, -1)
-        h = torch.cat([sos, h[:, :-1]], dim=1)              # (B, seq_len, hidden)
+        h = torch.cat([sos, h[:, :-1]], dim=1)   # (B, seq_len, hidden)
 
         mask = base.buffered_future_mask(h)
-        bar_indices = torch.arange(seq_len, device=h.device) // self.subbeats_per_bar
 
         for i, layer in enumerate(base.model.layer):
             h = layer(h, attention_mask=mask)[0]
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
-                # sub_offset=0: absolute subbeat positions start at 0
                 h = h + self.yinyang_attn[adapter_idx](h, rule_hidden, sub_offset=0)
 
         return base.local_decode(h, emb)

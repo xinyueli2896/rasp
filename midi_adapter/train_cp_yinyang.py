@@ -45,16 +45,15 @@ MAX_STEPS    = 100_000
 class ChordFramedDataset(FramedDataset):
     """
     Yields (data_window, pitch_shift, chord_tokens) where chord_tokens is a
-    (B, n_bars) int64 tensor aligned to the sampled subbeat window.
+    (B, n_beats) int64 tensor at beat granularity, aligned to the sampled window.
     """
 
     def __init__(self, file_path, target_length, batch_size, **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
-        self.bar_chords_data = None
-        self.n_bars = target_length // SUBBEATS_PER_BAR
+        self.beat_chords_data = None
+        self.n_beats = target_length   # one chord token per beat
 
     def __iter__(self):
-        # Load main data (via parent lazy load)
         if self.data is None:
             self.data = torch.load(self.file_path, weights_only=True)
             self.pitch_shift_range = torch.load(
@@ -66,11 +65,11 @@ class ChordFramedDataset(FramedDataset):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
             print(f'Data for dataset {self.file_path} loaded.')
 
-        if self.bar_chords_data is None:
-            self.bar_chords_data = torch.load(
-                self.file_path[:-3] + '.bar_chords.pt', weights_only=False
+        if self.beat_chords_data is None:
+            self.beat_chords_data = torch.load(
+                self.file_path[:-3] + '.beat_chords.pt', weights_only=False
             )
-            print(f'Bar chords for {self.file_path} loaded.')
+            print(f'Beat chords for {self.file_path} loaded.')
 
         while True:
             if self.random_order:
@@ -79,9 +78,9 @@ class ChordFramedDataset(FramedDataset):
                 indices = torch.arange(len(self.valid_indices))
 
             for i in range(0, len(self.valid_indices), self.batch_size):
-                batch_indices     = indices[i:i + self.batch_size]
-                raw_ids           = self.valid_indices[batch_indices]
-                ps_range          = self.pitch_shift_range[raw_ids]
+                batch_indices = indices[i:i + self.batch_size]
+                raw_ids       = self.valid_indices[batch_indices]
+                ps_range      = self.pitch_shift_range[raw_ids]
 
                 starts = (
                     torch.floor(
@@ -100,19 +99,18 @@ class ChordFramedDataset(FramedDataset):
                     ).long() + ps_range[:, 0]
                 )
 
-                # Chord tokens: extract n_bars bars starting at the window's bar offset
-                starts_in_song = starts - self.start[raw_ids]   # subbeat offset within song
-                bar_starts     = (starts_in_song // SUBBEATS_PER_BAR).tolist()
-                chord_list = []
-                for song_idx, bar_start in zip(raw_ids.tolist(), bar_starts):
-                    ct = self.bar_chords_data[song_idx]          # int16 tensor (n_bars_song,)
-                    ct = ct[bar_start: bar_start + self.n_bars].long()
-                    # pad if window overruns (shouldn't happen if song is long enough)
-                    if ct.shape[0] < self.n_bars:
-                        pad = torch.full((self.n_bars - ct.shape[0],), 420, dtype=torch.long)
+                # Beat-level chord tokens: one per beat, aligned to window start
+                beat_starts = (starts - self.start[raw_ids]).tolist()
+                chord_list  = []
+                for song_idx, beat_start in zip(raw_ids.tolist(), beat_starts):
+                    ct = self.beat_chords_data[song_idx]   # int16 (n_beats_song,)
+                    ct = ct[beat_start: beat_start + self.n_beats].long()
+                    if ct.shape[0] < self.n_beats:
+                        pad = torch.full((self.n_beats - ct.shape[0],), NO_CHORD_TOKEN,
+                                         dtype=torch.long)
                         ct  = torch.cat([ct, pad])
                     chord_list.append(ct)
-                chord_tokens = torch.stack(chord_list, dim=0)    # (B, n_bars)
+                chord_tokens = torch.stack(chord_list, dim=0)   # (B, n_beats)
 
                 yield self.data[index_matrix], pitch_shift, chord_tokens
 
@@ -128,12 +126,9 @@ class UnseenAccuracyCallback(L.Callback):
     """
     At each val check, compute chord root accuracy on unseen-key data.
 
-    Accuracy = fraction of bar-start positions where the model's predicted
-    bass pitch (argmax of pitch-slot logits % 128) matches the expected
-    MIDI pitch (36 + chord_root).
-
-    Requires sample_step=SUBBEATS_PER_BAR in the dataloader so windows start at bar
-    boundaries and chord_tokens[b, k] aligns with subbeat k*16.
+    Accuracy = fraction of beat positions where the model's predicted bass
+    pitch (argmax of pitch-slot logits % 128) matches 36 + chord_root.
+    Checks all beats since the chord changes every beat (I-IV-V-I per bar).
     """
 
     def __init__(self, dataloader: DataLoader, n_batches: int = 25):
@@ -156,17 +151,14 @@ class UnseenAccuracyCallback(L.Callback):
                 x, pitch_shift, chord_tokens = [t.to(device) for t in batch]
                 B, seq_len, _ = x.shape
 
-                x_proc = base.preprocess(x, pitch_shift)          # (B, seq_len, 8)
-                logits  = model(x_proc, chord_tokens)              # (B*seq_len, 8, V)
-                logits  = logits.view(B, seq_len, 8, -1)          # (B, seq_len, 8, V)
+                x_proc = base.preprocess(x, pitch_shift)   # (B, seq_len, 8)
+                logits  = model(x_proc, chord_tokens)       # (B, seq_len, 8, V)
+                logits  = logits.view(B, seq_len, 8, -1)
 
-                # Slot 1 at bar-start subbeats (0, 16, 32, ...) predicts pitch encoding
-                pitch_logits = logits[:, ::SUBBEATS_PER_BAR, 1, :]  # (B, n_bars, V)
-                pred_enc     = pitch_logits.argmax(-1)             # (B, n_bars)
-                pred_pitch   = pred_enc % 128                      # decode MIDI pitch
-
-                expected_root  = chord_tokens // N_QUALITIES       # (B, n_bars)
-                expected_pitch = 36 + expected_root                # MIDI pitch C2=36..B2=47
+                # Slot 1 at every beat predicts the pitch encoding
+                pred_pitch    = logits[:, :, 1, :].argmax(-1) % 128  # (B, seq_len)
+                expected_root = chord_tokens // N_QUALITIES           # (B, seq_len)
+                expected_pitch = 36 + expected_root
 
                 valid   = chord_tokens != NO_CHORD_TOKEN
                 correct += (pred_pitch == expected_pitch)[valid].sum().item()
