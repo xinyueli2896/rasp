@@ -174,7 +174,7 @@ def get_args():
     p.add_argument('--ft_lr',        type=float, default=2e-5,
                    help='Peak LR for fine-tuning (default 2e-5, ~5× lower than pretrain)')
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
-    p.add_argument('--val_check_interval', type=int, default=1000)
+    p.add_argument('--val_check_interval', type=int, default=500)
     p.add_argument('--ckpt_dir',      type=str, default='ckpt')
     p.add_argument('--run_name',      type=str, default=None)
     p.add_argument('--wandb_project', type=str, default='cp_bass',
