@@ -229,6 +229,8 @@ def main(args):
     )
     if args.base_ckpt and os.path.exists(args.base_ckpt):
         state = torch.load(args.base_ckpt, map_location='cpu')
+        if 'state_dict' in state:   # Lightning .ckpt
+            state = state['state_dict']
         base.load_state_dict(state)
         print(f'Loaded base CP transformer from {args.base_ckpt}')
     else:
