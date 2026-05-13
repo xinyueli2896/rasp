@@ -249,6 +249,10 @@ class FramedDataset(IterableDataset):
         self.data = None
         self.pitch_shift_range = None
 
+    def __len__(self):
+        import math
+        return math.ceil(self.valid_song_count / self.batch_size)
+
     def __iter__(self):
         if self.data is None:
             self.data = torch.load(self.file_path, weights_only=True)

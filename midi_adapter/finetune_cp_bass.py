@@ -18,7 +18,8 @@ Usage
       --pretrain_ckpt ckpt/cp_bass_size1_batch8/last.ckpt \\
       --train_data    data/bass_finetune_cp4.pt \\
       --val_data      data/bass_pretrain_cp4.pt \\
-      --model_size 1 --batch_size 8
+      --model_size 1 --batch_size 8 \\
+      --val_check_interval 500    # default; change as needed
 
 Key differences vs pretrain_cp_bass.py
 ---------------------------------------
