@@ -285,63 +285,46 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seed_len, _ = x.shape
 
-        rule_hidden = self._rule_hidden(chord_tokens)  # (B, n_bars, 16)
+        rule_hidden = self._rule_hidden(chord_tokens)  # (B, n_beats, 16)
 
         # Encode seed subbeats
         h_seed, _ = base.local_encode(x)
         h_seed = h_seed.view(batch_size, seed_len, base.hidden_size)
         sos = base.global_sos.view(1, 1, -1).expand(batch_size, 1, -1)
-        h = torch.cat([sos, h_seed], dim=1)                # (B, seed_len+1, hidden)
+        h = torch.cat([sos, h_seed], dim=1)  # (B, seed_len+1, hidden)
 
         y = [x[:, i, :] for i in range(seed_len)]
-        past_key_values = None
-        h_next = h                                         # first step: full seed
 
         for i in range(seed_len, max_seq_len):
             if i % 10 == 0:
                 print(f'Sampling {i}/{max_seq_len}')
 
-            cur_len = h_next.shape[1]
-            attn_mask = base.buffered_future_mask(h) if past_key_values is None else None
+            # RoFormerEncoder does not accumulate KV cache in this transformers version;
+            # run full sequence with causal mask each step (O(n^2) but correct).
+            attn_mask = base.buffered_future_mask(h)
+            sinusoidal_pos = base.model.embed_positions(h.shape[:-1], 0)[None, None, :, :]
 
-            # --- global transformer (with KV cache) ---
-            # Run each layer manually so we can inject the adapter
-            # at the last position after the final layer.
-            # KV caching only works cleanly with single-point injection (after last layer).
-            h_out = h_next
-            new_kvs = []
+            h_out = h
             for j, layer in enumerate(base.model.layer):
-                past_kv_j = past_key_values[j] if past_key_values is not None else None
-                layer_out = layer(
-                    h_out,
-                    attention_mask=attn_mask,
-                    past_key_value=past_kv_j,
-                    use_cache=True,
-                )
-                h_out = layer_out[0]
-                new_kvs.append(layer_out[1])
+                h_out = layer(h_out, attention_mask=attn_mask, sinusoidal_pos=sinusoidal_pos)[0]
 
-                # Inject adapter after every n_skip layers, at last position only
+                # Inject adapter after every n_skip layers, modifying last position only
                 if (j + 1) % self.n_skip == 0:
                     adapter_idx = (j + 1) // self.n_skip - 1
-                    # Query is only the last position; sub_offset = i (current step)
                     correction = self.yinyang_attn[adapter_idx](
                         h_out[:, -1:, :], rule_hidden, sub_offset=i
                     )
                     h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 
-            past_key_values = new_kvs
-
-            # Sample next subbeat from last global hidden
+            # Sample next subbeat from last global hidden state
             y_next = base.local_sampling(
                 h_out[:, -1], temperature=temperature,
                 global_step=i, sampling_func=sampling_func,
             )
             y.append(y_next)
 
-            # Encode next subbeat for next step
-            h_next = base.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
-            if past_key_values is None:
-                h = torch.cat([h, h_next], dim=1)   # grow h for attention mask
+            # Encode next subbeat and append to h for next step
+            h_enc = base.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
+            h = torch.cat([h, h_enc], dim=1)
 
         return y

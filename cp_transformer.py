@@ -107,13 +107,13 @@ class RoFormerSymbolicTransformer(L.LightningModule):
     def local_sampling(self, h, max_subseq_len=32, temperature=1.0, global_step=None, sampling_func=None):
         batch_size, _ = h.shape
         y = torch.zeros((batch_size, 0), dtype=torch.long, device=h.device)
-        emb = h[:, None, :]
         eos_triggered = torch.zeros(batch_size, dtype=torch.bool, device=h.device)
-        past_key_values = None
-        local_emb = emb
+        # RoFormerEncoder does not accumulate KV cache; use full-sequence + causal mask each step
+        seq_emb = h[:, None, :]  # (B, 1, D)
         for i in range(max_subseq_len):
-            h, past_key_values = self.local_decoder(local_emb, past_key_values=past_key_values, use_cache=True, return_dict=False)
-            p = self.final_decoder(h[:, -1])
+            mask = self.buffered_future_mask(seq_emb)
+            h_out = self.local_decoder(seq_emb, attention_mask=mask, return_dict=False)[0]
+            p = self.final_decoder(h_out[:, -1])
             if sampling_func is not None:
                 p = sampling_func(global_step, i, p)
             if temperature == 0:
@@ -127,7 +127,7 @@ class RoFormerSymbolicTransformer(L.LightningModule):
             if torch.all(eos_triggered):
                 y = torch.cat([y, torch.full((batch_size, max_subseq_len - i - 1), self.tokenizer.pad_token, dtype=torch.long, device=h.device)], dim=1)
                 break
-            local_emb = self.local_embedding(y_next)
+            seq_emb = torch.cat([seq_emb, self.local_embedding(y_next)], dim=1)
         return y
 
     def global_sampling(self, x, max_seq_len=384, temperature=1.0, sampling_func=None):
@@ -137,16 +137,15 @@ class RoFormerSymbolicTransformer(L.LightningModule):
         sos = self.global_sos.view(1, 1, -1).repeat(batch_size, 1, 1)
         h = torch.cat([sos, h], dim=1)
         y = [x[:, i, :] for i in range(seq_len)]
-        past_key_values = None
-        h_next = h
         for i in range(seq_len, max_seq_len):
             if i % 10 == 0:
                 print('Sampling', i, '/', max_seq_len)
-            attention_mask = self.buffered_future_mask(h) if past_key_values is None else None
-            h_out, past_key_values = self.model(h_next, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=True, return_dict=False)
+            mask = self.buffered_future_mask(h)
+            h_out = self.model(h, attention_mask=mask, return_dict=False)[0]
             y_next = self.local_sampling(h_out[:, -1], temperature=temperature, global_step=i, sampling_func=sampling_func)
             y.append(y_next)
-            h_next = self.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
+            h_enc = self.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
+            h = torch.cat([h, h_enc], dim=1)
         return y
 
     def buffered_future_mask(self, tensor):
