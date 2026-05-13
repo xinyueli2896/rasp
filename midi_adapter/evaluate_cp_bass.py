@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
-from midi_adapter.infer_cp_bass import _sample, _prompt_from_key
+from midi_adapter.infer_cp_bass import _sample, _prompt_from_key, decode_output
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -231,6 +231,25 @@ def _print_error_dist(errors: list) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MIDI export
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_dir) -> None:
+    import os
+    os.makedirs(out_dir, exist_ok=True)
+    all_keys = sorted(set(PRETRAIN_KEYS + FINETUNE_NEW + UNSEEN))
+    for key in all_keys:
+        prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                                   base=base, n_prompt_beats=n_prompt_beats)
+        sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
+                          show_progress=False)
+        path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
+        decode_output(sampled, base.tokenizer, save_path=path)
+        print(f'  saved {path}')
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -297,6 +316,11 @@ def run_evaluation(args) -> None:
 
     _print_error_dist(all_errors)
 
+    if args.save_midi_dir:
+        print(f'\nSaving MIDI for all 12 keys → {args.save_midi_dir}')
+        _save_midi_all_keys(base, args.n_gen_beats, device, args.temperature,
+                            args.n_prompt_beats, args.save_midi_dir)
+
 
 def get_args():
     p = argparse.ArgumentParser(
@@ -311,6 +335,8 @@ def get_args():
                    help='Trials per key (useful with temperature > 0)')
     p.add_argument('--temperature', type=float, default=0,
                    help='0 = greedy (default), >0 = stochastic')
+    p.add_argument('--save_midi_dir',  type=str, default=None,
+                   help='If set, save one MIDI per key to this directory')
     p.add_argument('--n_prompt_beats', type=int, default=2,
                    help='Beats to use as prompt (default 2: x, x+5 — uniquely pins cycle phase)')
     p.add_argument('--verbose',     action='store_true',
