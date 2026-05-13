@@ -272,14 +272,26 @@ def main(args):
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    checkpoint_cb = L.callbacks.ModelCheckpoint(
-        monitor    = 'val_loss',
-        save_top_k = 3,
-        save_last  = True,
-        enable_version_counter = False,
-        dirpath    = os.path.join(args.ckpt_dir, run_name),
-        filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
-    )
+    if unseen_acc_cb is not None:
+        # Mirror IS protocol: save best checkpoint by unseen-key accuracy
+        checkpoint_cb = L.callbacks.ModelCheckpoint(
+            monitor    = 'unseen_acc',
+            mode       = 'max',
+            save_top_k = 3,
+            save_last  = True,
+            enable_version_counter = False,
+            dirpath    = os.path.join(args.ckpt_dir, run_name),
+            filename   = run_name + '.{epoch:02d}.{unseen_acc:.4f}',
+        )
+    else:
+        checkpoint_cb = L.callbacks.ModelCheckpoint(
+            monitor    = 'val_loss',
+            save_top_k = 3,
+            save_last  = True,
+            enable_version_counter = False,
+            dirpath    = os.path.join(args.ckpt_dir, run_name),
+            filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
+        )
 
     loggers = []
     if args.wandb_project:
@@ -321,8 +333,18 @@ def main(args):
     ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
     trainer.fit(lit, train_loader, val_loaders, ckpt_path=ckpt_path)
 
+    # Load best checkpoint and save adapter weights as plain .pt
+    best_ckpt = checkpoint_cb.best_model_path or checkpoint_cb.last_model_path
+    if best_ckpt and os.path.exists(best_ckpt):
+        best_state = torch.load(best_ckpt, map_location='cpu')['state_dict']
+        adapter_state = {k[len('model.'):]: v for k, v in best_state.items()
+                         if k.startswith('model.')}
+        print(f'Best checkpoint: {best_ckpt}')
+    else:
+        adapter_state = adapter.state_dict()
+
     out_pt = os.path.join(args.ckpt_dir, f'{run_name}.pt')
-    torch.save(adapter.state_dict(), out_pt)
+    torch.save(adapter_state, out_pt)
     print(f'Adapter saved → {out_pt}')
 
 
