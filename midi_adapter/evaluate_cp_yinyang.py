@@ -173,36 +173,41 @@ def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_d
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_model(base_ckpt: str, adapter_ckpt: str,
+def load_model(base_ckpt: str | None, adapter_ckpt: str,
                model_size: int, adapter_rank: int, n_skip: int,
                device: torch.device) -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
-    base   = RoFormerSymbolicTransformer(
-        size=model_size, max_lr=max_lr, with_velocity=False,
-    )
-
-    if base_ckpt and os.path.exists(base_ckpt):
-        state = torch.load(base_ckpt, map_location='cpu')
-        if 'state_dict' in state:
-            state = state['state_dict']
-        base.load_state_dict(state)
-        print(f'  Base model   : {base_ckpt}')
-    else:
-        print(f'  WARNING: base ckpt not found ({base_ckpt}) — random weights')
-
+    base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
     model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip)
 
-    if adapter_ckpt and os.path.exists(adapter_ckpt):
-        state = torch.load(adapter_ckpt, map_location='cpu')
-        if 'state_dict' in state:
-            state = {k[len('model.'):]: v for k, v in state['state_dict'].items()
-                     if k.startswith('model.')}
-        missing, unexpected = model.load_state_dict(state, strict=False)
+    if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
+        print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
+        return model.to(device).eval()
+
+    raw = torch.load(adapter_ckpt, map_location='cpu')
+
+    if 'state_dict' in raw:
+        # Lightning .ckpt — contains full model (base + adapter)
+        full_state = {k[len('model.'):]: v for k, v in raw['state_dict'].items()
+                      if k.startswith('model.')}
+        missing, _ = model.load_state_dict(full_state, strict=False)
+        if missing:
+            print(f'  WARNING missing keys: {missing[:3]}')
+        print(f'  Loaded (Lightning ckpt, base+adapter): {adapter_ckpt}')
+    else:
+        # Lightweight .pt — adapter weights only; need base ckpt separately
+        if base_ckpt and os.path.exists(base_ckpt):
+            bstate = torch.load(base_ckpt, map_location='cpu')
+            if 'state_dict' in bstate:
+                bstate = bstate['state_dict']
+            base.load_state_dict(bstate)
+            print(f'  Base model   : {base_ckpt}')
+        else:
+            print(f'  WARNING: adapter is adapter-only .pt but no base_ckpt — random base weights')
+        missing, _ = model.load_state_dict(raw, strict=False)
         if missing:
             print(f'  WARNING missing keys: {missing[:3]}')
         print(f'  Adapter      : {adapter_ckpt}')
-    else:
-        print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random adapter weights')
 
     return model.to(device).eval()
 
@@ -216,8 +221,9 @@ def run_evaluation(args) -> None:
     print('=' * 60)
     print('CPYinyangTransformer — Rule-Following Evaluation')
     print('=' * 60)
-    print(f'  base_ckpt     : {args.base_ckpt}')
     print(f'  adapter_ckpt  : {args.adapter_ckpt}')
+    if args.base_ckpt:
+        print(f'  base_ckpt     : {args.base_ckpt}  (used only for adapter-only .pt)')
     print(f'  n_gen_beats   : {args.n_gen_beats}  ({args.n_gen_beats // SUBBEATS_PER_BAR} bars)')
     print(f'  n_prompt_beats: {args.n_prompt_beats}')
     print(f'  n_trials      : {args.n_trials}')
@@ -228,7 +234,7 @@ def run_evaluation(args) -> None:
     print(f'  Finetune-new  : {FINETUNE_NEW}')
     print(f'  Unseen        : {UNSEEN}')
 
-    model = load_model(args.base_ckpt, args.adapter_ckpt,
+    model = load_model(getattr(args, 'base_ckpt', None), args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip, device)
 
     rows       = []
@@ -269,8 +275,8 @@ def get_args():
     p = argparse.ArgumentParser(
         description='Evaluate CPYinyangTransformer rule-following accuracy'
     )
-    p.add_argument('--base_ckpt',     required=True,
-                   help='Base CP transformer .pt or .ckpt')
+    p.add_argument('--base_ckpt',     default=None,
+                   help='Base CP transformer ckpt (only needed when adapter_ckpt is an adapter-only .pt)')
     p.add_argument('--adapter_ckpt',  required=True,
                    help='Adapter .pt saved by train_cp_yinyang.py')
     p.add_argument('--model_size',    type=int, default=1, choices=[0, 1, 2, 3])
