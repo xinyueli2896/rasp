@@ -55,6 +55,34 @@ class ChordFramedDataset(FramedDataset):
         self.n_beats              = target_length   # one chord token per beat
         self.disable_pitch_shift  = disable_pitch_shift
 
+    def preload(self, shared_data_cache: dict | None = None):
+        """Load data, pitch_shift_range, and beat_chords into memory now.
+        Pass a shared_cache dict to reuse tensors across datasets backed by the same file.
+        This avoids duplicate copies when train and val use the same .pt file.
+        """
+        cache = shared_data_cache if shared_data_cache is not None else {}
+        path  = self.file_path
+
+        if path not in cache:
+            cache[path] = torch.load(path, weights_only=True)
+            print(f'Pre-loaded {path}')
+        self.data = cache[path]
+
+        # pitch_shift_range is small; keep per-instance so split-specific zeroing is safe
+        psr_path = path[:-3] + '.pitch_shift_range.pt'
+        psr = torch.load(psr_path, weights_only=True).reshape(-1, 2)
+        psr[psr[:, 0] < -5, 0] = -5
+        psr[psr[:, 1] > 6, 1] = 6
+        if self.split in ('val', 'test'):
+            psr = torch.zeros_like(psr)
+        self.pitch_shift_range = psr
+
+        chords_key = path[:-3] + '.beat_chords.pt'
+        if chords_key not in cache:
+            cache[chords_key] = torch.load(chords_key, weights_only=False)
+            print(f'Pre-loaded chords {chords_key}')
+        self.beat_chords_data = cache[chords_key]
+
     def __iter__(self):
         if self.data is None:
             self.data = torch.load(self.file_path, weights_only=True)
@@ -148,6 +176,9 @@ class UnseenAccuracyCallback(L.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
             return
+        # AR generation is expensive; only run on rank 0 to avoid DDP OOM / sync issues
+        if trainer.global_rank != 0:
+            return
         model       = pl_module.model
         device      = pl_module.device
         total_beats = self.n_prompt_beats + self.n_gen_beats
@@ -155,6 +186,7 @@ class UnseenAccuracyCallback(L.Callback):
         correct = 0
         total   = 0
 
+        torch.cuda.empty_cache()
         model.eval()
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.dataloader):
@@ -282,28 +314,32 @@ def main(args):
 
     lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps)
 
-    train_loader = DataLoader(
-        ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.train_split, sample_step=SUBBEATS_PER_BAR,
-                           disable_pitch_shift=True),
-        batch_size=None, num_workers=1, persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.val_split, sample_step=SUBBEATS_PER_BAR,
-                           repeat=True, disable_pitch_shift=True),
-        batch_size=None, num_workers=0,
-    )
+    # Shared cache so datasets pointing to the same file reuse one tensor copy
+    _cache: dict = {}
+
+    train_ds = ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+                                  split=args.train_split, sample_step=SUBBEATS_PER_BAR,
+                                  disable_pitch_shift=True)
+    train_ds.preload(_cache)
+
+    val_ds = ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+                                split=args.val_split, sample_step=SUBBEATS_PER_BAR,
+                                repeat=True, disable_pitch_shift=True)
+    val_ds.preload(_cache)
+
+    # num_workers=0: all data loading stays in the main process so _cache sharing works.
+    # A worker subprocess would copy-on-write the tensor and defeat the sharing.
+    train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=None, num_workers=0)
 
     val_loaders   = [val_loader]
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
-        unseen_loader = DataLoader(
-            ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
-                               split='val', sample_step=SUBBEATS_PER_BAR,
-                               repeat=True, disable_pitch_shift=True),
-            batch_size=None, num_workers=0,
-        )
+        unseen_ds = ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
+                                       split='val', sample_step=SUBBEATS_PER_BAR,
+                                       repeat=True, disable_pitch_shift=True)
+        unseen_ds.preload(_cache)
+        unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)
         unseen_acc_cb = UnseenAccuracyCallback(unseen_loader, n_batches=5,
                                                 n_prompt_beats=4, n_gen_beats=16)

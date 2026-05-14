@@ -328,8 +328,6 @@ class CPYinyangTransformer(nn.Module):
         y = [x[:, i, :] for i in range(seed_len)]
 
         for i in range(seed_len, max_seq_len):
-            if i % 10 == 0:
-                print(f'Sampling {i}/{max_seq_len}')
 
             # RoFormerEncoder does not accumulate KV cache in this transformers version;
             # run full sequence with causal mask each step (O(n^2) but correct).
