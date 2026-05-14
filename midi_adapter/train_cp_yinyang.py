@@ -129,23 +129,28 @@ class ChordFramedDataset(FramedDataset):
 
 class UnseenAccuracyCallback(L.Callback):
     """
-    At each val check, compute chord root accuracy on unseen-key data.
+    At each val check, compute chord root accuracy on unseen-key data using
+    AUTOREGRESSIVE generation so the metric reflects actual generation quality
+    rather than teacher-forced next-token prediction.
 
-    Accuracy = fraction of beat positions where the model's predicted bass
-    pitch (argmax of pitch-slot logits % 128) matches 36 + chord_root.
-    Checks all beats since the chord changes every beat (I-IV-V-I per bar).
+    For each batch: preprocess the first n_prompt_beats as a prompt, generate
+    the next n_gen_beats autoregressively (greedy), then check whether the
+    pitch class of each generated beat matches the chord root.
     """
 
-    def __init__(self, dataloader: DataLoader, n_batches: int = 25):
-        self.dataloader = dataloader
-        self.n_batches  = n_batches
+    def __init__(self, dataloader: DataLoader, n_batches: int = 5,
+                 n_prompt_beats: int = 4, n_gen_beats: int = 16):
+        self.dataloader     = dataloader
+        self.n_batches      = n_batches
+        self.n_prompt_beats = n_prompt_beats
+        self.n_gen_beats    = n_gen_beats
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
             return
-        model  = pl_module.model
-        device = pl_module.device
-        base   = model.base
+        model       = pl_module.model
+        device      = pl_module.device
+        total_beats = self.n_prompt_beats + self.n_gen_beats
 
         correct = 0
         total   = 0
@@ -156,21 +161,29 @@ class UnseenAccuracyCallback(L.Callback):
                 if batch_idx >= self.n_batches:
                     break
                 x, pitch_shift, chord_tokens = [t.to(device) for t in batch]
-                B, seq_len, _ = x.shape
 
-                x_proc = base.preprocess(x, pitch_shift)   # (B, seq_len, 8)
-                logits  = model(x_proc, chord_tokens)       # (B, seq_len, 8, V)
-                logits  = logits.view(B, seq_len, 8, -1)
+                # Preprocess prompt (pitch_shift=0 so preprocess is a no-op on values)
+                prompt    = model.base.preprocess(
+                    x[:, :self.n_prompt_beats, :], pitch_shift
+                )                                              # (B, n_prompt_beats, 8)
+                chord_tok = chord_tokens[:, :total_beats]      # (B, total_beats)
 
-                # Slot 1 predicts pitch+dur; extract pitch class (% 12) to
-                # match autoregressive eval and be octave-agnostic
-                # (pitch-shifted training moves V beat into octave 3 for some keys)
-                pred_pc       = (logits[:, :, 1, :].argmax(-1) % 128) % 12  # (B, seq_len)
-                expected_pc   = chord_tokens // N_QUALITIES                   # (B, seq_len)
+                # Autoregressive generation — greedy (temperature=0)
+                sampled = model.global_sampling_chord(
+                    prompt, chord_tok,
+                    max_seq_len=total_beats, temperature=0,
+                )
 
-                valid   = chord_tokens != NO_CHORD_TOKEN
-                correct += (pred_pc == expected_pc)[valid].sum().item()
-                total   += valid.sum().item()
+                # sampled[t] is (B, subseq_len) preprocessed token for beat t.
+                # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
+                for t in range(self.n_prompt_beats, total_beats):
+                    y_t         = sampled[t]                   # (B, 8)
+                    pred_pc     = (y_t[:, 1] % 128) % 12      # (B,)
+                    ct          = chord_tok[:, t]              # (B,)
+                    valid       = ct != NO_CHORD_TOKEN
+                    expected_pc = ct // N_QUALITIES            # (B,)
+                    correct    += (pred_pc == expected_pc)[valid].sum().item()
+                    total      += valid.sum().item()
 
         acc = correct / max(total, 1)
         pl_module.log('unseen_acc', acc, prog_bar=True)
@@ -292,7 +305,8 @@ def main(args):
             batch_size=None, num_workers=0,
         )
         val_loaders.append(unseen_loader)
-        unseen_acc_cb = UnseenAccuracyCallback(unseen_loader, n_batches=25)
+        unseen_acc_cb = UnseenAccuracyCallback(unseen_loader, n_batches=5,
+                                                n_prompt_beats=4, n_gen_beats=16)
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
