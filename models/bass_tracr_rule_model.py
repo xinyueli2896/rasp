@@ -12,7 +12,7 @@ Output: logits              (B, n_bars, 12)
         hidden              (B, n_bars, TRACR_D_MODEL=16)   if return_hidden=True
 
 Hidden state format (mirrors integer-sequence TracR):
-  dims  0-11 : one-hot of predicted next chord root
+  dims  0-11 : one-hot of CURRENT chord root (the note to generate at this beat)
   dims 12-15 : one-hot of bar % 4
 
 No trainable parameters.
@@ -85,18 +85,17 @@ class BassTracrRuleModel(nn.Module):
         B, T   = roots.shape
         device = roots.device
 
-        t_idx  = torch.arange(T, device=device)
-        o      = self._offsets[(t_idx + 1) % N_POS]
-        key    = roots[:, 0]                                  # starter = first bar root
-        next_r = (key[:, None] + o[None, :]) % N_ROOTS       # (B, T)
+        t_idx   = torch.arange(T, device=device)
+        o       = self._offsets[t_idx % N_POS]
+        key     = roots[:, 0]                                  # starter = first bar root
+        curr_r  = (key[:, None] + o[None, :]) % N_ROOTS       # (B, T) current beat root
 
-        logits = F.one_hot(next_r, num_classes=N_ROOTS).float()
-        logits = logits.detach().requires_grad_(True)
+        logits = F.one_hot(curr_r, num_classes=N_ROOTS).float()
 
         if return_hidden:
-            tok_next = self.W_E[next_r]                       # (B, T, 16) root dims
-            pos_emb  = self.W_pos[t_idx % N_POS]             # (T, 16) pos dims
-            h_out    = tok_next + pos_emb.unsqueeze(0)        # (B, T, 16)
+            tok_curr = self.W_E[curr_r]                        # (B, T, 16) root dims
+            pos_emb  = self.W_pos[t_idx % N_POS]              # (T, 16) pos dims
+            h_out    = tok_curr + pos_emb.unsqueeze(0)         # (B, T, 16)
             return logits, h_out
 
         return logits
@@ -121,6 +120,6 @@ if __name__ == '__main__':
     preds = logits.argmax(-1).squeeze().tolist()
     print(f'roots  : {roots.squeeze().tolist()}')
     print(f'preds  : {preds}')
-    print(f'expect : [5, 7, 0, 0, 5, 7, 0, 0]')
+    print(f'expect : [0, 5, 7, 0, 0, 5, 7, 0]  (current root, not next)')
     print(f'hidden shape: {hidden.shape}')
-    print(f'All correct: {preds == [5, 7, 0, 0, 5, 7, 0, 0]}')
+    print(f'All correct: {preds == [0, 5, 7, 0, 0, 5, 7, 0]}')

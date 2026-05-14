@@ -87,7 +87,7 @@ class CPYinyangCrossAttention(nn.Module):
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
-        self.gate      = nn.Parameter(torch.ones(1))
+        self.gate      = nn.Parameter(torch.full((1,), 0.1))
         self.attn_drop = nn.Dropout(dropout)
 
         # Single sinusoidal PE shared by Q and K (same beat index space)
