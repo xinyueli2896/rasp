@@ -141,6 +141,8 @@ class UnseenAccuracyCallback(L.Callback):
         self.n_batches  = n_batches
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
         model  = pl_module.model
         device = pl_module.device
         base   = model.base
