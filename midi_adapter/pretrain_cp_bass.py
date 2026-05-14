@@ -58,16 +58,32 @@ def main(args):
         return [optimizer], [scheduler]
     net.configure_optimizers = _configure_optimizers
 
-    train_loader = DataLoader(
-        FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                      split=args.train_split),
-        batch_size=None, num_workers=1, persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                      split=args.val_split, sample_step=16, repeat=True),
-        batch_size=None, num_workers=0,
-    )
+    def _preload(ds, cache: dict) -> None:
+        """Pre-load data into ds so the worker process never makes a second copy."""
+        path = ds.file_path
+        if path not in cache:
+            cache[path] = torch.load(path, weights_only=True)
+            print(f'Pre-loaded {path}')
+        ds.data = cache[path]
+        psr = torch.load(path[:-3] + '.pitch_shift_range.pt', weights_only=True).reshape(-1, 2)
+        psr[psr[:, 0] < -5, 0] = -5
+        psr[psr[:, 1] > 6, 1] = 6
+        if ds.split in ('val', 'test'):
+            psr = torch.zeros_like(psr)
+        ds.pitch_shift_range = psr
+
+    _cache: dict = {}
+    train_ds = FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+                             split=args.train_split)
+    _preload(train_ds, _cache)
+
+    val_ds = FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+                           split=args.val_split, sample_step=16, repeat=True)
+    _preload(val_ds, _cache)
+
+    # num_workers=0: keeps both datasets in the main process so _cache sharing works.
+    train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=None, num_workers=0)
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
     checkpoint_cb = L.callbacks.ModelCheckpoint(
