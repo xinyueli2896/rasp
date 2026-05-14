@@ -78,8 +78,9 @@ DURATION_TEMPLATES = np.array([
 ])
 DURATION_BOUNDARIES = (DURATION_TEMPLATES[1:] + DURATION_TEMPLATES[:-1]) / 2.0
 
-# Bass range: E1 (MIDI 28) to B3 (MIDI 59)
-BASS_MIN, BASS_MAX = 28, 59
+# Bass range: one octave only (C2=36 … B2=47) so every pitch class maps to
+# exactly one MIDI note — no octave ambiguity during training or evaluation.
+BASS_MIN, BASS_MAX = 36, 47
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
