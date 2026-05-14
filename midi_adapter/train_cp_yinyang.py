@@ -237,9 +237,10 @@ class CPYinyangLightning(L.LightningModule):
 def main(args):
     n_gpus   = max(torch.cuda.device_count(), 1)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
+    lora_suffix = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
     run_name = (
         args.run_name
-        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}'
+        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}'
     )
 
     # Build base CP transformer and load pretrained weights
@@ -259,6 +260,7 @@ def main(args):
         base_model   = base,
         adapter_rank = args.adapter_rank,
         n_skip       = args.n_skip,
+        lora_rank    = args.lora_rank,
     )
 
     n_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
@@ -386,6 +388,8 @@ def get_args():
     p.add_argument('--val_check_interval', type=int, default=500)
     p.add_argument('--adapter_rank',       type=int, default=256)
     p.add_argument('--n_skip',             type=int, default=4)
+    p.add_argument('--lora_rank',          type=int, default=0,
+                   help='LoRA rank for base model Q/V projections (0 = frozen base)')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)

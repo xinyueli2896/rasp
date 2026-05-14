@@ -55,6 +55,29 @@ from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
 
 
 # ---------------------------------------------------------------------------
+# LoRA wrapper for nn.Linear
+# ---------------------------------------------------------------------------
+
+class LoRALinear(nn.Module):
+    """Drop-in replacement for a frozen nn.Linear with a low-rank update.
+
+    output = W_frozen @ x  +  (B @ A @ x) * scale
+    Only A and B are trainable. scale = lora_alpha / rank.
+    """
+
+    def __init__(self, linear: nn.Linear, rank: int, alpha: float | None = None):
+        super().__init__()
+        d_out, d_in = linear.weight.shape
+        self.linear = linear                          # kept frozen by caller
+        self.lora_A = nn.Parameter(torch.randn(rank, d_in) * 0.02)
+        self.lora_B = nn.Parameter(torch.zeros(d_out, rank))
+        self.scale  = (alpha if alpha is not None else float(rank)) / rank
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x) + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+
+
+# ---------------------------------------------------------------------------
 # Cross-attention with bar-aligned causal mask
 # ---------------------------------------------------------------------------
 
@@ -194,14 +217,23 @@ class CPYinyangTransformer(nn.Module):
         base_model,
         adapter_rank: int = 256,
         n_skip:       int = 4,
+        lora_rank:    int = 0,
     ):
         super().__init__()
-        self.base   = base_model
-        self.n_skip = n_skip
+        self.base      = base_model
+        self.n_skip    = n_skip
+        self.lora_rank = lora_rank
 
         # Freeze everything in the base model
         for p in self.base.parameters():
             p.requires_grad_(False)
+
+        # Optionally inject LoRA into every attention layer of the base model
+        if lora_rank > 0:
+            for layer in self.base.model.layer:
+                sa = layer.attention.self
+                sa.query = LoRALinear(sa.query, lora_rank)
+                sa.value = LoRALinear(sa.value, lora_rank)
 
         n_layers = len(self.base.model.layer)
         assert n_layers % n_skip == 0, \
