@@ -155,13 +155,14 @@ class UnseenAccuracyCallback(L.Callback):
                 logits  = model(x_proc, chord_tokens)       # (B, seq_len, 8, V)
                 logits  = logits.view(B, seq_len, 8, -1)
 
-                # Slot 1 at every beat predicts the pitch encoding
-                pred_pitch    = logits[:, :, 1, :].argmax(-1) % 128  # (B, seq_len)
-                expected_root = chord_tokens // N_QUALITIES           # (B, seq_len)
-                expected_pitch = 36 + expected_root
+                # Slot 1 predicts pitch+dur; extract pitch class (% 12) to
+                # match autoregressive eval and be octave-agnostic
+                # (pitch-shifted training moves V beat into octave 3 for some keys)
+                pred_pc       = (logits[:, :, 1, :].argmax(-1) % 128) % 12  # (B, seq_len)
+                expected_pc   = chord_tokens // N_QUALITIES                   # (B, seq_len)
 
                 valid   = chord_tokens != NO_CHORD_TOKEN
-                correct += (pred_pitch == expected_pitch)[valid].sum().item()
+                correct += (pred_pc == expected_pc)[valid].sum().item()
                 total   += valid.sum().item()
 
         acc = correct / max(total, 1)
