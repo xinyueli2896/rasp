@@ -329,8 +329,9 @@ def get_args():
     p.add_argument('--base_ckpt',   required=True,
                    help='.pt or .ckpt checkpoint path')
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
-    p.add_argument('--n_gen_beats', type=int, default=32,
-                   help='Beats to generate per trial (default 32 = 8 bars)')
+    p.add_argument('--n_gen_beats', type=int, default=16,
+                   help='Beats to generate per trial (default 16 = 4 bars; '
+                        'keep n_prompt_beats + n_gen_beats <= TRAIN_LENGTH=24)')
     p.add_argument('--n_trials',    type=int, default=1,
                    help='Trials per key (useful with temperature > 0)')
     p.add_argument('--temperature', type=float, default=0,
