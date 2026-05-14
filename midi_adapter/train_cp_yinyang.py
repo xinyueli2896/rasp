@@ -220,7 +220,7 @@ def main(args):
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
     run_name = (
         args.run_name
-        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}'
+        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}'
     )
 
     # Build base CP transformer and load pretrained weights
