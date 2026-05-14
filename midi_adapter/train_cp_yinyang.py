@@ -202,6 +202,11 @@ class CPYinyangLightning(L.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, pitch_shift, chord_tokens = batch
+        roots   = chord_tokens // N_QUALITIES
+        quals   = chord_tokens % N_QUALITIES
+        valid   = chord_tokens != NO_CHORD_TOKEN
+        shifted = ((roots + pitch_shift[:, None]) % 12) * N_QUALITIES + quals
+        chord_tokens = torch.where(valid, shifted, chord_tokens)
         loss = self.model.loss(x, pitch_shift, chord_tokens)
         key  = 'val_loss' if dataloader_idx == 0 else 'unseen_loss'
         self.log(key, loss, on_step=False, on_epoch=True,
@@ -257,7 +262,7 @@ def main(args):
 
     train_loader = DataLoader(
         ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.train_split),
+                           split=args.train_split, sample_step=SUBBEATS_PER_BAR),
         batch_size=None, num_workers=1, persistent_workers=True,
     )
     val_loader = DataLoader(
