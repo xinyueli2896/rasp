@@ -185,6 +185,12 @@ class CPYinyangLightning(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, pitch_shift, chord_tokens = batch
+        # Shift chord roots to match pitch-shifted notes so adapter sees consistent signal
+        roots   = chord_tokens // N_QUALITIES
+        quals   = chord_tokens % N_QUALITIES
+        valid   = chord_tokens != NO_CHORD_TOKEN
+        shifted = ((roots + pitch_shift[:, None]) % 12) * N_QUALITIES + quals
+        chord_tokens = torch.where(valid, shifted, chord_tokens)
         loss = self.model.loss(x, pitch_shift, chord_tokens)
         self.log('train_loss', loss, on_step=True, on_epoch=False)
         scheduler = self.lr_schedulers()
@@ -264,7 +270,7 @@ def main(args):
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_loader = DataLoader(
             ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
-                               split='all', sample_step=SUBBEATS_PER_BAR, repeat=True),
+                               split='val', sample_step=SUBBEATS_PER_BAR, repeat=True),
             batch_size=None, num_workers=0,
         )
         val_loaders.append(unseen_loader)
