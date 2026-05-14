@@ -48,10 +48,12 @@ class ChordFramedDataset(FramedDataset):
     (B, n_beats) int64 tensor at beat granularity, aligned to the sampled window.
     """
 
-    def __init__(self, file_path, target_length, batch_size, **kwargs):
+    def __init__(self, file_path, target_length, batch_size,
+                 disable_pitch_shift: bool = False, **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
-        self.beat_chords_data = None
-        self.n_beats = target_length   # one chord token per beat
+        self.beat_chords_data     = None
+        self.n_beats              = target_length   # one chord token per beat
+        self.disable_pitch_shift  = disable_pitch_shift
 
     def __iter__(self):
         if self.data is None:
@@ -92,12 +94,15 @@ class ChordFramedDataset(FramedDataset):
                 index_matrix = (
                     torch.arange(self.target_length).view(1, -1) + starts.view(-1, 1)
                 )
-                pitch_shift = (
-                    torch.floor(
-                        torch.rand(len(raw_ids))
-                        * (ps_range[:, 1] - ps_range[:, 0] + 1)
-                    ).long() + ps_range[:, 0]
-                )
+                if self.disable_pitch_shift:
+                    pitch_shift = torch.zeros(len(raw_ids), dtype=torch.long)
+                else:
+                    pitch_shift = (
+                        torch.floor(
+                            torch.rand(len(raw_ids))
+                            * (ps_range[:, 1] - ps_range[:, 0] + 1)
+                        ).long() + ps_range[:, 0]
+                    )
 
                 # Beat-level chord tokens: one per beat, aligned to window start
                 beat_starts = (starts - self.start[raw_ids]).tolist()
@@ -262,12 +267,14 @@ def main(args):
 
     train_loader = DataLoader(
         ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.train_split, sample_step=SUBBEATS_PER_BAR),
+                           split=args.train_split, sample_step=SUBBEATS_PER_BAR,
+                           disable_pitch_shift=True),
         batch_size=None, num_workers=1, persistent_workers=True,
     )
     val_loader = DataLoader(
         ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
-                           split=args.val_split, sample_step=SUBBEATS_PER_BAR, repeat=True),
+                           split=args.val_split, sample_step=SUBBEATS_PER_BAR,
+                           repeat=True, disable_pitch_shift=True),
         batch_size=None, num_workers=0,
     )
 
@@ -276,7 +283,8 @@ def main(args):
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_loader = DataLoader(
             ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
-                               split='val', sample_step=SUBBEATS_PER_BAR, repeat=True),
+                               split='val', sample_step=SUBBEATS_PER_BAR,
+                               repeat=True, disable_pitch_shift=True),
             batch_size=None, num_workers=0,
         )
         val_loaders.append(unseen_loader)
