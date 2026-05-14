@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 
-TRAIN_LENGTH = 384
+TRAIN_LENGTH = 24
 MAX_STEPS    = 200_000
 
 

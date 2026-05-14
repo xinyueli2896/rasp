@@ -34,7 +34,7 @@ from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR
 
-TRAIN_LENGTH = 384
+TRAIN_LENGTH = 24
 MAX_STEPS    = 100_000
 
 
