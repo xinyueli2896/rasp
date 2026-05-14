@@ -90,6 +90,7 @@ def main(args):
         monitor    = 'val_loss',
         save_top_k = 5,
         save_last  = True,
+        save_weights_only = True,   # omit optimizer states: 1.1 GB → ~220 MB per ckpt
         enable_version_counter = False,
         dirpath    = os.path.join(args.ckpt_dir, run_name),
         filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
