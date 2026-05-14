@@ -38,14 +38,14 @@ from midi_adapter.infer_cp_bass import _sample, _prompt_from_key, decode_output
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 # Key partitions (mirror of EVAL_PRETRAIN_ONLY / EVAL_FINETUNE_ONLY / ... in evaluate.py)
-PRETRAIN_KEYS = [0, 2, 4, 5, 7, 9, 11]     # seen during CP pretraining
-FINETUNE_NEW  = [1, 3, 10]                  # added in fine-tune, not seen in pretrain
+PRETRAIN_KEYS = [0, 4, 7, 9, 11]                    # seen during CP pretraining
+FINETUNE_NEW  = [1, 2, 3, 5, 10]                    # added in fine-tune, not seen in pretrain
 ALL_SEEN      = [0, 1, 2, 3, 4, 5, 7, 9, 10, 11]
-UNSEEN        = [6, 8]                      # never seen
+UNSEEN        = [6, 8]                               # never seen
 
 CATEGORIES = [
-    ('Pretrain keys', PRETRAIN_KEYS, '{0,2,4,5,7,9,11}'),
-    ('Finetune-new',  FINETUNE_NEW,  '{1,3,10}'),
+    ('Pretrain keys', PRETRAIN_KEYS, '{0,4,7,9,11}'),
+    ('Finetune-new',  FINETUNE_NEW,  '{1,2,3,5,10}'),
     ('All seen',      ALL_SEEN,      '{0..5,7,9..11}'),
     ('Unseen',        UNSEEN,        '{6,8}'),
 ]
