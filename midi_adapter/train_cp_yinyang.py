@@ -1,9 +1,9 @@
 """
-Fine-tune CPYinyangTransformer on synthetic bass data with chord conditioning.
+Fine-tune CPYinyangTransformer on synthetic bass data with rule conditioning.
 
-The base CP transformer is frozen; only ChordRuleModel + yinyang_attn adapters
-are trained.  Chord tokens are loaded from the .bar_chords.pt file produced by
-generate_synthetic_bass.py.
+The base CP transformer is frozen; only yinyang_attn adapters are trained.
+The rule model is analytical (BassTracrRuleModel) and reads the starting pitch
+class directly from the generated sequence — no chord token files needed.
 
 Usage
 -----
@@ -31,8 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
-from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
-from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR
+from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
 
 TRAIN_LENGTH = 24
 MAX_STEPS    = 100_000
@@ -44,21 +43,18 @@ MAX_STEPS    = 100_000
 
 class ChordFramedDataset(FramedDataset):
     """
-    Yields (data_window, pitch_shift, chord_tokens) where chord_tokens is a
-    (B, n_beats) int64 tensor at beat granularity, aligned to the sampled window.
+    Thin extension of FramedDataset that adds shared-cache preloading and
+    an optional disable_pitch_shift flag.  Yields (data_window, pitch_shift).
     """
 
     def __init__(self, file_path, target_length, batch_size,
                  disable_pitch_shift: bool = False, **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
-        self.beat_chords_data     = None
-        self.n_beats              = target_length   # one chord token per beat
-        self.disable_pitch_shift  = disable_pitch_shift
+        self.disable_pitch_shift = disable_pitch_shift
 
     def preload(self, shared_data_cache: dict | None = None):
-        """Load data, pitch_shift_range, and beat_chords into memory now.
+        """Load data and pitch_shift_range into memory now.
         Pass a shared_cache dict to reuse tensors across datasets backed by the same file.
-        This avoids duplicate copies when train and val use the same .pt file.
         """
         cache = shared_data_cache if shared_data_cache is not None else {}
         path  = self.file_path
@@ -68,7 +64,6 @@ class ChordFramedDataset(FramedDataset):
             print(f'Pre-loaded {path}')
         self.data = cache[path]
 
-        # pitch_shift_range is small; keep per-instance so split-specific zeroing is safe
         psr_path = path[:-3] + '.pitch_shift_range.pt'
         psr = torch.load(psr_path, weights_only=True).reshape(-1, 2)
         psr[psr[:, 0] < -5, 0] = -5
@@ -76,12 +71,6 @@ class ChordFramedDataset(FramedDataset):
         if self.split in ('val', 'test'):
             psr = torch.zeros_like(psr)
         self.pitch_shift_range = psr
-
-        chords_key = path[:-3] + '.beat_chords.pt'
-        if chords_key not in cache:
-            cache[chords_key] = torch.load(chords_key, weights_only=False)
-            print(f'Pre-loaded chords {chords_key}')
-        self.beat_chords_data = cache[chords_key]
 
     def __iter__(self):
         if self.data is None:
@@ -94,12 +83,6 @@ class ChordFramedDataset(FramedDataset):
             if self.split in ('val', 'test'):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
             print(f'Data for dataset {self.file_path} loaded.')
-
-        if self.beat_chords_data is None:
-            self.beat_chords_data = torch.load(
-                self.file_path[:-3] + '.beat_chords.pt', weights_only=False
-            )
-            print(f'Beat chords for {self.file_path} loaded.')
 
         while True:
             if self.random_order:
@@ -132,20 +115,7 @@ class ChordFramedDataset(FramedDataset):
                         ).long() + ps_range[:, 0]
                     )
 
-                # Beat-level chord tokens: one per beat, aligned to window start
-                beat_starts = (starts - self.start[raw_ids]).tolist()
-                chord_list  = []
-                for song_idx, beat_start in zip(raw_ids.tolist(), beat_starts):
-                    ct = self.beat_chords_data[song_idx]   # int16 (n_beats_song,)
-                    ct = ct[beat_start: beat_start + self.n_beats].long()
-                    if ct.shape[0] < self.n_beats:
-                        pad = torch.full((self.n_beats - ct.shape[0],), NO_CHORD_TOKEN,
-                                         dtype=torch.long)
-                        ct  = torch.cat([ct, pad])
-                    chord_list.append(ct)
-                chord_tokens = torch.stack(chord_list, dim=0)   # (B, n_beats)
-
-                yield self.data[index_matrix], pitch_shift, chord_tokens
+                yield self.data[index_matrix], pitch_shift
 
             if not self.repeat:
                 break
@@ -192,30 +162,28 @@ class UnseenAccuracyCallback(L.Callback):
             for batch_idx, batch in enumerate(self.dataloader):
                 if batch_idx >= self.n_batches:
                     break
-                x, pitch_shift, chord_tokens = [t.to(device) for t in batch]
+                x, pitch_shift = [t.to(device) for t in batch]
 
-                # Preprocess prompt (pitch_shift=0 so preprocess is a no-op on values)
-                prompt    = model.base.preprocess(
+                prompt = model.base.preprocess(
                     x[:, :self.n_prompt_beats, :], pitch_shift
-                )                                              # (B, n_prompt_beats, 8)
-                chord_tok = chord_tokens[:, :total_beats]      # (B, total_beats)
+                )                                              # (B, n_prompt_beats, subseq)
 
                 # Autoregressive generation — greedy (temperature=0)
-                sampled = model.global_sampling_chord(
-                    prompt, chord_tok,
-                    max_seq_len=total_beats, temperature=0,
+                sampled = model.global_sampling(
+                    prompt, max_seq_len=total_beats, temperature=0,
                 )
+
+                # Extract key from prompt's first beat: slot 1 % 128 % 12
+                key = (prompt[:, 0, 1] % 128 % 12)            # (B,)
 
                 # sampled[t] is (B, subseq_len) preprocessed token for beat t.
                 # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
                 for t in range(self.n_prompt_beats, total_beats):
-                    y_t         = sampled[t]                   # (B, 8)
+                    y_t         = sampled[t]                   # (B, subseq)
                     pred_pc     = (y_t[:, 1] % 128) % 12      # (B,)
-                    ct          = chord_tok[:, t]              # (B,)
-                    valid       = ct != NO_CHORD_TOKEN
-                    expected_pc = ct // N_QUALITIES            # (B,)
-                    correct    += (pred_pc == expected_pc)[valid].sum().item()
-                    total      += valid.sum().item()
+                    expected_pc = (key + OFFSETS[t % 4]) % 12 # (B,)
+                    correct    += (pred_pc == expected_pc).sum().item()
+                    total      += len(pred_pc)
 
         acc = correct / max(total, 1)
         pl_module.log('unseen_acc', acc, prog_bar=True)
@@ -233,18 +201,12 @@ class CPYinyangLightning(L.LightningModule):
         self.max_lr   = max_lr
         self.max_steps = max_steps
 
-    def forward(self, x, chord_tokens):
-        return self.model(x, chord_tokens)
+    def forward(self, x):
+        return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        x, pitch_shift, chord_tokens = batch
-        # Shift chord roots to match pitch-shifted notes so adapter sees consistent signal
-        roots   = chord_tokens // N_QUALITIES
-        quals   = chord_tokens % N_QUALITIES
-        valid   = chord_tokens != NO_CHORD_TOKEN
-        shifted = ((roots + pitch_shift[:, None]) % 12) * N_QUALITIES + quals
-        chord_tokens = torch.where(valid, shifted, chord_tokens)
-        loss = self.model.loss(x, pitch_shift, chord_tokens)
+        x, pitch_shift = batch
+        loss = self.model.loss(x, pitch_shift)
         self.log('train_loss', loss, on_step=True, on_epoch=False)
         scheduler = self.lr_schedulers()
         if scheduler is not None:
@@ -253,13 +215,8 @@ class CPYinyangLightning(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        x, pitch_shift, chord_tokens = batch
-        roots   = chord_tokens // N_QUALITIES
-        quals   = chord_tokens % N_QUALITIES
-        valid   = chord_tokens != NO_CHORD_TOKEN
-        shifted = ((roots + pitch_shift[:, None]) % 12) * N_QUALITIES + quals
-        chord_tokens = torch.where(valid, shifted, chord_tokens)
-        loss = self.model.loss(x, pitch_shift, chord_tokens)
+        x, pitch_shift = batch
+        loss = self.model.loss(x, pitch_shift)
         key  = 'val_loss' if dataloader_idx == 0 else 'unseen_loss'
         self.log(key, loss, on_step=False, on_epoch=True,
                  sync_dist=True, add_dataloader_idx=False)
@@ -318,13 +275,12 @@ def main(args):
     _cache: dict = {}
 
     train_ds = ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                                  split=args.train_split, sample_step=SUBBEATS_PER_BAR,
-                                  disable_pitch_shift=True)
+                                  split=args.train_split, sample_step=SUBBEATS_PER_BAR)
     train_ds.preload(_cache)
 
     val_ds = ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
                                 split=args.val_split, sample_step=SUBBEATS_PER_BAR,
-                                repeat=True, disable_pitch_shift=True)
+                                repeat=True)
     val_ds.preload(_cache)
 
     # num_workers=0: all data loading stays in the main process so _cache sharing works.
@@ -337,7 +293,7 @@ def main(args):
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_ds = ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
                                        split='val', sample_step=SUBBEATS_PER_BAR,
-                                       repeat=True, disable_pitch_shift=True)
+                                       repeat=True)
         unseen_ds.preload(_cache)
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)

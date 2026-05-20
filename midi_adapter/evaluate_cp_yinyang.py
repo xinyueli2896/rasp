@@ -1,8 +1,8 @@
 """
 Evaluate rule-following accuracy of the CPYinyangTransformer (base + adapter).
 
-Mirrors evaluate_cp_bass.py but uses chord-conditioned autoregressive
-generation via global_sampling_chord.
+Mirrors evaluate_cp_bass.py but uses rule-conditioned autoregressive
+generation via global_sampling (no chord tokens required).
 
 Usage
 -----
@@ -29,7 +29,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
-from midi_adapter.chord_tokenizer import chord_str_to_token
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
 from midi_adapter.infer_cp_bass import _prompt_from_key, decode_output
 
@@ -43,19 +42,6 @@ from midi_adapter.evaluate_cp_bass import (
 
 
 # ---------------------------------------------------------------------------
-# Chord token helpers
-# ---------------------------------------------------------------------------
-
-def _make_chord_tokens(key: int, n_beats: int, device: torch.device) -> torch.Tensor:
-    """Build beat-level chord token tensor for a given key and length."""
-    tokens = [
-        chord_str_to_token(f'{ROOT_NAMES[(key + OFFSETS[t % 4]) % 12]}:maj')
-        for t in range(n_beats)
-    ]
-    return torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)  # (1, n_beats)
-
-
-# ---------------------------------------------------------------------------
 # Core generation
 # ---------------------------------------------------------------------------
 
@@ -64,15 +50,13 @@ def _gen_pcs(model: CPYinyangTransformer,
              key: int, n_gen: int,
              device: torch.device, temperature: float,
              n_prompt_beats: int = 2) -> list[int | None]:
-    """Generate n_gen beats with chord conditioning and return pitch classes."""
+    """Generate n_gen beats with rule conditioning and return pitch classes."""
     prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
                               base=model.base, n_prompt_beats=n_prompt_beats)
 
-    total     = n_prompt_beats + n_gen
-    chord_tok = _make_chord_tokens(key, total, device)   # (1, total)
-
-    sampled = model.global_sampling_chord(
-        prompt, chord_tok, max_seq_len=total, temperature=temperature,
+    total = n_prompt_beats + n_gen
+    sampled = model.global_sampling(
+        prompt, max_seq_len=total, temperature=temperature,
     )
     return [_extract_pc(t, model.base.tokenizer) for t in sampled[n_prompt_beats:]]
 
@@ -157,13 +141,10 @@ def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_d
     os.makedirs(out_dir, exist_ok=True)
     all_keys = sorted(set(PRETRAIN_KEYS + FINETUNE_NEW + UNSEEN))
     for key in all_keys:
-        prompt    = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                                     base=model.base, n_prompt_beats=n_prompt_beats)
-        total     = n_prompt_beats + n_gen
-        chord_tok = _make_chord_tokens(key, total, device)
-        sampled   = model.global_sampling_chord(
-            prompt, chord_tok, max_seq_len=total, temperature=temperature,
-        )
+        prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                                   base=model.base, n_prompt_beats=n_prompt_beats)
+        total   = n_prompt_beats + n_gen
+        sampled = model.global_sampling(prompt, max_seq_len=total, temperature=temperature)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
         decode_output(sampled, model.base.tokenizer, save_path=path)
         print(f'  saved {path}')

@@ -1,41 +1,30 @@
 """
-CP-Transformer Yin-Yang adapter for chord-conditioned bass generation.
+CP-Transformer Yin-Yang adapter for rule-conditioned bass generation.
 
 Architecture
 ------------
-  ChordRuleModel
-    Small bidirectional transformer over bar-level chord tokens.
-    Input : (B, n_bars)                  int64
-    Output: (B, n_bars, rule_d_model)    float
+  BassTracrRuleModel  (models/bass_tracr_rule_model.py)
+    Zero-parameter analytical model. Reads starting pitch class from the
+    first beat of the sequence (x = pc[0]) and predicts:
+      hidden[t] = one-hot((x + OFFSETS[(t+1)%4]) % 12) + position encoding
+    OFFSETS = [0, 5, 7, 0]  — same I-IV-V-I rule as the integer experiment.
+    No chord tokens needed; the key is read directly from the generated sequence.
 
   CPYinyangCrossAttention
-    Cross-attention from subbeat AR hidden states to bar-level rule hidden.
-    Key difference from the RASP version: the causal mask is bar-aligned —
-    subbeat t can attend to bar b iff t // subbeats_per_bar >= b.
-    This is correct when T_q (subbeats) >> T_k (bars).
+    Cross-attention from beat-level AR hidden states to rule hidden states.
+    Causal mask: beat t may attend to rule_hidden[0..t].
+    At step t the adapter sees hidden[t] = predicted next pitch class → t+1.
 
-  CPYinyangTransformer  (extends RoFormerSymbolicTransformer)
-    Pretrained CP transformer with adapter injected at the global level.
-    The base model is frozen; only ChordRuleModel + adapters are trained.
+  CPYinyangTransformer  (wraps RoFormerSymbolicTransformer)
+    Pretrained CP transformer with adapter injected every n_skip global layers.
+    The base model is frozen; only yinyang_attn adapters are trained.
 
-    forward(x, chord_tokens)
-      Layer-by-layer global transformer; adapter injected every n_skip layers.
+    forward(x)
+      x : (B, seq_len, subseq_len)  preprocessed CP tokens
+      Pitch classes extracted from x[:, :, 1] % 128 % 12 to build rule_hidden.
 
-    global_sampling_chord(x, chord_tokens, ...)
-      Autoregressive sampling with chord conditioning.
-      Uses KV cache for the global transformer; adapter applied at each step
-      to the most recent position only (valid because of causal mask).
-
-Dataset note
-------------
-  For pretraining the base CP transformer use bass-only tracks from the LA
-  dataset (GM programs 32-39). The existing FramedDataset + preprocess_midi
-  pipeline works unchanged; just filter by program in preprocess_midi.
-
-  For adapter fine-tuning, pair bass tracks with XF chord annotations from
-  the RWC dataset (xf_midi.chords). Use chord_tokenizer.chords_to_bar_tokens
-  to convert per-song chord events into bar-token sequences that align with
-  the FramedDataset windows.
+    global_sampling(x, ...)
+      Autoregressive sampling. Starting pitch class read from x[:, 0, 1].
 """
 
 from __future__ import annotations
@@ -49,8 +38,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from midi_adapter.chord_tokenizer import N_CHORD_TOKENS, NO_CHORD_TOKEN, N_QUALITIES
-from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
 
 
@@ -156,54 +143,16 @@ class CPYinyangCrossAttention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Chord rule model
-# ---------------------------------------------------------------------------
-
-class ChordRuleModel(nn.Module):
-    """
-    Bidirectional transformer over bar-level chord tokens.
-    Bidirectional is appropriate because the full chord chart is known at
-    generation time (chords are the conditioning input, not generated).
-    """
-
-    def __init__(
-        self,
-        rule_d_model: int = 128,
-        n_layers:     int = 2,
-        n_heads:      int = 4,
-        dropout:      float = 0.1,
-    ):
-        super().__init__()
-        self.embed = nn.Embedding(N_CHORD_TOKENS, rule_d_model,
-                                  padding_idx=NO_CHORD_TOKEN)
-        layer = nn.TransformerEncoderLayer(
-            d_model=rule_d_model, nhead=n_heads,
-            dim_feedforward=rule_d_model * 4,
-            dropout=dropout, batch_first=True, norm_first=True,
-        )
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers,
-                                                      enable_nested_tensor=False)
-
-    def forward(self, chord_tokens: torch.Tensor) -> torch.Tensor:
-        # chord_tokens: (B, n_bars)
-        key_pad_mask = (chord_tokens == NO_CHORD_TOKEN)   # True = ignore
-        x = self.embed(chord_tokens)                      # (B, n_bars, rule_d_model)
-        return self.transformer(x, src_key_padding_mask=key_pad_mask)
-
-
-# ---------------------------------------------------------------------------
 # Yin-Yang CP transformer
 # ---------------------------------------------------------------------------
 
 class CPYinyangTransformer(nn.Module):
     """
-    Wraps a pretrained RoFormerSymbolicTransformer and adds chord-conditioned
+    Wraps a pretrained RoFormerSymbolicTransformer and adds rule-conditioned
     Yin-Yang cross-attention adapters.
 
-    Only ChordRuleModel and yinyang_attn are trainable; everything else is frozen.
+    Only yinyang_attn adapters are trainable; everything else is frozen.
+    The rule model is the analytical BassTracrRuleModel (zero parameters).
 
     Parameters
     ----------
@@ -240,7 +189,7 @@ class CPYinyangTransformer(nn.Module):
             f"n_global_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
 
-        # Frozen analytical rule model — no trainable parameters
+        # Frozen analytical rule model — zero trainable parameters
         self.rule_model = BassTracrRuleModel()
 
         self.yinyang_attn = nn.ModuleList([
@@ -257,23 +206,27 @@ class CPYinyangTransformer(nn.Module):
     # Training forward  (full sequence, layer-by-layer injection)
     # ------------------------------------------------------------------
 
-    def _rule_hidden(self, chord_tokens: torch.Tensor) -> torch.Tensor:
-        """Extract roots from beat-level chord tokens and run frozen TracR rule model."""
-        roots = chord_tokens // N_QUALITIES   # (B, n_beats) in 0-11
-        roots = roots.clamp(0, 11)
-        _, h  = self.rule_model(roots, return_hidden=True)   # (B, n_beats, 16)
+    def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
+
+        x_proc : (B, T, subseq_len)  preprocessed CP tokens
+          slot 1 = pitch + (dur+1)*128  →  pitch = slot1 % 128  →  pc = pitch % 12
+        Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
+        hidden[t] encodes predicted next pitch class at t+1.
+        """
+        pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
+        _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
         return h
 
-    def forward(self, x: torch.Tensor, chord_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x            : (B, seq_len, subseq_len)  preprocessed CP tokens
-        chord_tokens : (B, seq_len)              beat-level chord token indices
+        x : (B, seq_len, subseq_len)  preprocessed CP tokens
         Returns logits of shape (B, seq_len, subseq_len, vocab_size) via local_decode.
         """
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        rule_hidden = self._rule_hidden(chord_tokens)   # (B, seq_len, 16)
+        rule_hidden = self._rule_hidden(x)   # (B, seq_len, 16)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -290,10 +243,9 @@ class CPYinyangTransformer(nn.Module):
 
         return base.local_decode(h, emb)
 
-    def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor,
-             chord_tokens: torch.Tensor) -> torch.Tensor:
+    def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor) -> torch.Tensor:
         x_proc = self.base.preprocess(x, pitch_shift)
-        logits = self(x_proc, chord_tokens)
+        logits = self(x_proc)
         return F.cross_entropy(
             logits.view(-1, self.base.tokenizer.n_tokens),
             x_proc.view(-1),
@@ -306,18 +258,21 @@ class CPYinyangTransformer(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def global_sampling_chord(
+    def global_sampling(
         self,
-        x:            torch.Tensor,   # (B, seed_len, subseq_len)  seed subbeats
-        chord_tokens: torch.Tensor,   # (B, n_bars)
-        max_seq_len:  int   = 384,
-        temperature:  float = 1.0,
+        x:           torch.Tensor,   # (B, seed_len, subseq_len)  seed subbeats (preprocessed)
+        max_seq_len: int   = 384,
+        temperature: float = 1.0,
         sampling_func = None,
     ) -> list:
         base = self.base
         batch_size, seed_len, _ = x.shape
 
-        rule_hidden = self._rule_hidden(chord_tokens)  # (B, n_beats, 16)
+        # Rule model only needs the starting pitch class; build a constant sequence of
+        # length max_seq_len so rule_model.forward() can return the full hidden trajectory.
+        pc_0   = (x[:, 0, 1] % 128 % 12).clamp(0, 11)           # (B,) starting pitch class
+        dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)        # (B, max_seq_len)
+        _, rule_hidden = self.rule_model(dummy, return_hidden=True)  # (B, max_seq_len, 16)
 
         # Encode seed subbeats
         h_seed, _ = base.local_encode(x)

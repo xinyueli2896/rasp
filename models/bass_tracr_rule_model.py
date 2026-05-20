@@ -1,19 +1,19 @@
 """
-Analytical TracR-style rule model for bar-level chord root prediction.
+Analytical TracR-style rule model for bass next-pitch-class prediction.
 
-Exact structural analogue of TracrPyTorchRuleModel, but operating on
-chord roots (mod 12) rather than integer tokens (mod 24).
+Exact structural analogue of TracrPyTorchRuleModel (integer model, mod 24),
+but operating on pitch classes (mod 12) rather than integers (mod 24).
 
-Rule:  chord_root[bar] = (key + OFFSETS[bar % 4]) % 12
-       OFFSETS = [0, 5, 7, 0]   (I – IV – V – I)
+Rule:  sequence[t] = (x + OFFSETS[t % 4]) % 12,   OFFSETS = [0, 5, 7, 0]
+       where x = pitch_classes[:, 0]  (starting pitch class, read from sequence)
 
-Input : chord root indices  (B, n_bars)   int64, values in 0-11
-Output: logits              (B, n_bars, 12)
-        hidden              (B, n_bars, TRACR_D_MODEL=16)   if return_hidden=True
+Input : pitch class indices  (B, T)   int64, values in 0-11
+Output: logits               (B, T, 12)
+        hidden               (B, T, TRACR_D_MODEL=16)   if return_hidden=True
 
-Hidden state format (mirrors integer-sequence TracR):
-  dims  0-11 : one-hot of CURRENT chord root (the note to generate at this beat)
-  dims 12-15 : one-hot of bar % 4
+Hidden state format (identical to integer-sequence TracR):
+  dims  0-11 : one-hot of PREDICTED NEXT pitch class
+  dims 12-15 : one-hot of t % 4
 
 No trainable parameters.
 """
@@ -77,25 +77,24 @@ class BassTracrRuleModel(nn.Module):
 
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
 
-    def forward(self, roots: torch.Tensor, return_hidden: bool = False):
+    def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         """
-        roots : (B, T)  chord root indices in 0-11
-                (extracted from full chord tokens as token // N_QUALITIES)
+        idx : (B, T)  pitch class indices in 0-11; idx[:, 0] determines the key.
         """
-        B, T   = roots.shape
-        device = roots.device
+        B, T   = idx.shape
+        device = idx.device
 
-        t_idx   = torch.arange(T, device=device)
-        o       = self._offsets[t_idx % N_POS]
-        key     = roots[:, 0]                                  # starter = first bar root
-        curr_r  = (key[:, None] + o[None, :]) % N_ROOTS       # (B, T) current beat root
+        t_idx  = torch.arange(T, device=device)
+        o      = self._offsets[(t_idx + 1) % N_POS]           # +1: predict NEXT pitch class
+        key    = idx[:, 0]                                     # starting pitch class
+        next_r = (key[:, None] + o[None, :]) % N_ROOTS        # (B, T) next pitch class
 
-        logits = F.one_hot(curr_r, num_classes=N_ROOTS).float()
+        logits = F.one_hot(next_r, num_classes=N_ROOTS).float()
 
         if return_hidden:
-            tok_curr = self.W_E[curr_r]                        # (B, T, 16) root dims
+            tok_next = self.W_E[next_r]                        # (B, T, 16) root dims
             pos_emb  = self.W_pos[t_idx % N_POS]              # (T, 16) pos dims
-            h_out    = tok_curr + pos_emb.unsqueeze(0)         # (B, T, 16)
+            h_out    = tok_next + pos_emb.unsqueeze(0)         # (B, T, 16)
             return logits, h_out
 
         return logits
@@ -108,18 +107,16 @@ class BassTracrRuleModel(nn.Module):
 
 
 if __name__ == '__main__':
-    from midi_adapter.chord_tokenizer import N_QUALITIES
-
     model = BassTracrRuleModel()
     print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}')
 
-    # key=0 (C): roots should be [C,F,G,C,...] = [0,5,7,0,...]
-    # predicted NEXT root at each bar: [5,7,0,0, 5,7,0,0]
-    roots = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
-    logits, hidden = model(roots, return_hidden=True)
+    # key=0 (C): sequence = [0,5,7,0,0,5,7,0,...]
+    # predicted NEXT at each position: [5,7,0,0, 5,7,0,0]
+    idx = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
+    logits, hidden = model(idx, return_hidden=True)
     preds = logits.argmax(-1).squeeze().tolist()
-    print(f'roots  : {roots.squeeze().tolist()}')
+    print(f'input  : {idx.squeeze().tolist()}')
     print(f'preds  : {preds}')
-    print(f'expect : [0, 5, 7, 0, 0, 5, 7, 0]  (current root, not next)')
+    print(f'expect : [5, 7, 0, 0, 5, 7, 0, 0]  (next pitch class)')
     print(f'hidden shape: {hidden.shape}')
-    print(f'All correct: {preds == [0, 5, 7, 0, 0, 5, 7, 0]}')
+    print(f'All correct: {preds == [5, 7, 0, 0, 5, 7, 0, 0]}')
