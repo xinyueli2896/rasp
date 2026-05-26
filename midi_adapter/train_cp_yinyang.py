@@ -305,19 +305,21 @@ def main(args):
     if unseen_acc_cb is not None:
         # Mirror IS protocol: save best checkpoint by unseen-key accuracy
         checkpoint_cb = L.callbacks.ModelCheckpoint(
-            monitor    = 'unseen_acc',
-            mode       = 'max',
-            save_top_k = 3,
-            save_last  = True,
+            monitor           = 'unseen_acc',
+            mode              = 'max',
+            save_top_k        = 3,
+            save_last         = True,
+            save_weights_only = True,
             enable_version_counter = False,
             dirpath    = os.path.join(args.ckpt_dir, run_name),
             filename   = run_name + '.{epoch:02d}.{unseen_acc:.4f}',
         )
     else:
         checkpoint_cb = L.callbacks.ModelCheckpoint(
-            monitor    = 'val_loss',
-            save_top_k = 3,
-            save_last  = True,
+            monitor           = 'val_loss',
+            save_top_k        = 3,
+            save_last         = True,
+            save_weights_only = True,
             enable_version_counter = False,
             dirpath    = os.path.join(args.ckpt_dir, run_name),
             filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
