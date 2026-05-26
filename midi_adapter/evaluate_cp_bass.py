@@ -37,16 +37,21 @@ from midi_adapter.infer_cp_bass import _sample, _prompt_from_key, decode_output
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# Key partitions (mirror of EVAL_PRETRAIN_ONLY / EVAL_FINETUNE_ONLY / ... in evaluate.py)
-PRETRAIN_KEYS = [0, 5, 9]                            # seen during CP pretraining
-FINETUNE_NEW  = [1, 2, 3, 4, 7, 10, 11]             # added in fine-tune, not seen in pretrain
-ALL_SEEN      = [0, 1, 2, 3, 4, 5, 7, 9, 10, 11]
-UNSEEN        = [6, 8]                               # never seen
+# Key partitions
+PRETRAIN_ONLY = [5, 9]                        # seen only during CP pretraining
+FINETUNE_ONLY = [1, 2, 3, 4, 7, 10, 11]      # seen only during fine-tuning
+BOTH_SEEN     = [0]                           # seen in both pretrain and fine-tune
+UNSEEN        = [6, 8]                        # never seen during any training
+
+# Aliases kept for backward compatibility
+PRETRAIN_KEYS = PRETRAIN_ONLY
+FINETUNE_NEW  = FINETUNE_ONLY
+ALL_SEEN      = PRETRAIN_ONLY + FINETUNE_ONLY + BOTH_SEEN
 
 CATEGORIES = [
-    ('Pretrain keys', PRETRAIN_KEYS, '{0,5,9}'),
-    ('Finetune-new',  FINETUNE_NEW,  '{1,2,3,4,7,10,11}'),
-    ('All seen',      ALL_SEEN,      '{0..5,7,9..11}'),
+    ('Pretrain-only', PRETRAIN_ONLY, '{5,9}'),
+    ('Finetune-only', FINETUNE_ONLY, '{1,2,3,4,7,10,11}'),
+    ('Both seen',     BOTH_SEEN,     '{0}'),
     ('Unseen',        UNSEEN,        '{6,8}'),
 ]
 

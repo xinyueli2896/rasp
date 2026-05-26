@@ -35,7 +35,8 @@ from midi_adapter.infer_cp_bass import _prompt_from_key, decode_output
 # Re-use shared helpers from evaluate_cp_bass
 from midi_adapter.evaluate_cp_bass import (
     ROOT_NAMES,
-    PRETRAIN_KEYS, FINETUNE_NEW, ALL_SEEN, UNSEEN, CATEGORIES,
+    PRETRAIN_ONLY, FINETUNE_ONLY, BOTH_SEEN, UNSEEN, CATEGORIES,
+    PRETRAIN_KEYS, FINETUNE_NEW, ALL_SEEN,   # backward-compat aliases
     _expected_pc, _extract_pc,
     _print_summary_table, _print_per_key, _print_error_dist,
 )
