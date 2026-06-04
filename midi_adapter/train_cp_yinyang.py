@@ -369,8 +369,8 @@ def main(args):
 
 def get_args():
     p = argparse.ArgumentParser(description='Train CPYinyangTransformer adapter')
-    p.add_argument('--base_ckpt',          type=str, required=True,
-                   help='Path to pretrained CP transformer .pt file')
+    p.add_argument('--base_ckpt',          type=str, default=None,
+                   help='Path to pretrained CP transformer .pt file (omit to train from random weights)')
     p.add_argument('--train_data',         type=str, required=True)
     p.add_argument('--val_data',           type=str, required=True)
     p.add_argument('--train_split',        type=str, default='train',
