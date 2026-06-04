@@ -243,7 +243,7 @@ def _print_error_dist(errors: list) -> None:
 def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_dir) -> None:
     import os
     os.makedirs(out_dir, exist_ok=True)
-    all_keys = sorted(set(PRETRAIN_KEYS + FINETUNE_NEW + UNSEEN))
+    all_keys = list(range(12))
     for key in all_keys:
         prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
                                    base=base, n_prompt_beats=n_prompt_beats)

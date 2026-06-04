@@ -46,6 +46,13 @@ def main(args):
         with_velocity= False,
     )
 
+    if args.base_ckpt and os.path.exists(args.base_ckpt):
+        state = torch.load(args.base_ckpt, map_location='cpu')
+        if 'state_dict' in state:
+            state = state['state_dict']
+        net.load_state_dict(state)
+        print(f'Loaded pretrained weights from {args.base_ckpt}')
+
     # cp_transformer's configure_optimizers hardcodes total_steps=2_000_000.
     # Override to use the actual training budget so the LR schedule is correct.
     # Return legacy ([optimizer], [scheduler]) so PL steps per epoch (never, since we
@@ -156,6 +163,8 @@ def get_args():
     p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
     p.add_argument('--run_name',      type=str,  default=None)
+    p.add_argument('--base_ckpt',      type=str,  default=None,
+                   help='Load pretrained weights before finetuning (starts with fresh optimizer/schedule)')
     p.add_argument('--resume_ckpt',   type=str,  default=None)
     p.add_argument('--wandb_project', type=str,  default='cp_bass',
                    help='W&B project name (set to empty string to disable wandb)')
