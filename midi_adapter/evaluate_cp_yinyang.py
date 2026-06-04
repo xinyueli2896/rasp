@@ -247,10 +247,12 @@ def run_evaluation(args) -> None:
 
     _print_error_dist(all_errors)
 
-    if args.save_midi_dir:
-        print(f'\nSaving MIDI for all 12 keys → {args.save_midi_dir}')
-        _save_midi_all_keys(model, args.n_gen_beats, device, args.temperature,
-                            args.n_prompt_beats, args.save_midi_dir)
+    midi_dir = args.save_midi_dir or os.path.join(
+        'eval_midi', os.path.splitext(os.path.basename(args.adapter_ckpt))[0]
+    )
+    print(f'\nSaving MIDI for all 12 keys → {midi_dir}')
+    _save_midi_all_keys(model, args.n_gen_beats, device, args.temperature,
+                        args.n_prompt_beats, midi_dir)
 
 
 def get_args():
@@ -271,7 +273,8 @@ def get_args():
     p.add_argument('--n_trials',      type=int, default=1)
     p.add_argument('--temperature',   type=float, default=0)
     p.add_argument('--verbose',       action='store_true')
-    p.add_argument('--save_midi_dir', type=str, default=None)
+    p.add_argument('--save_midi_dir', type=str, default=None,
+                   help='Directory for MIDI output (default: eval_midi/<adapter_name>/)')
     return p.parse_args()
 
 
