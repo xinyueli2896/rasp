@@ -41,7 +41,7 @@ MAX_STEPS    = 100_000
 # Dataset — extends FramedDataset to also yield bar-level chord tokens
 # ---------------------------------------------------------------------------
 
-class ChordFramedDataset(FramedDataset):
+class BassFramedDataset(FramedDataset):
     """
     Thin extension of FramedDataset that adds shared-cache preloading and
     an optional disable_pitch_shift flag.  Yields (data_window, pitch_shift).
@@ -127,13 +127,13 @@ class ChordFramedDataset(FramedDataset):
 
 class UnseenAccuracyCallback(L.Callback):
     """
-    At each val check, compute chord root accuracy on unseen-key data using
+    At each val check, compute rule-following accuracy on unseen-key data using
     AUTOREGRESSIVE generation so the metric reflects actual generation quality
     rather than teacher-forced next-token prediction.
 
     For each batch: preprocess the first n_prompt_beats as a prompt, generate
     the next n_gen_beats autoregressively (greedy), then check whether the
-    pitch class of each generated beat matches the chord root.
+    pitch class of each generated beat matches (key + OFFSETS[t%4]) % 12.
     """
 
     def __init__(self, dataloader: DataLoader, n_batches: int = 5,
@@ -274,11 +274,11 @@ def main(args):
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
 
-    train_ds = ChordFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+    train_ds = BassFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
                                   split=args.train_split, sample_step=SUBBEATS_PER_BAR)
     train_ds.preload(_cache)
 
-    val_ds = ChordFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+    val_ds = BassFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
                                 split=args.val_split, sample_step=SUBBEATS_PER_BAR,
                                 repeat=True)
     val_ds.preload(_cache)
@@ -291,7 +291,7 @@ def main(args):
     val_loaders   = [val_loader]
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
-        unseen_ds = ChordFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
+        unseen_ds = BassFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
                                        split='val', sample_step=SUBBEATS_PER_BAR,
                                        repeat=True)
         unseen_ds.preload(_cache)
