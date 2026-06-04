@@ -5,8 +5,9 @@ Architecture
 ------------
   BassTracrRuleModel  (models/bass_tracr_rule_model.py)
     Zero-parameter analytical model. Reads starting pitch class from the
-    first beat of the sequence (x = pc[0]) and predicts:
-      hidden[t] = one-hot((x + OFFSETS[(t+1)%4]) % 12) + position encoding
+    first beat of the sequence (x = pc[0]) and encodes:
+      hidden[t] = one-hot((x + OFFSETS[t%4]) % 12) + position encoding
+    i.e. the CURRENT pitch class at position t (not next).
     OFFSETS = [0, 5, 7, 0]  — same I-IV-V-I rule as the integer experiment.
     No chord tokens needed; the key is read directly from the generated sequence.
 
@@ -25,6 +26,8 @@ Architecture
 
     global_sampling(x, ...)
       Autoregressive sampling. Starting pitch class read from x[:, 0, 1].
+      rule_hidden[t] = embed(key + OFFSETS[t%4]) so the adapter at step t
+      naturally attends to rule_hidden[t] (matching PE) for the correct signal.
 """
 
 from __future__ import annotations
@@ -212,7 +215,7 @@ class CPYinyangTransformer(nn.Module):
         x_proc : (B, T, subseq_len)  preprocessed CP tokens
           slot 1 = pitch + (dur+1)*128  →  pitch = slot1 % 128  →  pc = pitch % 12
         Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
-        hidden[t] encodes predicted next pitch class at t+1.
+        hidden[t] encodes the CURRENT pitch class at position t: (key + OFFSETS[t%4]) % 12.
         """
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
