@@ -68,6 +68,39 @@ class LoRALinear(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Learned rule-input encoder  (encoder-injected variant)
+# ---------------------------------------------------------------------------
+
+class BassRuleInputEncoder(nn.Module):
+    """
+    Replaces the frozen one-hot W_E[pc] lookup in BassTracrRuleModel with a
+    learned embedding, keeping W_pos frozen.
+
+    Standard analytical rule:
+        rule_hidden[t] = W_E[(key + OFFSETS[t%4]) % 12]  +  W_pos[t%4]
+                       = one_hot(cur_pc)                 +  pos_embed   (16-dim)
+
+    Encoder-injected:
+        rule_hidden[t] = encoder(cur_pc)  +  W_pos[t%4]
+                         ^^^^^^^^^^^^^^
+                         learned dense embedding instead of one-hot
+
+    The learned embedding can generalise to unseen keys because all 12 pitch
+    classes appear during training as intermediate notes in other keys' cycles.
+    The cross-attention's k_proj/v_proj also benefit from a smoother input
+    representation compared to sparse one-hots.
+    """
+
+    def __init__(self, n_pitches: int = 12, rule_d_model: int = TRACR_D_MODEL):
+        super().__init__()
+        self.embedding = nn.Embedding(n_pitches, rule_d_model)
+        nn.init.xavier_uniform_(self.embedding.weight)
+
+    def forward(self, pc: torch.Tensor) -> torch.Tensor:
+        return self.embedding(pc)   # (B, T, rule_d_model)
+
+
+# ---------------------------------------------------------------------------
 # Cross-attention with bar-aligned causal mask
 # ---------------------------------------------------------------------------
 
@@ -167,16 +200,20 @@ class CPYinyangTransformer(nn.Module):
     def __init__(
         self,
         base_model,
-        adapter_rank:  int  = 256,
-        n_skip:        int  = 4,
-        lora_rank:     int  = 0,
-        bidirectional: bool = False,
+        adapter_rank:     int  = 256,
+        n_skip:           int  = 4,
+        lora_rank:        int  = 0,
+        bidirectional:    bool = False,
+        encoder_injected: bool = False,
     ):
+        assert not (bidirectional and encoder_injected), \
+            "bidirectional and encoder_injected are mutually exclusive"
         super().__init__()
-        self.base          = base_model
-        self.n_skip        = n_skip
-        self.lora_rank     = lora_rank
-        self.bidirectional = bidirectional
+        self.base             = base_model
+        self.n_skip           = n_skip
+        self.lora_rank        = lora_rank
+        self.bidirectional    = bidirectional
+        self.encoder_injected = encoder_injected
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -207,6 +244,11 @@ class CPYinyangTransformer(nn.Module):
             for _ in range(n_adapters)
         ])
 
+        if encoder_injected:
+            # Learned pitch-class embedding replaces the hard one-hot W_E lookup.
+            # W_pos is kept frozen; the embedding is shared across all adapter layers.
+            self.rule_input_encoder = BassRuleInputEncoder()
+
         if bidirectional:
             # Learned AR→rule projection (one per adapter layer).
             # Replaces the TracR rule model: AR hidden states are projected to
@@ -221,6 +263,23 @@ class CPYinyangTransformer(nn.Module):
     # ------------------------------------------------------------------
     # Training forward  (full sequence, layer-by-layer injection)
     # ------------------------------------------------------------------
+
+    def _encoder_injected_rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """Encoder-injected rule_hidden: learned embedding for each pitch class.
+
+        Reads key = pc[:, 0], computes cur_pc[t] = (key + OFFSETS[t%4]) % 12,
+        then returns encoder(cur_pc) + W_pos[t%4].  Identical structure to the
+        analytical rule model but with a learned dense embedding instead of one-hot.
+        """
+        B, T = x_proc.shape[0], x_proc.shape[1]
+        pc_seq  = x_proc[:, :, 1] % 128 % 12              # (B, T)
+        key     = pc_seq[:, 0]                             # (B,)
+        t_idx   = torch.arange(T, device=x_proc.device)
+        offsets = self.rule_model._offsets[t_idx % 4]     # (T,)
+        cur_pc  = (key[:, None] + offsets[None, :]) % 12  # (B, T)
+        h       = self.rule_input_encoder(cur_pc)          # (B, T, TRACR_D_MODEL)
+        pos_emb = self.rule_model.W_pos[t_idx % 4]        # (T, TRACR_D_MODEL)
+        return h + pos_emb.unsqueeze(0)
 
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
@@ -242,7 +301,12 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        rule_hidden = None if self.bidirectional else self._rule_hidden(x)
+        if self.encoder_injected:
+            rule_hidden = self._encoder_injected_rule_hidden(x)
+        elif self.bidirectional:
+            rule_hidden = None
+        else:
+            rule_hidden = self._rule_hidden(x)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -285,11 +349,18 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seed_len, _ = x.shape
 
-        # Standard mode: pre-compute rule_hidden from dummy constant-key sequence.
-        # Bidirectional mode: rule_hidden is computed on-the-fly from AR states each step.
-        if not self.bidirectional:
-            pc_0   = (x[:, 0, 1] % 128 % 12).clamp(0, 11)           # (B,) starting pitch class
-            dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)        # (B, max_seq_len)
+        # Pre-compute rule_hidden for standard and encoder_injected modes.
+        # Bidirectional computes rule_hidden on-the-fly from AR states each step.
+        pc_0 = (x[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,) starting pitch class
+        if self.encoder_injected:
+            t_idx   = torch.arange(max_seq_len, device=x.device)
+            offsets = self.rule_model._offsets[t_idx % 4]              # (max_seq_len,)
+            cur_pc  = (pc_0[:, None] + offsets[None, :]) % 12          # (B, max_seq_len)
+            h_enc   = self.rule_input_encoder(cur_pc)                   # (B, max_seq_len, 16)
+            pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, 16)
+            rule_hidden = h_enc + pos_emb.unsqueeze(0)
+        elif not self.bidirectional:
+            dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)          # (B, max_seq_len)
             _, rule_hidden = self.rule_model(dummy, return_hidden=True)  # (B, max_seq_len, 16)
         else:
             rule_hidden = None
