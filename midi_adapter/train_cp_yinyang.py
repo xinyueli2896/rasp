@@ -41,6 +41,21 @@ MAX_STEPS    = 100_000
 # Dataset — extends FramedDataset to also yield bar-level chord tokens
 # ---------------------------------------------------------------------------
 
+class InterleavedDataset(IterableDataset):
+    """Interleave two IterableDatasets, sampling each with probability p_first / (1-p_first)."""
+
+    def __init__(self, ds1: 'BassFramedDataset', ds2: 'BassFramedDataset', p_first: float = 0.5):
+        self.ds1      = ds1
+        self.ds2      = ds2
+        self.p_first  = p_first
+
+    def __iter__(self):
+        it1 = iter(self.ds1)
+        it2 = iter(self.ds2)
+        while True:
+            yield next(it1) if torch.rand(1).item() < self.p_first else next(it2)
+
+
 class BassFramedDataset(FramedDataset):
     """
     Thin extension of FramedDataset that adds shared-cache preloading and
@@ -265,6 +280,11 @@ def main(args):
         lora_rank    = args.lora_rank,
     )
 
+    if args.unfreeze_base:
+        for p in adapter.base.parameters():
+            p.requires_grad_(True)
+        print('Base model UNFROZEN — training base + adapter jointly')
+
     n_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
     n_frozen    = sum(p.numel() for p in adapter.parameters() if not p.requires_grad)
     print(f'Trainable: {n_trainable:,}   Frozen: {n_frozen:,}')
@@ -278,6 +298,15 @@ def main(args):
                                   split=args.train_split, sample_step=SUBBEATS_PER_BAR)
     train_ds.preload(_cache)
 
+    if args.pretrain_data and os.path.exists(args.pretrain_data):
+        pretrain_ds = BassFramedDataset(args.pretrain_data, TRAIN_LENGTH, args.batch_size,
+                                        split=args.train_split, sample_step=SUBBEATS_PER_BAR)
+        pretrain_ds.preload(_cache)
+        effective_train_ds = InterleavedDataset(pretrain_ds, train_ds)
+        print(f'Training on interleaved: {args.pretrain_data}  +  {args.train_data}')
+    else:
+        effective_train_ds = train_ds
+
     val_ds = BassFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
                                 split=args.val_split, sample_step=SUBBEATS_PER_BAR,
                                 repeat=True)
@@ -285,7 +314,7 @@ def main(args):
 
     # num_workers=0: all data loading stays in the main process so _cache sharing works.
     # A worker subprocess would copy-on-write the tensor and defeat the sharing.
-    train_loader = DataLoader(train_ds, batch_size=None, num_workers=0)
+    train_loader = DataLoader(effective_train_ds, batch_size=None, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=None, num_workers=0)
 
     val_loaders   = [val_loader]
@@ -371,7 +400,10 @@ def get_args():
     p = argparse.ArgumentParser(description='Train CPYinyangTransformer adapter')
     p.add_argument('--base_ckpt',          type=str, default=None,
                    help='Path to pretrained CP transformer .pt file (omit to train from random weights)')
-    p.add_argument('--train_data',         type=str, required=True)
+    p.add_argument('--train_data',         type=str, required=True,
+                   help='Primary (finetune) training data .pt file')
+    p.add_argument('--pretrain_data',      type=str, default=None,
+                   help='Optional second data file; batches are interleaved 50/50 with --train_data')
     p.add_argument('--val_data',           type=str, required=True)
     p.add_argument('--train_split',        type=str, default='train',
                    choices=['all', 'train', 'val', 'test'])
@@ -385,6 +417,8 @@ def get_args():
     p.add_argument('--n_skip',             type=int, default=4)
     p.add_argument('--lora_rank',          type=int, default=0,
                    help='LoRA rank for base model Q/V projections (0 = frozen base)')
+    p.add_argument('--unfreeze_base',      action='store_true',
+                   help='Unfreeze entire base model for joint base+adapter training (use with --pretrain_data when training from scratch)')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
