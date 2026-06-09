@@ -184,9 +184,7 @@ def run_evaluation(args):
 
     default_stems = ["yinyang_skip1", "yinyang_skip2", "yinyang_skip4"]
     stems = args.adapter_stems if args.adapter_stems else default_stems
-    skip1_models = _load_seed_models(stems[0] if len(stems) > 0 else "yinyang_skip1", args, device)
-    skip2_models = _load_seed_models(stems[1] if len(stems) > 1 else "yinyang_skip2", args, device)
-    skip4_models = _load_seed_models(stems[2] if len(stems) > 2 else "yinyang_skip4", args, device)
+    stem_models = [(s, _load_seed_models(s, args, device)) for s in stems]
 
     print()
     print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
@@ -196,7 +194,8 @@ def run_evaluation(args):
     print(f"  Finetune-only (B\\A) = {EVAL_FINETUNE_ONLY}")
     print(f"  Both          (A∩B) = {EVAL_BOTH}")
     print(f"  Neither             = {EVAL_NEITHER}")
-    print(f"  skip=1 seeds: {len(skip1_models)}  skip=2 seeds: {len(skip2_models)}  skip=4 seeds: {len(skip4_models)}")
+    for s, mdls in stem_models:
+        print(f"  {s}: {len(mdls)} seed(s)")
 
     n_prompt = args.prompt_len
 
@@ -212,11 +211,7 @@ def run_evaluation(args):
         ("Pretrain", [pretrain_model]),
         ("Finetune", [finetune_model]),
     ]
-    adapter_models = [
-        (stems[0] if len(stems) > 0 else "skip=1", skip1_models, len(skip1_models) > 1),
-        (stems[1] if len(stems) > 1 else "skip=2", skip2_models, len(skip2_models) > 1),
-        (stems[2] if len(stems) > 2 else "skip=4", skip4_models, len(skip4_models) > 1),
-    ]
+    adapter_models = [(s, mdls, len(mdls) > 1) for s, mdls in stem_models]
 
     # Evaluate all
     # results[label] = {cat_label: (per_starter, mean, std)}
@@ -306,13 +301,10 @@ def run_evaluation(args):
     print("Qualitative generation examples (prompt length =", n_prompt, ")")
     print("-" * 72)
     show_len = 9
-    qual_models = [
-        ("Pretrain",  pretrain_model),
-        ("Finetune",  finetune_model),
-        (stems[0] if len(stems) > 0 else "skip=1", skip1_models[0]),
-        (stems[1] if len(stems) > 1 else "skip=2", skip2_models[0]),
-        (stems[2] if len(stems) > 2 else "skip=4", skip4_models[0]),
-    ]
+    qual_models = (
+        [("Pretrain", pretrain_model), ("Finetune", finetune_model)]
+        + [(s, mdls[0]) for s, mdls in stem_models]
+    )
     for cat_label, x in (
         [("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
          ("Finetune-only", EVAL_FINETUNE_ONLY[0]),
