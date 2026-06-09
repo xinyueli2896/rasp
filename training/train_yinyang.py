@@ -13,7 +13,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.dataset  import (get_adapter_dataloaders,
+from data.dataset  import (get_adapter_dataloaders, get_dataloaders,
                             AR_TRAIN_STARTERS, ADAPTER_TRAIN_STARTERS,
                             TEST_STARTERS, VOCAB_SIZE)
 from models.yinyang_model            import build_yinyang_model, RULE_D_MODEL
@@ -122,11 +122,21 @@ def train(args):
     print(f'Adapter train starters: {ADAPTER_TRAIN_STARTERS}')
     print(f'Test starters         : {TEST_STARTERS}')
 
-    train_loader, test_loader = get_adapter_dataloaders(
-        batch_size         = args.batch_size,
-        n_cycles           = args.n_cycles,
-        n_seqs_per_starter = args.n_seqs_per_starter,
-    )
+    if args.joint:
+        joint_starters = sorted(set(AR_TRAIN_STARTERS) | set(ADAPTER_TRAIN_STARTERS))
+        print(f'Joint training starters: {joint_starters}')
+        train_loader, test_loader = get_dataloaders(
+            batch_size         = args.batch_size,
+            n_cycles           = args.n_cycles,
+            n_seqs_per_starter = args.n_seqs_per_starter,
+            train_starters     = joint_starters,
+        )
+    else:
+        train_loader, test_loader = get_adapter_dataloaders(
+            batch_size         = args.batch_size,
+            n_cycles           = args.n_cycles,
+            n_seqs_per_starter = args.n_seqs_per_starter,
+        )
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_path = os.path.join(args.ckpt_dir, f'{args.ckpt_name}.pt')
 
@@ -230,6 +240,8 @@ def get_args():
                    help='Use bidirectional cross-attention: AR informs rule (round 1), '
                         'rule informs AR (round 2). Rule model input injection is skipped.')
     p.add_argument('--force_fallback',     action='store_true')
+    p.add_argument('--joint',              action='store_true', default=False,
+                   help='Train on union of AR pretrain + adapter finetune starters')
     p.add_argument('--seed',               type=int,   default=42)
     return p.parse_args()
 
