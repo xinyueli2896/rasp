@@ -133,6 +133,159 @@ Compares Pretrain / Finetune / Finetune+rule (skip=1,2,4) across all four data s
 
 ---
 
+## Bass CP Experiment
+
+A parallel experiment that tests the same Yin-Yang rule-adapter idea on symbolic
+music: a CP transformer trained on bass lines that follow the I–IV–V–I cycle.
+
+**The rule:** at beat `t`, the bass pitch class is `(key + OFFSETS[t % 4]) % 12`
+where `key` is the starting pitch class and `OFFSETS = [0, 5, 7, 0]`.
+Example for `key=0` (C): `C, F, G, C, C, F, G, C, ...`
+
+### Key splits
+
+| Split | Keys | Description |
+|---|---|---|
+| Pretrain-only | {5, 9} | Seen only during base CP pretraining |
+| Finetune-only | {1, 2, 3, 4, 7, 10, 11} | Seen only during adapter finetuning |
+| Both seen | {0} | Seen in both pretrain and finetune |
+| Unseen | {6, 8} | Never seen during any training — generalization test |
+
+### Rule model
+
+`models/bass_tracr_rule_model.py` — analytical, zero parameters.
+- `d_model = 12 + 4 = 16` (12 pitch-class dims + 4 period-4 position dims)
+- `rule_hidden[t]` encodes the **next** pitch class (prediction target at `t`):
+  token dims = `one_hot(key + OFFSETS[(t+1)%4])`, position dims = `one_hot((t+1)%4)`
+- Both dims consistently shifted to `t+1` so same-position cross-attention gives
+  the direct next-token signal — the natural match for the LM objective.
+
+### Adapter variants
+
+| Flag | Description |
+|---|---|
+| *(none)* | Standard: frozen analytical rule model |
+| `--encoder_injected` | Learned `nn.Embedding(12, 16)` replaces the one-hot `W_E` lookup |
+| `--bidirectional` | No rule model input; learned `Linear(d_model, 16)` projects AR states to rule space |
+
+### Full training pipeline
+
+**Step 1 — generate datasets**
+
+```bash
+# Base pretrain data  (keys 0, 5, 9)
+python -m midi_adapter.generate_synthetic_bass \
+    --n_songs 3000 --n_bars 32 --seed 42 \
+    --keys 0 5 9 \
+    --out_dir data/bass_pretrain --out_pt data/bass_pretrain_cp4
+
+# Adapter finetune data  (keys 0–4, 7, 10, 11)
+python -m midi_adapter.generate_synthetic_bass \
+    --n_songs 3000 --n_bars 32 --seed 42 \
+    --keys 0 1 2 3 4 7 10 11 \
+    --out_dir data/bass_finetune --out_pt data/bass_finetune_cp4
+
+# Validation / unseen-key eval  (all 12 keys)
+python -m midi_adapter.generate_synthetic_bass \
+    --n_songs 1000 --n_bars 32 --seed 99 \
+    --out_dir data/bass_all --out_pt data/bass_all_cp4
+```
+
+**Step 2 — pretrain base CP transformer**  (max_steps=200,000)
+
+```bash
+python -m midi_adapter.pretrain_cp_bass \
+    --train_data data/bass_pretrain_cp4.pt \
+    --val_data   data/bass_pretrain_cp4.pt \
+    --model_size 1 --batch_size 8 \
+    --ckpt_dir   ckpt/cp_bass_pretrained
+```
+
+Checkpoint saved to `ckpt/cp_bass_pretrained/last.ckpt`.
+
+**Step 3 — train the adapter**  (max_steps=100,000)
+
+Standard adapter:
+```bash
+python -m midi_adapter.train_cp_yinyang \
+    --base_ckpt  ckpt/cp_bass_pretrained/last.ckpt \
+    --train_data data/bass_finetune_cp4.pt \
+    --val_data   data/bass_all_cp4.pt \
+    --model_size 1 --batch_size 8 \
+    --adapter_rank 256 --n_skip 4 \
+    --ckpt_dir   checkpoints
+```
+
+Encoder-injected (learned pitch-class embedding):
+```bash
+python -m midi_adapter.train_cp_yinyang \
+    --base_ckpt  ckpt/cp_bass_pretrained/last.ckpt \
+    --train_data data/bass_finetune_cp4.pt \
+    --val_data   data/bass_all_cp4.pt \
+    --model_size 1 --batch_size 8 \
+    --adapter_rank 256 --n_skip 4 \
+    --encoder_injected \
+    --ckpt_dir   checkpoints
+```
+
+Bidirectional (no rule model input):
+```bash
+python -m midi_adapter.train_cp_yinyang \
+    --base_ckpt  ckpt/cp_bass_pretrained/last.ckpt \
+    --train_data data/bass_finetune_cp4.pt \
+    --val_data   data/bass_all_cp4.pt \
+    --model_size 1 --batch_size 8 \
+    --adapter_rank 256 --n_skip 4 \
+    --bidirectional \
+    --ckpt_dir   checkpoints
+```
+
+Joint training with pretrain + finetune data interleaved:
+```bash
+python -m midi_adapter.train_cp_yinyang \
+    --base_ckpt    ckpt/cp_bass_pretrained/last.ckpt \
+    --train_data   data/bass_finetune_cp4.pt \
+    --pretrain_data data/bass_pretrain_cp4.pt \
+    --val_data     data/bass_all_cp4.pt \
+    --model_size 1 --batch_size 8 \
+    --adapter_rank 256 --n_skip 4 \
+    --ckpt_dir     checkpoints
+```
+
+**Step 4 — evaluate**
+
+```bash
+python -m midi_adapter.evaluate_cp_yinyang \
+    --base_ckpt    ckpt/cp_bass_pretrained/last.ckpt \
+    --adapter_ckpt checkpoints/<run_name>/best.pt \
+    --model_size 1 \
+    --n_trials 4 --temperature 1.0
+```
+
+Reports per-key accuracy broken down by split (pretrain-only, finetune-only,
+both-seen, unseen). The key metric is unseen-key accuracy `{6, 8}`.
+
+### Bass project structure
+
+```
+rasp/
+├── models/
+│   ├── bass_tracr_rule_model.py     # Analytical rule model (mod 12, 16-dim hidden)
+│   └── tracr_pytorch_rule_model.py  # Integer rule model (mod 24, 28-dim hidden)
+└── midi_adapter/
+    ├── cp_yinyang.py                # CPYinyangTransformer + CPYinyangCrossAttention
+    ├── train_cp_yinyang.py          # Adapter training (Lightning)
+    ├── evaluate_cp_yinyang.py       # Accuracy evaluation across key splits
+    ├── pretrain_cp_bass.py          # Base CP transformer pretraining
+    ├── finetune_cp_bass.py          # Base CP transformer finetuning
+    ├── generate_synthetic_bass.py   # Synthetic bass dataset generation
+    ├── evaluate_cp_bass.py          # Base model evaluation
+    ├── chord_tokenizer.py           # CP token encoding/decoding
+    └── infer_cp_bass.py             # Single-key inference helper
+```
+
+---
+
 ## Project Structure
 
 ```
