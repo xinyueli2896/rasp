@@ -42,7 +42,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Union
 
-VOCAB_SIZE = 24
+VOCAB_SIZE = 12
 OFFSETS    = [0, 5, 7, 0]    # period-4 rule
 BOS_TOKEN  = "BOS"
 

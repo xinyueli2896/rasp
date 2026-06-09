@@ -12,12 +12,12 @@ from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
 
 
 class TracrPyTorchRuleModel(nn.Module):
-    # d_model = VOCAB_SIZE + 4 = 28
-    # first 24 dims: token subspace (one-hot of token value)
+    # d_model = VOCAB_SIZE + 4 = 16  (vocab=12, same as BassTracrRuleModel)
+    # first 12 dims: token subspace (one-hot of token value)
     # last   4 dims: position subspace (one-hot of position mod 4)
     # 1 attention head, no MLP, no causal mask, no trainable parameters
 
-    TRACR_D_MODEL: int = VOCAB_SIZE + 4   # 28
+    TRACR_D_MODEL: int = VOCAB_SIZE + 4   # 16
 
     def __init__(self, max_seq_len: int = 128, attn_scale: float = 20.0):
         super().__init__()
@@ -121,10 +121,12 @@ if __name__ == "__main__":
     model = TracrPyTorchRuleModel()
     print(f"TRACR_D_MODEL = {model.TRACR_D_MODEL}")
 
+    # vocab=12, OFFSETS=[0,5,7,0]: sequence for x=0 → [0,5,7,0,0,5,7,0,...]
+    # CURRENT encoding: logits predict current token (same as input)
     tests = [
-        (0,  [0,  5,  7,  0,  0,  5,  7,  0],  [0,  5,  7,  0,  0,  5,  7,  0]),
-        (2,  [2,  7,  9,  2,  2,  7,  9,  2],  [2,  7,  9,  2,  2,  7,  9,  2]),
-        (9,  [9,  14, 16, 9,  9,  14, 16, 9],  [9,  14, 16, 9,  9,  14, 16, 9]),
+        (0,  [0, 5, 7, 0, 0, 5, 7, 0],  [0, 5, 7, 0, 0, 5, 7, 0]),
+        (2,  [2, 7, 9, 2, 2, 7, 9, 2],  [2, 7, 9, 2, 2, 7, 9, 2]),
+        (9,  [9, 2, 4, 9, 9, 2, 4, 9],  [9, 2, 4, 9, 9, 2, 4, 9]),  # (9+5)%12=2, (9+7)%12=4
     ]
 
     all_ok = True

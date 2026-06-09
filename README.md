@@ -4,9 +4,11 @@ This project studies whether a frozen AR transformer can be steered to follow a
 modular arithmetic sequence rule by patching on cross-attention adapters guided
 by a Tracr-equivalent rule model (the Yin-Yang architecture).
 
-**The rule:** at position `i`, the token is `(x + OFFSETS[i % 4]) % 24`
+**The rule:** at position `i`, the token is `(x + OFFSETS[i % 4]) % 12`
 where `x` is the starting integer and `OFFSETS = [0, 5, 7, 0]`.
 Example for `x=2`: `2, 7, 9, 2, 2, 7, 9, 2, ...`
+
+Vocab is mod 12, matching the bass CP experiment for direct comparison.
 
 ---
 
@@ -43,10 +45,12 @@ RASP program — no JAX or Tracr dependency required.
 
 | Split | Starters | Description |
 |---|---|---|
-| Pretrain-only | {0, 1} | AR pretrain only, not finetuned |
-| Finetune-only | {6..15} | Finetuned only, not pretrained |
-| Both | {2, 3, 4, 5} | Pretrained and finetuned |
-| Neither | {17, 19, 20, 21} | Unseen — all individual tokens seen in training |
+| Pretrain-only | {5, 9} | AR pretrain only, not finetuned |
+| Finetune-only | {1, 2, 3, 4, 7, 10, 11} | Finetuned only, not pretrained |
+| Both | {0} | Pretrained and finetuned |
+| Neither | {6, 8} | Unseen — tokens covered by training sequences |
+
+Vocab is mod 12 (same as bass). Splits are identical to the bass CP experiment for direct comparison.
 
 ---
 
