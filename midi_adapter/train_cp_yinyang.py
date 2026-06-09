@@ -274,10 +274,11 @@ def main(args):
         print('WARNING: no base checkpoint found — training adapter from scratch.')
 
     adapter = CPYinyangTransformer(
-        base_model   = base,
-        adapter_rank = args.adapter_rank,
-        n_skip       = args.n_skip,
-        lora_rank    = args.lora_rank,
+        base_model    = base,
+        adapter_rank  = args.adapter_rank,
+        n_skip        = args.n_skip,
+        lora_rank     = args.lora_rank,
+        bidirectional = args.bidirectional,
     )
 
     if args.unfreeze_base:
@@ -419,6 +420,8 @@ def get_args():
                    help='LoRA rank for base model Q/V projections (0 = frozen base)')
     p.add_argument('--unfreeze_base',      action='store_true',
                    help='Unfreeze entire base model for joint base+adapter training (use with --pretrain_data when training from scratch)')
+    p.add_argument('--bidirectional',     action='store_true',
+                   help='No-input-to-rule-model variant: AR hidden states are projected to rule space via a learned linear instead of reading the key from the sequence')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)

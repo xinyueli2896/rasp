@@ -167,14 +167,16 @@ class CPYinyangTransformer(nn.Module):
     def __init__(
         self,
         base_model,
-        adapter_rank: int = 256,
-        n_skip:       int = 4,
-        lora_rank:    int = 0,
+        adapter_rank:  int  = 256,
+        n_skip:        int  = 4,
+        lora_rank:     int  = 0,
+        bidirectional: bool = False,
     ):
         super().__init__()
-        self.base      = base_model
-        self.n_skip    = n_skip
-        self.lora_rank = lora_rank
+        self.base          = base_model
+        self.n_skip        = n_skip
+        self.lora_rank     = lora_rank
+        self.bidirectional = bidirectional
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -192,7 +194,7 @@ class CPYinyangTransformer(nn.Module):
             f"n_global_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
 
-        # Frozen analytical rule model — zero trainable parameters
+        # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
         self.rule_model = BassTracrRuleModel()
 
         self.yinyang_attn = nn.ModuleList([
@@ -204,6 +206,17 @@ class CPYinyangTransformer(nn.Module):
             )
             for _ in range(n_adapters)
         ])
+
+        if bidirectional:
+            # Learned AR→rule projection (one per adapter layer).
+            # Replaces the TracR rule model: AR hidden states are projected to
+            # TRACR_D_MODEL space and used as rule_hidden, so the adapter learns
+            # to extract the rule signal from the base model's representations
+            # rather than reading pc[:, 0] from the input sequence.
+            self.ar_to_rule = nn.ModuleList([
+                nn.Linear(self.base.hidden_size, TRACR_D_MODEL)
+                for _ in range(n_adapters)
+            ])
 
     # ------------------------------------------------------------------
     # Training forward  (full sequence, layer-by-layer injection)
@@ -229,7 +242,7 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        rule_hidden = self._rule_hidden(x)   # (B, seq_len, 16)
+        rule_hidden = None if self.bidirectional else self._rule_hidden(x)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -242,7 +255,8 @@ class CPYinyangTransformer(nn.Module):
             h = layer(h, attention_mask=mask)[0]
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
-                h = h + self.yinyang_attn[adapter_idx](h, rule_hidden, sub_offset=0)
+                rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden
+                h = h + self.yinyang_attn[adapter_idx](h, rule_h, sub_offset=0)
 
         return base.local_decode(h, emb)
 
@@ -271,11 +285,14 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seed_len, _ = x.shape
 
-        # Rule model only needs the starting pitch class; build a constant sequence of
-        # length max_seq_len so rule_model.forward() can return the full hidden trajectory.
-        pc_0   = (x[:, 0, 1] % 128 % 12).clamp(0, 11)           # (B,) starting pitch class
-        dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)        # (B, max_seq_len)
-        _, rule_hidden = self.rule_model(dummy, return_hidden=True)  # (B, max_seq_len, 16)
+        # Standard mode: pre-compute rule_hidden from dummy constant-key sequence.
+        # Bidirectional mode: rule_hidden is computed on-the-fly from AR states each step.
+        if not self.bidirectional:
+            pc_0   = (x[:, 0, 1] % 128 % 12).clamp(0, 11)           # (B,) starting pitch class
+            dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)        # (B, max_seq_len)
+            _, rule_hidden = self.rule_model(dummy, return_hidden=True)  # (B, max_seq_len, 16)
+        else:
+            rule_hidden = None
 
         # Encode seed subbeats
         h_seed, _ = base.local_encode(x)
@@ -299,8 +316,12 @@ class CPYinyangTransformer(nn.Module):
                 # Inject adapter after every n_skip layers, modifying last position only
                 if (j + 1) % self.n_skip == 0:
                     adapter_idx = (j + 1) // self.n_skip - 1
+                    # Bidirectional: project the full AR sequence to rule space on-the-fly;
+                    # the cross-attention query (last position) can then attend to the full
+                    # AR-derived rule trajectory up to step i.
+                    rule_h = self.ar_to_rule[adapter_idx](h_out) if self.bidirectional else rule_hidden
                     correction = self.yinyang_attn[adapter_idx](
-                        h_out[:, -1:, :], rule_hidden, sub_offset=i
+                        h_out[:, -1:, :], rule_h, sub_offset=i
                     )
                     h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 
