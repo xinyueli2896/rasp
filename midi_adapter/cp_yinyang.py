@@ -6,9 +6,8 @@ Architecture
   BassTracrRuleModel  (models/bass_tracr_rule_model.py)
     Zero-parameter analytical model. Reads starting pitch class from the
     first beat of the sequence (x = pc[0]) and encodes:
-      hidden[t] = one-hot((x + OFFSETS[(t+1)%4]) % 12) + pos_encoding[(t+1)%4]
-    i.e. the NEXT pitch class (prediction target at t), with position dims also
-    shifted to t+1 for internal consistency.
+      hidden[t] = one-hot((x + OFFSETS[t%4]) % 12) + pos_encoding[t%4]
+    i.e. the CURRENT pitch class at position t.
     OFFSETS = [0, 5, 7, 0]  — same I-IV-V-I rule as the integer experiment.
     No chord tokens needed; the key is read directly from the generated sequence.
 
@@ -27,9 +26,9 @@ Architecture
 
     global_sampling(x, ...)
       Autoregressive sampling. Starting pitch class read from x[:, 0, 1].
-      rule_hidden[t] = embed(key + OFFSETS[(t+1)%4]) + pos[(t+1)%4] so the
-      adapter at step t naturally attends to rule_hidden[t] (same index) to read
-      the next-token prediction target directly.
+      rule_hidden[t] = embed(key + OFFSETS[t%4]) + pos[t%4]. The adapter learns
+      to attend rule_hidden[0] (= embed(key)) and uses query position encoding
+      to derive the next note — routing that generalises to unseen keys.
 """
 
 from __future__ import annotations
@@ -79,12 +78,12 @@ class BassRuleInputEncoder(nn.Module):
     learned embedding, keeping W_pos frozen.
 
     Standard analytical rule:
-        rule_hidden[t] = W_E[(key + OFFSETS[(t+1)%4]) % 12]  +  W_pos[(t+1)%4]
-                       = one_hot(next_pc)                     +  pos_embed   (16-dim)
+        rule_hidden[t] = W_E[(key + OFFSETS[t%4]) % 12]  +  W_pos[t%4]
+                       = one_hot(cur_pc)                  +  pos_embed   (16-dim)
 
     Encoder-injected:
-        rule_hidden[t] = encoder(next_pc)  +  W_pos[(t+1)%4]
-                         ^^^^^^^^^^^^^^^
+        rule_hidden[t] = encoder(cur_pc)  +  W_pos[t%4]
+                         ^^^^^^^^^^^^^^
                          learned dense embedding instead of one-hot
 
     The learned embedding can generalise to unseen keys because all 12 pitch
@@ -269,18 +268,18 @@ class CPYinyangTransformer(nn.Module):
     def _encoder_injected_rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Encoder-injected rule_hidden: learned embedding for each pitch class.
 
-        Reads key = pc[:, 0], computes next_pc[t] = (key + OFFSETS[(t+1)%4]) % 12,
-        then returns encoder(next_pc) + W_pos[(t+1)%4].  Both token and position
-        dims are consistently shifted to t+1, matching the analytical rule model.
+        Reads key = pc[:, 0], computes cur_pc[t] = (key + OFFSETS[t%4]) % 12,
+        then returns encoder(cur_pc) + W_pos[t%4].  Mirrors the analytical rule
+        model but with a learned dense embedding instead of one-hot.
         """
         B, T = x_proc.shape[0], x_proc.shape[1]
         pc_seq  = x_proc[:, :, 1] % 128 % 12               # (B, T)
         key     = pc_seq[:, 0]                              # (B,)
         t_idx   = torch.arange(T, device=x_proc.device)
-        offsets = self.rule_model._offsets[(t_idx + 1) % 4] # (T,)
-        next_pc = (key[:, None] + offsets[None, :]) % 12    # (B, T)
-        h       = self.rule_input_encoder(next_pc)           # (B, T, TRACR_D_MODEL)
-        pos_emb = self.rule_model.W_pos[(t_idx + 1) % 4]    # (T, TRACR_D_MODEL)
+        offsets = self.rule_model._offsets[t_idx % 4]       # (T,)
+        cur_pc  = (key[:, None] + offsets[None, :]) % 12    # (B, T)
+        h       = self.rule_input_encoder(cur_pc)            # (B, T, TRACR_D_MODEL)
+        pos_emb = self.rule_model.W_pos[t_idx % 4]          # (T, TRACR_D_MODEL)
         return h + pos_emb.unsqueeze(0)
 
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
@@ -289,8 +288,7 @@ class CPYinyangTransformer(nn.Module):
         x_proc : (B, T, subseq_len)  preprocessed CP tokens
           slot 1 = pitch + (dur+1)*128  →  pitch = slot1 % 128  →  pc = pitch % 12
         Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
-        hidden[t] encodes the NEXT pitch class: (key + OFFSETS[(t+1)%4]) % 12,
-        with position dims also at (t+1)%4 for consistency.
+        hidden[t] encodes the CURRENT pitch class: (key + OFFSETS[t%4]) % 12.
         """
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
@@ -357,10 +355,10 @@ class CPYinyangTransformer(nn.Module):
         pc_0 = (x[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,) starting pitch class
         if self.encoder_injected:
             t_idx   = torch.arange(max_seq_len, device=x.device)
-            offsets = self.rule_model._offsets[(t_idx + 1) % 4]        # (max_seq_len,)
-            next_pc = (pc_0[:, None] + offsets[None, :]) % 12          # (B, max_seq_len)
-            h_enc   = self.rule_input_encoder(next_pc)                  # (B, max_seq_len, 16)
-            pos_emb = self.rule_model.W_pos[(t_idx + 1) % 4]           # (max_seq_len, 16)
+            offsets = self.rule_model._offsets[t_idx % 4]               # (max_seq_len,)
+            cur_pc  = (pc_0[:, None] + offsets[None, :]) % 12           # (B, max_seq_len)
+            h_enc   = self.rule_input_encoder(cur_pc)                    # (B, max_seq_len, 16)
+            pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, 16)
             rule_hidden = h_enc + pos_emb.unsqueeze(0)
         elif not self.bidirectional:
             dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)          # (B, max_seq_len)

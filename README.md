@@ -155,10 +155,13 @@ Example for `key=0` (C): `C, F, G, C, C, F, G, C, ...`
 
 `models/bass_tracr_rule_model.py` — analytical, zero parameters.
 - `d_model = 12 + 4 = 16` (12 pitch-class dims + 4 period-4 position dims)
-- `rule_hidden[t]` encodes the **next** pitch class (prediction target at `t`):
-  token dims = `one_hot(key + OFFSETS[(t+1)%4])`, position dims = `one_hot((t+1)%4)`
-- Both dims consistently shifted to `t+1` so same-position cross-attention gives
-  the direct next-token signal — the natural match for the LM objective.
+- `rule_hidden[t]` encodes the **current** pitch class at `t`:
+  token dims = `one_hot(key + OFFSETS[t%4])`, position dims = `one_hot(t%4)`
+- CURRENT encoding is used because the causal mask blocks `rule_hidden[t+1]`.
+  The adapter learns to attend `rule_hidden[0]` (= `embed(key)`, always accessible)
+  and uses query position encoding to derive the next note — routing that
+  generalises to unseen keys. NEXT encoding causes a 0.25 accuracy collapse
+  where the model fixates on `rule_hidden[1]` (= `embed(key+7)`) for all positions.
 
 ### Adapter variants
 

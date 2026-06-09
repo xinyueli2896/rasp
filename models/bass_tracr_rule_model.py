@@ -12,14 +12,17 @@ Output: logits               (B, T, 12)
         hidden               (B, T, TRACR_D_MODEL=16)   if return_hidden=True
 
 Hidden state format:
-  dims  0-11 : one-hot of NEXT pitch class at position t  (key + OFFSETS[(t+1)%4])
-  dims 12-15 : one-hot of (t+1) % 4
+  dims  0-11 : one-hot of CURRENT pitch class at position t  (key + OFFSETS[t%4])
+  dims 12-15 : one-hot of t % 4
 
-Both token and position dims are consistently shifted to t+1, so rule_hidden[t]
-is a clean representation of the prediction target at position t. The
-cross-attention adapter can do same-position attention (query at t → key at t)
-to read the next-token embedding directly — the most natural match for the LM
-objective.
+CURRENT encoding is used (not NEXT) because the causal mask in
+CPYinyangCrossAttention blocks rule_hidden[t+1] from the query at t.
+With CURRENT encoding the adapter learns to attend rule_hidden[0] (always
+accessible, always = embed(key)) and uses the query's positional encoding to
+derive the next note — a purely positional routing that generalises to unseen
+keys. NEXT encoding causes a pathological local minimum where the model
+collapses to attending rule_hidden[1] (= embed(key+7)) for all positions,
+yielding 0.25 accuracy on unseen keys.
 
 No trainable parameters.
 """
@@ -91,16 +94,16 @@ class BassTracrRuleModel(nn.Module):
         device = idx.device
 
         t_idx  = torch.arange(T, device=device)
-        o      = self._offsets[(t_idx + 1) % N_POS]           # NEXT pitch class at t+1
+        o      = self._offsets[t_idx % N_POS]                  # CURRENT pitch class at t
         key    = idx[:, 0]                                     # starting pitch class
-        next_r = (key[:, None] + o[None, :]) % N_ROOTS        # (B, T) next pitch class
+        cur_r  = (key[:, None] + o[None, :]) % N_ROOTS        # (B, T) current pitch class
 
-        logits = F.one_hot(next_r, num_classes=N_ROOTS).float()
+        logits = F.one_hot(cur_r, num_classes=N_ROOTS).float()
 
         if return_hidden:
-            tok_next = self.W_E[next_r]                        # (B, T, 16) root dims
-            pos_emb  = self.W_pos[(t_idx + 1) % N_POS]        # (T, 16) pos dims — consistent NEXT
-            h_out    = tok_next + pos_emb.unsqueeze(0)         # (B, T, 16)
+            tok_cur = self.W_E[cur_r]                          # (B, T, 16) root dims
+            pos_emb = self.W_pos[t_idx % N_POS]               # (T, 16) pos dims
+            h_out   = tok_cur + pos_emb.unsqueeze(0)           # (B, T, 16)
             return logits, h_out
 
         return logits
@@ -117,12 +120,12 @@ if __name__ == '__main__':
     print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}')
 
     # key=0 (C): sequence = [0,5,7,0,0,5,7,0,...]
-    # NEXT pitch class at each position: [5,7,0,0, 5,7,0,0]
+    # CURRENT pitch class at each position: [0,5,7,0, 0,5,7,0]  (same as input)
     idx = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
     logits, hidden = model(idx, return_hidden=True)
     preds = logits.argmax(-1).squeeze().tolist()
     print(f'input  : {idx.squeeze().tolist()}')
     print(f'preds  : {preds}')
-    print(f'expect : [5, 7, 0, 0, 5, 7, 0, 0]  (next pitch class)')
+    print(f'expect : [0, 5, 7, 0, 0, 5, 7, 0]  (current pitch class)')
     print(f'hidden shape: {hidden.shape}')
-    print(f'All correct: {preds == [5, 7, 0, 0, 5, 7, 0, 0]}')
+    print(f'All correct: {preds == [0, 5, 7, 0, 0, 5, 7, 0]}')
