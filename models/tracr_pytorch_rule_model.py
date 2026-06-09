@@ -71,33 +71,43 @@ class TracrPyTorchRuleModel(nn.Module):
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         # idx: (B, T)
         # returns logits (B, T, VOCAB_SIZE) and optionally hidden (B, T, 16)
-        # hidden = h_out[q] = [e_{predicted_next[q]}, e_{q%4}]
-        # (only next-token embedding + position — unambiguous signal for cross-attention)
+        # hidden = h_out[q] = [e_{cur_token[q]}, e_{q%4}]
+        #
+        # CURRENT encoding: both token and position dims are at t, not t+1.
+        # The causal mask in YinyangCrossAttention blocks rule_hidden[t+1], so
+        # NEXT encoding creates a pathological local minimum where the adapter
+        # collapses to attending rule_hidden[1] (= embed(x+7)) for all positions,
+        # yielding 0.25 accuracy on unseen starters. With CURRENT encoding the
+        # adapter learns to attend rule_hidden[0] (= embed(starter x)) and uses
+        # query position encoding to derive the next token — routing that
+        # generalises to unseen starters.
         #
         # Hidden states are computed analytically (not via attention) so they
         # are correct for any T, including T < 4 during autoregressive generation.
         B, T   = idx.shape
         device = idx.device
 
-        # Compute predicted next tokens analytically
+        # Compute current tokens analytically
         t_idx  = torch.arange(T, device=device)
-        o      = self._offsets[(t_idx + 1) % 4]
+        o      = self._offsets[t_idx % 4]
         x      = idx[:, 0]
-        next_t = (x[:, None] + o[None, :]) % VOCAB_SIZE   # (B, T)
+        cur_t  = (x[:, None] + o[None, :]) % VOCAB_SIZE   # (B, T)
 
-        # Logits: exact one-hot of next token
+        # Logits: exact one-hot of next token (for LM training target)
+        o_next = self._offsets[(t_idx + 1) % 4]
+        next_t = (x[:, None] + o_next[None, :]) % VOCAB_SIZE   # (B, T)
         logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()
         logits = logits.detach().requires_grad_(True)
 
         if return_hidden:
-            # h_out[q] = [e_{predicted_next[q]}, e_{q%4}]
-            # Token subspace (dims 0-11): one-hot of predicted next token
-            tok_next = self.W_E[next_t]     # (B, T, 16) — e_{predicted_next[q]} in dims 0-11
+            # h_out[q] = [e_{cur_token[q]}, e_{q%4}]
+            # Token subspace (dims 0-11): one-hot of current token
+            tok_cur = self.W_E[cur_t]       # (B, T, 16) — e_{cur_token[q]} in dims 0-11
             # Position subspace (dims 12-15): one-hot of q % 4
             pos_idx = t_idx % 4
             pos_emb = self.W_pos[pos_idx]   # (T, 16) — e_{q%4} in dims 12-15
 
-            h_out = tok_next + pos_emb.unsqueeze(0)   # (B, T, 16)
+            h_out = tok_cur + pos_emb.unsqueeze(0)   # (B, T, 16)
             return logits, h_out
 
         return logits
@@ -114,7 +124,7 @@ if __name__ == "__main__":
     print(f"TRACR_D_MODEL = {model.TRACR_D_MODEL}")
 
     # vocab=12, OFFSETS=[0,5,7,0]: sequence for x=0 → [0,5,7,0,0,5,7,0,...]
-    # NEXT encoding: logits predict next token
+    # CURRENT encoding: hidden encodes current token; logits still predict next token
     tests = [
         (0,  [0, 5, 7, 0, 0, 5, 7, 0],  [5, 7, 0, 0, 5, 7, 0, 0]),
         (2,  [2, 7, 9, 2, 2, 7, 9, 2],  [7, 9, 2, 2, 7, 9, 2, 2]),
