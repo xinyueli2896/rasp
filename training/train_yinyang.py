@@ -85,7 +85,7 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
 
 def _save(model, path, has_lora, train_ar=False):
     state = {k: v for k, v in model.state_dict().items()
-             if k.startswith('yinyang_attn')}
+             if k.startswith('yinyang_attn') or k.startswith('rule_input_encoder')}
     if has_lora:
         for k, v in model.ar_model.state_dict().items():
             if 'lora_' in k:

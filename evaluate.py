@@ -101,20 +101,28 @@ def load_yinyang(label, ckpt_path, args, device):
                      if k in current and v.shape == current[k].shape}
     model.yinyang_attn.load_state_dict(yinyang_state, strict=False)
 
+    # Load rule_input_encoder if present (encoder_injected checkpoints)
+    enc_state = {k.removeprefix('rule_input_encoder.'): v
+                 for k, v in state.items() if k.startswith('rule_input_encoder.')}
+    if enc_state and hasattr(model, 'rule_input_encoder'):
+        model.rule_input_encoder.load_state_dict(enc_state, strict=False)
+
     ar_keys = {k: v for k, v in state.items()
                if k.startswith('ar_model.') and 'lora_' not in k}
+    has_enc = bool(enc_state)
+    enc_tag = ' + encoder' if has_enc else ''
     if has_lora:
         lora_state = {k.removeprefix('ar_model.'): v
                       for k, v in state.items() if k.startswith('ar_model.')}
         model.ar_model.load_state_dict(lora_state, strict=False)
         lora_keys = [k for k in lora_state if 'lora_' in k]
-        print(f"  {label:<12}: loaded yinyang_attn + LoRA (rank={lora_rank}, {len(lora_keys)} lora tensors) from {ckpt_path}")
+        print(f"  {label:<12}: loaded yinyang_attn + LoRA (rank={lora_rank}, {len(lora_keys)} lora tensors){enc_tag} from {ckpt_path}")
     elif ar_keys:
         ar_state = {k.removeprefix('ar_model.'): v for k, v in ar_keys.items()}
         model.ar_model.load_state_dict(ar_state)
-        print(f"  {label:<12}: loaded yinyang_attn + AR weights from {ckpt_path}")
+        print(f"  {label:<12}: loaded yinyang_attn + AR weights{enc_tag} from {ckpt_path}")
     else:
-        print(f"  {label:<12}: loaded yinyang_attn from {ckpt_path}")
+        print(f"  {label:<12}: loaded yinyang_attn{enc_tag} from {ckpt_path}")
 
     model.eval()
     return model
