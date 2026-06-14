@@ -122,14 +122,26 @@ class LearnedRuleInputEncoder(nn.Module):
         self,
         vocab_size:    int,
         rule_d_model:  int   = RULE_D_MODEL,
-        encoder_type:  str   = 'embedding',   # 'embedding' | 'transformer'
+        encoder_type:  str   = 'embedding',   # 'embedding' | 'transformer' | 'softmax'
         n_layers:      int   = 2,
         n_heads:       int   = 4,
         dropout:       float = 0.1,
     ):
         super().__init__()
         self.encoder_type = encoder_type
-        self.embedding    = nn.Embedding(vocab_size, rule_d_model)
+        self.vocab_size   = vocab_size
+        self.rule_d_model = rule_d_model
+
+        if encoder_type == 'softmax':
+            # Learns a soft token-to-token mapping. Output dims 0-(V-1) are a
+            # probability distribution over vocab; dims V-(d-1) are left as zeros
+            # so W_pos can fill in position information cleanly.
+            # Init to scaled identity so softmax ≈ one-hot at the start.
+            self.token_logits = nn.Embedding(vocab_size, vocab_size)
+            nn.init.eye_(self.token_logits.weight)
+            self.token_logits.weight.data *= 10.0
+        else:
+            self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
         if encoder_type == 'transformer':
             import warnings
@@ -146,11 +158,16 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type != 'embedding':
-            raise ValueError(f"encoder_type must be 'embedding' or 'transformer', got {encoder_type!r}")
+        elif encoder_type not in ('embedding', 'softmax'):
+            raise ValueError(f"encoder_type must be 'embedding', 'transformer', or 'softmax', got {encoder_type!r}")
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: (B, T)
+        if self.encoder_type == 'softmax':
+            probs = F.softmax(self.token_logits(tokens), dim=-1)       # (B, T, vocab_size)
+            pad   = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)                     # (B, T, rule_d_model)
         h = self.embedding(tokens)   # (B, T, rule_d_model)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
