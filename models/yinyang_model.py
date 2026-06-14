@@ -164,12 +164,10 @@ class LearnedRuleInputEncoder(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: (B, T)
         if self.encoder_type == 'softmax':
-            logits = self.token_logits(tokens)                         # (B, T, vocab_size)
-            # Straight-through: one-hot in forward, softmax gradient in backward
-            one_hot = F.gumbel_softmax(logits, tau=1.0, hard=True)    # (B, T, vocab_size)
-            pad     = torch.zeros(*one_hot.shape[:-1], self.rule_d_model - self.vocab_size,
-                                  device=tokens.device)
-            return torch.cat([one_hot, pad], dim=-1)                   # (B, T, rule_d_model)
+            probs = F.softmax(self.token_logits(tokens), dim=-1)       # (B, T, vocab_size)
+            pad   = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)                     # (B, T, rule_d_model)
         h = self.embedding(tokens)   # (B, T, rule_d_model)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
@@ -436,32 +434,22 @@ class YinyangModel(nn.Module):
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
         Encoder-injected pipeline:
-          starter → learned encoder → broadcast T times → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
+          tokens → learned encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
 
-        Only the starter token (idx[:, 0]) is fed to the encoder, repeated T times.
-        This matches autoregressive generation where only the starter is reliably
-        known — feeding the full sequence during training would give the attention
-        access to future ground-truth tokens (teacher-forcing mismatch), causing
-        the model to collapse to repeating the prompt at generation time.
-
-        With a uniform token input, the frozen attention attends to position 0
-        for all queries (only position with matching pos dim after W_Q shift is
-        (q+1)%4 — the one key at that cycle position), so:
-          rule_hidden[q] = encode(starter) + W_pos[q%4]
-        The adapter then learns: starter identity + query position → next token.
+        The encoder outputs a soft probability distribution over vocab (softmax),
+        which replaces the hard one-hot W_E lookup. The frozen attention then
+        routes each position's representation to the right query position.
         """
         B, T   = idx.shape
-        # Expand starter across all T positions so attention always finds a valid key
-        starter = idx[:, 0:1].expand(-1, T)                             # (B, T)
-        h_in   = self.rule_input_encoder(starter)                       # (B, T, d)
+        h_in   = self.rule_input_encoder(idx)                          # (B, T, d)
         pos    = torch.arange(T, device=idx.device) % 4
-        h_in   = h_in + self._W_pos[pos].unsqueeze(0)                   # (B, T, d)
+        h_in   = h_in + self._W_pos[pos].unsqueeze(0)                  # (B, T, d)
         Q      = h_in @ self._W_Q.t()
         K      = h_in @ self._W_K.t()
         V      = h_in @ self._W_V.t()
         scores = (Q @ K.transpose(-1, -2)) * 20.0
         attn   = F.softmax(scores, dim=-1)
-        rule_out = (attn @ V) @ self._W_O.t()                          # (B, T, d)
+        rule_out = (attn @ V) @ self._W_O.t()                         # (B, T, d)
         rule_out = rule_out + self._W_pos[pos].unsqueeze(0)
         return rule_out
 
