@@ -231,7 +231,7 @@ def get_args():
                    help='Replace W_E[tokens] with a learned encoder before the frozen '
                         'W_Q/K/V/O rule attention block.')
     p.add_argument('--encoder_type',       type=str, default='embedding',
-                   choices=['embedding', 'transformer'],
+                   choices=['embedding', 'transformer', 'softmax'],
                    help='embedding: plain token lookup (no context, better generalisation); '
                         'transformer: embedding + bidirectional transformer (risks overfitting).')
     p.add_argument('--encoder_n_layers',   type=int, default=2)
