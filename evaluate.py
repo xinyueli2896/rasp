@@ -396,12 +396,56 @@ def get_args():
                    help="Checkpoint stems to evaluate across seeds, e.g. --seed_stems yinyang_skip1 yinyang_skip2")
     p.add_argument("--adapter_stems",  type=str,  nargs="*", default=None,
                    help="Override adapter stems in main table (default: yinyang_skip1 yinyang_skip2 yinyang_skip4)")
+    p.add_argument("--inspect_encoder", action="store_true",
+                   help="Print learned token mapping table for encoder_injected checkpoints")
     return p.parse_args()
+
+
+def inspect_encoder(model, label: str):
+    """Print the learned token→token mapping for encoder_injected models."""
+    enc = getattr(model, 'rule_input_encoder', None)
+    if enc is None:
+        enc = getattr(getattr(model, 'yinyang_attn', None), 'rule_input_encoder', None)
+    if enc is None or not hasattr(enc, 'token_logits'):
+        print(f"  [{label}] no softmax encoder found")
+        return
+
+    with torch.no_grad():
+        W = enc.token_logits.weight.cpu()          # (V, V)
+        probs  = torch.softmax(W, dim=-1)           # (V, V)
+        mapped = probs.argmax(dim=-1).tolist()       # hard mapping: input → output token
+
+    V = W.shape[0]
+    print(f"\nEncoder mapping [{label}]")
+    print(f"  {'in':>4}  {'→out':>5}  {'conf':>6}  {'top-3 (token:prob)':}")
+    print(f"  {'-'*50}")
+    for i in range(V):
+        top3 = probs[i].topk(3)
+        top3_str = "  ".join(f"{idx.item()}:{p.item():.2f}"
+                              for idx, p in zip(top3.indices, top3.values))
+        conf = probs[i, mapped[i]].item()
+        print(f"  {i:>4}  {mapped[i]:>5}  {conf:>6.3f}  {top3_str}")
 
 
 if __name__ == "__main__":
     args = get_args()
     run_evaluation(args)
+    if args.inspect_encoder:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        default_stems = ["yinyang_skip1", "yinyang_skip2", "yinyang_skip4"]
+        stems = args.adapter_stems if args.adapter_stems else default_stems
+        print("\n" + "=" * 60)
+        print("ENCODER INSPECTION")
+        print("=" * 60)
+        for stem in stems:
+            seed_paths = sorted(glob.glob(os.path.join(args.ckpt_dir, f"{stem}_seed*.pt")))
+            paths = seed_paths if seed_paths else [os.path.join(args.ckpt_dir, f"{stem}.pt")]
+            for i, path in enumerate(paths):
+                if not os.path.exists(path):
+                    continue
+                label = f"{stem}/seed{i}" if seed_paths else stem
+                mdl = load_yinyang(label, path, args, device)
+                inspect_encoder(mdl, label)
     for stem in args.seed_stems:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print()
