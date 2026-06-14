@@ -79,19 +79,24 @@ def load_yinyang(label, ckpt_path, args, device):
     n_skip        = args.n_layers // max(n_adapters, 1)
     # Detect bidirectional: only BidirectionalYinyangAttention has ar_to_rule
     is_bidir      = any('ar_to_rule' in k for k in state)
+    # Detect encoder_injected and encoder_type from saved keys
+    is_enc_inj    = any(k.startswith('rule_input_encoder.') for k in state)
+    enc_type      = 'softmax' if any('token_logits' in k for k in state) else 'embedding'
 
     model = build_yinyang_model(
-        ar_ckpt_path   = args.ar_ckpt,
-        max_seq_len    = args.n_cycles * 4 + 10,
-        d_model        = args.d_model,
-        n_layers       = args.n_layers,
-        n_heads        = args.n_heads,
-        n_skip         = n_skip,
-        use_lora       = has_lora,
-        lora_rank      = lora_rank,
-        force_fallback = args.force_fallback,
-        device         = str(device),
-        bidirectional  = is_bidir,
+        ar_ckpt_path     = args.ar_ckpt,
+        max_seq_len      = args.n_cycles * 4 + 10,
+        d_model          = args.d_model,
+        n_layers         = args.n_layers,
+        n_heads          = args.n_heads,
+        n_skip           = n_skip,
+        use_lora         = has_lora,
+        lora_rank        = lora_rank,
+        force_fallback   = args.force_fallback,
+        device           = str(device),
+        bidirectional    = is_bidir,
+        encoder_injected = is_enc_inj,
+        encoder_type     = enc_type,
     )
 
     yinyang_state = {k.removeprefix('yinyang_attn.'): v
