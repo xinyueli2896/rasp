@@ -434,11 +434,11 @@ class YinyangModel(nn.Module):
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
         Encoder-injected pipeline:
-          tokens → learned encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
+          tokens → learned encoder → +W_pos[pos%4] → causal frozen W_Q/K/V/O → rule_hidden
 
-        The encoder outputs a soft probability distribution over vocab (softmax),
-        which replaces the hard one-hot W_E lookup. The frozen attention then
-        routes each position's representation to the right query position.
+        W_Q routes query q to key (q-1)%4 (causal: always a past position).
+        A causal mask enforces no future token leakage.
+        rule_hidden[q] = encode(token[q]) + W_pos[q%4]  (CURRENT encoding)
         """
         B, T   = idx.shape
         h_in   = self.rule_input_encoder(idx)                          # (B, T, d)
@@ -448,6 +448,9 @@ class YinyangModel(nn.Module):
         K      = h_in @ self._W_K.t()
         V      = h_in @ self._W_V.t()
         scores = (Q @ K.transpose(-1, -2)) * 20.0
+        # Causal mask: position q can only attend to k <= q
+        causal = torch.triu(torch.ones(T, T, device=idx.device), diagonal=1).bool()
+        scores = scores.masked_fill(causal.unsqueeze(0), float('-inf'))
         attn   = F.softmax(scores, dim=-1)
         rule_out = (attn @ V) @ self._W_O.t()                         # (B, T, d)
         rule_out = rule_out + self._W_pos[pos].unsqueeze(0)
