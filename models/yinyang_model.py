@@ -164,10 +164,12 @@ class LearnedRuleInputEncoder(nn.Module):
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         # tokens: (B, T)
         if self.encoder_type == 'softmax':
-            probs = F.softmax(self.token_logits(tokens), dim=-1)       # (B, T, vocab_size)
-            pad   = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
-                                device=tokens.device)
-            return torch.cat([probs, pad], dim=-1)                     # (B, T, rule_d_model)
+            logits = self.token_logits(tokens)                         # (B, T, vocab_size)
+            # Straight-through: one-hot in forward, softmax gradient in backward
+            one_hot = F.gumbel_softmax(logits, tau=1.0, hard=True)    # (B, T, vocab_size)
+            pad     = torch.zeros(*one_hot.shape[:-1], self.rule_d_model - self.vocab_size,
+                                  device=tokens.device)
+            return torch.cat([one_hot, pad], dim=-1)                   # (B, T, rule_d_model)
         h = self.embedding(tokens)   # (B, T, rule_d_model)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
