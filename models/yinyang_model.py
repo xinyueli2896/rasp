@@ -470,18 +470,34 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Position-aware causal NEXT encoding — consistent with non-encoder-injected:
-          rule_hidden[q] = encoder(token[q], q%4) + W_pos[(q+1)%4]
+        Soft embedding path: encoder(token, pos) → probs → probs @ W_E + W_pos[q%4]
+        → frozen causal W_Q/K/V/O self-attention → rule_hidden.
 
-        The position-aware encoder (4×V×V table) learns the position-dependent
-        token → next_token mapping causally from (token[q], q%4) alone.
-        No W_Q/K/V/O routing needed; no future token access.
+        The encoder only needs to learn identity (token t → one_hot(t)).
+        The rule model's attention handles next-token reasoning — the same
+        mechanism that makes the analytic rule model work.
         """
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
-        h_in = self.rule_input_encoder(idx, positions=pos)             # (B, T, d)
-        pos_next = (pos + 1) % 4
-        return h_in + self._W_pos[pos_next].unsqueeze(0)              # NEXT encoding
+
+        # 1. Encoder → soft token distribution
+        enc_out   = self.rule_input_encoder(idx, positions=pos)   # (B, T, RULE_D_MODEL)
+        tok_probs = enc_out[:, :, :VOCAB_SIZE]                     # (B, T, V)
+
+        # 2. Soft W_E lookup + positional encoding (same as hard rule model, but soft)
+        soft_h = tok_probs @ self._W_E + self._W_pos[pos % 4].unsqueeze(0)  # (B, T, d)
+
+        # 3. Frozen causal self-attention (W_Q, W_K, W_V, W_O)
+        Q      = soft_h @ self._W_Q
+        K      = soft_h @ self._W_K
+        V      = soft_h @ self._W_V
+        scale  = self.rule_model._tracr.attn_scale
+        scores = (Q @ K.transpose(-2, -1)) * scale
+        causal = torch.ones(T, T, device=idx.device).tril().bool()
+        scores = scores.masked_fill(~causal, float('-inf'))
+        # nan_to_num: first 3 positions have no valid causal key → all -inf → NaN → 0
+        attn   = F.softmax(scores, dim=-1).nan_to_num(nan=0.0)
+        return (attn @ V) @ self._W_O
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
@@ -503,8 +519,10 @@ class YinyangModel(nn.Module):
     def get_encoder_logits(self, idx: torch.Tensor) -> torch.Tensor | None:
         """Pre-softmax logits (B, T, V) from the learned encoder for auxiliary supervision.
 
-        At position q, the encoder should predict next_token[q], so auxiliary CE loss
-        against target[q] directly teaches the cyclic shift rule.
+        The encoder feeds into W_E (soft lookup), so it should learn identity:
+        token t → one_hot(t). Auxiliary CE loss should be against idx (current tokens),
+        not target (next tokens). Identity is trivial to learn and generalizes to unseen
+        token values because one-hot inputs are orthogonal.
         Returns None for encoder types without vocab-space logits.
         """
         if not (self.encoder_injected and hasattr(self, 'rule_input_encoder')):

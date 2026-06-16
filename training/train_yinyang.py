@@ -49,8 +49,10 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
             if enc_loss_weight > 0:
                 enc_logits = model.get_encoder_logits(inp)
                 if enc_logits is not None:
+                    # Supervise encoder to learn identity: token t → one_hot(t).
+                    # The rule model's W_Q/K/V/O attention handles next-token reasoning.
                     loss = loss + enc_loss_weight * criterion(
-                        enc_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)
+                        enc_logits.reshape(-1, VOCAB_SIZE), inp.reshape(-1)
                     )
 
             optimizer.zero_grad()
