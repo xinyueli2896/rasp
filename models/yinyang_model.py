@@ -106,23 +106,23 @@ class LearnedRuleInputEncoder(nn.Module):
     Replaces W_E[tokens] (the hard one-hot token embedding) as the input to
     the rule model's frozen attention block.
 
-    Pipeline:
-        tokens → this encoder → +W_pos[pos%4] → frozen W_Q/K/V/O → rule_hidden
-
-    encoder_type='embedding' : plain token embedding lookup (no context).
-                               Each token value gets one fixed representation
-                               regardless of surrounding context — forces
-                               token-level generalization.
+    encoder_type='embedding'  : plain token embedding lookup (no context).
     encoder_type='transformer': embedding + bidirectional TransformerEncoder.
-                               Can exploit sequence context but risks learning
-                               seen-starter shortcuts that don't generalise.
+    encoder_type='softmax'    : position-separate 4×V×V tables. Cannot generalise
+                                to token values unseen at a given position class.
+    encoder_type='mlp'        : shared token_embed + shared pos_embed + shared
+                                out_proj. Cross-position parameter sharing lets the
+                                model generalise to unseen (token, pos) pairs and
+                                extends naturally to other tasks: swap token_embed
+                                for any modality-specific encoder (CNN, transformer,
+                                etc.) while keeping pos_embed + out_proj fixed.
     """
 
     def __init__(
         self,
         vocab_size:    int,
         rule_d_model:  int   = RULE_D_MODEL,
-        encoder_type:  str   = 'embedding',   # 'embedding' | 'transformer' | 'softmax'
+        encoder_type:  str   = 'embedding',   # 'embedding'|'transformer'|'softmax'|'mlp'
         n_layers:      int   = 2,
         n_heads:       int   = 4,
         dropout:       float = 0.1,
@@ -133,14 +133,23 @@ class LearnedRuleInputEncoder(nn.Module):
         self.rule_d_model = rule_d_model
 
         if encoder_type == 'softmax':
-            # Position-aware: 4 separate V×V logit tables (one per pos%4 class).
-            # encoder(token, pos%4) → next_token probability distribution.
-            # Initialized to scaled identity so softmax ≈ one-hot(current_token);
-            # training shifts each table to the correct position-dependent permutation.
-            # Output dims 0-(V-1) are probs; dims V-(d-1) are zeros (W_pos fills them).
+            # Position-separate: 4 independent V×V logit tables.
             self.token_logits = nn.Parameter(
                 torch.eye(vocab_size).unsqueeze(0).expand(4, -1, -1).clone() * 10.0
             )
+        elif encoder_type == 'mlp':
+            # Shared backbone: token_embed + pos_embed → out_proj → V-dim probs.
+            # token_embed is shared across position classes so that seeing token t
+            # at any position updates the same weights, enabling cross-position
+            # generalisation to unseen (token, pos) combinations.
+            # For other tasks: replace token_embed with any modality encoder.
+            self.token_embed = nn.Embedding(vocab_size, vocab_size)
+            self.pos_embed   = nn.Embedding(4, vocab_size)
+            self.out_proj    = nn.Linear(vocab_size, vocab_size)
+            nn.init.eye_(self.token_embed.weight)
+            nn.init.zeros_(self.pos_embed.weight)
+            nn.init.eye_(self.out_proj.weight)
+            nn.init.zeros_(self.out_proj.bias)
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -159,25 +168,39 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type not in ('embedding', 'softmax'):
-            raise ValueError(f"encoder_type must be 'embedding', 'transformer', or 'softmax', got {encoder_type!r}")
+        elif encoder_type not in ('embedding', 'softmax', 'mlp'):
+            raise ValueError(
+                f"encoder_type must be 'embedding', 'transformer', 'softmax', or 'mlp', "
+                f"got {encoder_type!r}"
+            )
 
     def forward(self, tokens: torch.Tensor,
                 positions: torch.Tensor | None = None) -> torch.Tensor:
-        # tokens: (B, T), positions: (T,) sequence indices (optional, used by softmax encoder)
+        # tokens: (B, T), positions: (T,) sequence indices
         if self.encoder_type == 'softmax':
             B, T = tokens.shape
             if positions is not None:
-                pos_class = (positions % 4).long()               # (T,)
-                p = pos_class.unsqueeze(0).expand(B, -1)         # (B, T)
-                logits = self.token_logits[p, tokens]             # (B, T, V)
+                pos_class = (positions % 4).long()
+                p = pos_class.unsqueeze(0).expand(B, -1)
+                logits = self.token_logits[p, tokens]
             else:
-                logits = self.token_logits[0][tokens]             # fallback: use pos=0 table
+                logits = self.token_logits[0][tokens]
             probs = F.softmax(logits, dim=-1)
             pad   = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                 device=tokens.device)
-            return torch.cat([probs, pad], dim=-1)               # (B, T, rule_d_model)
-        h = self.embedding(tokens)   # (B, T, rule_d_model)
+            return torch.cat([probs, pad], dim=-1)
+
+        if self.encoder_type == 'mlp':
+            h = self.token_embed(tokens)                          # (B, T, V)
+            if positions is not None:
+                h = h + self.pos_embed((positions % 4).long())   # (B, T, V)
+            logits = self.out_proj(h)                             # (B, T, V)
+            probs  = F.softmax(logits, dim=-1)
+            pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                 device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)
+
+        h = self.embedding(tokens)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
         return h
@@ -391,8 +414,7 @@ class YinyangModel(nn.Module):
             # Initialize embedding to W_E so the pipeline is analytically correct
             # from epoch 0. Training refines rather than re-discovers the solution.
             with torch.no_grad():
-                if encoder_type == 'softmax':
-                    # token_logits is (V, V); scaled identity → softmax ≈ one-hot ≈ W_E
+                if encoder_type in ('softmax', 'mlp'):
                     pass  # already initialized in LearnedRuleInputEncoder.__init__
                 else:
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)

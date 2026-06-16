@@ -231,9 +231,10 @@ def get_args():
                    help='Replace W_E[tokens] with a learned encoder before the frozen '
                         'W_Q/K/V/O rule attention block.')
     p.add_argument('--encoder_type',       type=str, default='embedding',
-                   choices=['embedding', 'transformer', 'softmax'],
-                   help='embedding: plain token lookup (no context, better generalisation); '
-                        'transformer: embedding + bidirectional transformer (risks overfitting).')
+                   choices=['embedding', 'transformer', 'softmax', 'mlp'],
+                   help='embedding: plain token lookup; transformer: embedding + bidir transformer; '
+                        'softmax: position-separate 4xVxV tables (does not generalise); '
+                        'mlp: shared token_embed + pos_embed + out_proj (generalises across positions).')
     p.add_argument('--encoder_n_layers',   type=int, default=2)
     p.add_argument('--encoder_n_heads',    type=int, default=4)
     p.add_argument('--bidirectional',      action='store_true', default=False,

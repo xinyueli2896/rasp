@@ -81,7 +81,12 @@ def load_yinyang(label, ckpt_path, args, device):
     is_bidir      = any('ar_to_rule' in k for k in state)
     # Detect encoder_injected and encoder_type from saved keys
     is_enc_inj    = any(k.startswith('rule_input_encoder.') for k in state)
-    enc_type      = 'softmax' if any('token_logits' in k for k in state) else 'embedding'
+    if any('token_logits' in k for k in state):
+        enc_type = 'softmax'
+    elif any('token_embed' in k and 'rule_input_encoder' in k for k in state):
+        enc_type = 'mlp'
+    else:
+        enc_type = 'embedding'
 
     model = build_yinyang_model(
         ar_ckpt_path     = args.ar_ckpt,
@@ -420,20 +425,32 @@ def get_args():
 def inspect_encoder(model, label: str):
     """Print the learned token→token mapping for encoder_injected models."""
     enc = getattr(model, 'rule_input_encoder', None)
-    if enc is None or not hasattr(enc, 'token_logits'):
-        print(f"  [{label}] no softmax encoder found")
+    if enc is None:
+        print(f"  [{label}] no encoder found")
         return
 
     with torch.no_grad():
-        W = enc.token_logits.cpu() if isinstance(enc.token_logits, torch.Tensor) \
-            else enc.token_logits.weight.cpu()
-
-    if W.dim() == 2:
-        # Legacy: position-agnostic (V, V)
-        _print_encoder_table(W.unsqueeze(0), label, pos_names=["(all)"])
-    else:
-        # Position-aware: (4, V, V)
-        _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        if hasattr(enc, 'token_logits'):
+            W = enc.token_logits.cpu() if isinstance(enc.token_logits, torch.Tensor) \
+                else enc.token_logits.weight.cpu()
+            if W.dim() == 2:
+                _print_encoder_table(W.unsqueeze(0), label, pos_names=["(all)"])
+            else:
+                _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        elif hasattr(enc, 'token_embed') and hasattr(enc, 'pos_embed'):
+            # mlp encoder: compute effective mapping for each pos class
+            V = enc.vocab_size
+            tokens = torch.arange(V).unsqueeze(0)           # (1, V)
+            tables = []
+            for p in range(4):
+                pos = torch.full((V,), p, dtype=torch.long)
+                h   = enc.token_embed(tokens) + enc.pos_embed(pos.unsqueeze(0))
+                logits = enc.out_proj(h)                     # (1, V, V)
+                tables.append(logits.squeeze(0))
+            W = torch.stack(tables, dim=0)                   # (4, V, V)
+            _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        else:
+            print(f"  [{label}] encoder type not inspectable")
 
 
 def _print_encoder_table(W: torch.Tensor, label: str, pos_names: list):
