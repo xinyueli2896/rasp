@@ -111,16 +111,22 @@ class LearnedRuleInputEncoder(nn.Module):
     encoder_type='softmax'    : position-separate 4×V×V tables. Cannot generalise
                                 to token values unseen at a given position class.
     encoder_type='mlp'        : concat(one_hot(token), one_hot(pos%4)) → fc1 →
-                                ReLU → fc2 → softmax. Nonlinear position-token
-                                interaction enables learning position-dependent
-                                cyclic shifts. Generalises across position classes.
+                                ReLU → fc2 → softmax. Memorises training pairs;
+                                does NOT generalise to unseen (token, pos_class) pairs.
+    encoder_type='additive'   : logits = W_tok[token] + W_pos[pos_class].
+                                Forces factorised computation: W_tok learns per-token
+                                direction, W_pos learns per-pos-class shift.
+                                All 12 token values and all 4 pos_classes are seen
+                                during adapter training (at different combinations),
+                                so W_tok and W_pos are fully trained. Their sum
+                                generalises to unseen (token, pos_class) pairs.
     """
 
     def __init__(
         self,
         vocab_size:    int,
         rule_d_model:  int   = RULE_D_MODEL,
-        encoder_type:  str   = 'embedding',   # 'embedding'|'transformer'|'softmax'|'mlp'
+        encoder_type:  str   = 'embedding',   # 'embedding'|'transformer'|'softmax'|'mlp'|'additive'
         n_layers:      int   = 2,
         n_heads:       int   = 4,
         dropout:       float = 0.1,
@@ -137,10 +143,6 @@ class LearnedRuleInputEncoder(nn.Module):
             )
         elif encoder_type == 'mlp':
             # concat(one_hot(token), one_hot(pos%4)) → fc1 → ReLU → fc2 → V-dim probs.
-            # Concatenation + nonlinearity lets position MODULATE the token mapping,
-            # so the network can learn the position-dependent cyclic shift rule.
-            # 128 hidden units: large enough to represent 4 independent permutation
-            # matrices (one per position class) without interference.
             hidden = 128
             self.mlp_fc1 = nn.Linear(vocab_size + 4, hidden)
             self.mlp_fc2 = nn.Linear(hidden, vocab_size)
@@ -148,6 +150,16 @@ class LearnedRuleInputEncoder(nn.Module):
             nn.init.zeros_(self.mlp_fc1.bias)
             nn.init.xavier_uniform_(self.mlp_fc2.weight)
             nn.init.zeros_(self.mlp_fc2.bias)
+        elif encoder_type == 'additive':
+            # Additive factorisation: logits(token, pos) = W_tok[token] + W_pos[pos_class]
+            # W_tok: (V, V) — trained for all 12 token values (each appears at some pos_class)
+            # W_pos: (4, V) — trained for all 4 pos_classes (each appears with many tokens)
+            # Sum generalises to any (token, pos_class) combination, including unseen ones
+            # from test starters, because token and pos_class effects are learned independently.
+            self.W_tok = nn.Parameter(torch.zeros(vocab_size, vocab_size))
+            self.W_pos = nn.Parameter(torch.zeros(4, vocab_size))
+            nn.init.normal_(self.W_tok, std=0.01)
+            nn.init.normal_(self.W_pos, std=0.01)
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -166,9 +178,9 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type not in ('embedding', 'softmax', 'mlp'):
+        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive'):
             raise ValueError(
-                f"encoder_type must be 'embedding', 'transformer', 'softmax', or 'mlp', "
+                f"encoder_type must be 'embedding', 'transformer', 'softmax', 'mlp', or 'additive', "
                 f"got {encoder_type!r}"
             )
 
@@ -200,6 +212,20 @@ class LearnedRuleInputEncoder(nn.Module):
             x      = torch.cat([tok_oh, pos_oh], dim=-1)                     # (B, T, V+4)
             h      = F.relu(self.mlp_fc1(x))                                 # (B, T, 2V)
             logits = self.mlp_fc2(h)                                          # (B, T, V)
+            probs  = F.softmax(logits, dim=-1)
+            pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                 device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)
+
+        if self.encoder_type == 'additive':
+            B, T = tokens.shape
+            if positions is not None:
+                pos_class = (positions % 4).long()                            # (T,)
+            else:
+                pos_class = torch.zeros(T, dtype=torch.long, device=tokens.device)
+            tok_logits = self.W_tok[tokens]                                   # (B, T, V)
+            pos_logits = self.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1) # (B, T, V)
+            logits = tok_logits + pos_logits                                  # (B, T, V)
             probs  = F.softmax(logits, dim=-1)
             pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                  device=tokens.device)
@@ -523,6 +549,11 @@ class YinyangModel(nn.Module):
             pos_class = (pos % 4).long()
             p         = pos_class.unsqueeze(0).expand(B, -1)
             return enc.token_logits[p, idx]                       # (B, T, V) pre-softmax
+        elif enc.encoder_type == 'additive':
+            pos_class  = (pos % 4).long()
+            tok_logits = enc.W_tok[idx]                           # (B, T, V)
+            pos_logits = enc.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1)  # (B, T, V)
+            return tok_logits + pos_logits                        # (B, T, V) pre-softmax
         return None
 
     @torch.no_grad()

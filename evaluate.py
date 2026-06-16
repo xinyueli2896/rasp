@@ -85,6 +85,8 @@ def load_yinyang(label, ckpt_path, args, device):
         enc_type = 'softmax'
     elif any('mlp_fc1' in k for k in state):
         enc_type = 'mlp'
+    elif any('W_tok' in k for k in state):
+        enc_type = 'additive'
     else:
         enc_type = 'embedding'
 
@@ -438,20 +440,27 @@ def inspect_encoder(model, label: str):
             else:
                 _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
         elif hasattr(enc, 'mlp_fc1') and hasattr(enc, 'mlp_fc2'):
-            # mlp encoder: compute effective mapping for each pos class
             import torch.nn.functional as F
             V = enc.vocab_size
-            tokens = torch.arange(V)                                  # (V,)
-            tok_oh = F.one_hot(tokens, num_classes=V).float()         # (V, V)
+            tokens = torch.arange(V)
+            tok_oh = F.one_hot(tokens, num_classes=V).float()
             tables = []
             for p in range(4):
-                pos_oh = F.one_hot(torch.tensor([p]), num_classes=4).float()  # (1, 4)
-                pos_oh = pos_oh.expand(V, -1)                                 # (V, 4)
-                x      = torch.cat([tok_oh, pos_oh], dim=-1)                  # (V, V+4)
-                h      = F.relu(enc.mlp_fc1(x))                               # (V, 2V)
-                logits = enc.mlp_fc2(h)                                        # (V, V)
+                pos_oh = F.one_hot(torch.tensor([p]), num_classes=4).float().expand(V, -1)
+                x      = torch.cat([tok_oh, pos_oh], dim=-1)
+                logits = enc.mlp_fc2(F.relu(enc.mlp_fc1(x)))
                 tables.append(logits)
-            W = torch.stack(tables, dim=0)                             # (4, V, V)
+            W = torch.stack(tables, dim=0)
+            _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        elif hasattr(enc, 'W_tok') and hasattr(enc, 'W_pos'):
+            # additive: logits = W_tok[token] + W_pos[pos_class]
+            V = enc.vocab_size
+            tokens = torch.arange(V)
+            tables = []
+            for p in range(4):
+                logits = enc.W_tok[tokens] + enc.W_pos[p].unsqueeze(0)  # (V, V)
+                tables.append(logits)
+            W = torch.stack(tables, dim=0)
             _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
         else:
             print(f"  [{label}] encoder type not inspectable")
