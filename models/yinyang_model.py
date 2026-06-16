@@ -151,15 +151,31 @@ class LearnedRuleInputEncoder(nn.Module):
             nn.init.xavier_uniform_(self.mlp_fc2.weight)
             nn.init.zeros_(self.mlp_fc2.bias)
         elif encoder_type == 'additive':
-            # Additive factorisation: logits(token, pos) = W_tok[token] + W_pos[pos_class]
-            # W_tok: (V, V) — trained for all 12 token values (each appears at some pos_class)
-            # W_pos: (4, V) — trained for all 4 pos_classes (each appears with many tokens)
-            # Sum generalises to any (token, pos_class) combination, including unseen ones
-            # from test starters, because token and pos_class effects are learned independently.
             self.W_tok = nn.Parameter(torch.zeros(vocab_size, vocab_size))
             self.W_pos = nn.Parameter(torch.zeros(4, vocab_size))
             nn.init.normal_(self.W_tok, std=0.01)
             nn.init.normal_(self.W_pos, std=0.01)
+        elif encoder_type == 'fourier':
+            # Fourier-rotation encoder: cyclic shift IS a rotation in Fourier space.
+            # logits = (R[pos_class] @ fourier(token)) · fourier(t') for each t'
+            # R[p] ∈ R^(V×V) is a learned rotation matrix per pos_class.
+            # KEY: R[p] is token-independent, so it generalises to ANY token once
+            # trained — even tokens unseen at pos_class p in training.
+            # All V=12 token values appear in training at SOME pos_class, so fourier(t)
+            # is meaningful for every t. All 4 pos_classes appear in training, so R[p]
+            # is fully learned for every p.
+            import math
+            V = vocab_size
+            t_idx = torch.arange(V).float()
+            cols  = [torch.ones(V)]   # DC (k=0)
+            for k in range(1, V // 2):
+                cols.append(torch.cos(2 * math.pi * k * t_idx / V))
+                cols.append(torch.sin(2 * math.pi * k * t_idx / V))
+            cols.append(torch.cos(math.pi * t_idx))  # Nyquist (k=V/2)
+            fourier_feats = torch.stack(cols, dim=1)  # (V, V)
+            self.register_buffer('fourier_feats', fourier_feats)
+            # Init to identity: no rotation at start, training learns the right shift
+            self.R = nn.Parameter(torch.eye(V).unsqueeze(0).expand(4, -1, -1).clone())
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -178,10 +194,10 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive'):
+        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive', 'fourier'):
             raise ValueError(
-                f"encoder_type must be 'embedding', 'transformer', 'softmax', 'mlp', or 'additive', "
-                f"got {encoder_type!r}"
+                f"encoder_type must be 'embedding', 'transformer', 'softmax', 'mlp', 'additive', "
+                f"or 'fourier', got {encoder_type!r}"
             )
 
     def forward(self, tokens: torch.Tensor,
@@ -220,12 +236,27 @@ class LearnedRuleInputEncoder(nn.Module):
         if self.encoder_type == 'additive':
             B, T = tokens.shape
             if positions is not None:
-                pos_class = (positions % 4).long()                            # (T,)
+                pos_class = (positions % 4).long()
             else:
                 pos_class = torch.zeros(T, dtype=torch.long, device=tokens.device)
-            tok_logits = self.W_tok[tokens]                                   # (B, T, V)
-            pos_logits = self.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1) # (B, T, V)
-            logits = tok_logits + pos_logits                                  # (B, T, V)
+            tok_logits = self.W_tok[tokens]
+            pos_logits = self.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1)
+            logits = tok_logits + pos_logits
+            probs  = F.softmax(logits, dim=-1)
+            pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                 device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)
+
+        if self.encoder_type == 'fourier':
+            B, T = tokens.shape
+            if positions is not None:
+                pos_class = (positions % 4).long()
+            else:
+                pos_class = torch.zeros(T, dtype=torch.long, device=tokens.device)
+            phi   = self.fourier_feats[tokens]                                # (B, T, V)
+            R_p   = self.R[pos_class]                                         # (T, V, V)
+            v     = torch.einsum('bti,tij->btj', phi, R_p)                   # (B, T, V)
+            logits = v @ self.fourier_feats.t()                               # (B, T, V)
             probs  = F.softmax(logits, dim=-1)
             pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                  device=tokens.device)
@@ -445,7 +476,7 @@ class YinyangModel(nn.Module):
             # Initialize embedding to W_E so the pipeline is analytically correct
             # from epoch 0. Training refines rather than re-discovers the solution.
             with torch.no_grad():
-                if encoder_type not in ('softmax', 'mlp', 'additive'):
+                if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier'):
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
         assert n_layers % n_skip == 0, \
@@ -549,9 +580,15 @@ class YinyangModel(nn.Module):
             return enc.token_logits[p, idx]                       # (B, T, V) pre-softmax
         elif enc.encoder_type == 'additive':
             pos_class  = (pos % 4).long()
-            tok_logits = enc.W_tok[idx]                           # (B, T, V)
-            pos_logits = enc.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1)  # (B, T, V)
-            return tok_logits + pos_logits                        # (B, T, V) pre-softmax
+            tok_logits = enc.W_tok[idx]
+            pos_logits = enc.W_pos[pos_class].unsqueeze(0).expand(B, -1, -1)
+            return tok_logits + pos_logits
+        elif enc.encoder_type == 'fourier':
+            pos_class = (pos % 4).long()
+            phi  = enc.fourier_feats[idx]                         # (B, T, V)
+            R_p  = enc.R[pos_class]                               # (T, V, V)
+            v    = torch.einsum('bti,tij->btj', phi, R_p)        # (B, T, V)
+            return v @ enc.fourier_feats.t()                      # (B, T, V) pre-softmax
         return None
 
     @torch.no_grad()

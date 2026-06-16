@@ -87,6 +87,8 @@ def load_yinyang(label, ckpt_path, args, device):
         enc_type = 'mlp'
     elif any('W_tok' in k for k in state):
         enc_type = 'additive'
+    elif any('.R' in k and 'rule_input_encoder' in k for k in state):
+        enc_type = 'fourier'
     else:
         enc_type = 'embedding'
 
