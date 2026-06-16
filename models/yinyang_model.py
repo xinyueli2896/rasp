@@ -470,34 +470,28 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Soft embedding path: encoder(token, pos) → probs → probs @ W_E + W_pos[q%4]
-        → frozen causal W_Q/K/V/O self-attention → rule_hidden.
+        Every position attends to position 0 (the starter, always causally available).
+        rule_hidden[q] = encoder(starter) @ W_E + W_pos[(q+1)%4]
+                       ≈ [one_hot(starter), one_hot((q+1)%4)]   if encoder learns identity
 
-        The encoder only needs to learn identity (token t → one_hot(t)).
-        The rule model's attention handles next-token reasoning — the same
-        mechanism that makes the analytic rule model work.
+        Advantages over causal W_Q/K/V/O:
+        - No cascade: reads from position 0 (original prompt), never generated tokens
+        - Valid from q=0: position 0 is always a causal key
+        - Enough info for cross-attention to learn (starter + shift[pos_class]) % 12
         """
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
 
-        # 1. Encoder → soft token distribution
-        enc_out   = self.rule_input_encoder(idx, positions=pos)   # (B, T, RULE_D_MODEL)
-        tok_probs = enc_out[:, :, :VOCAB_SIZE]                     # (B, T, V)
+        # Encoder: AR tokens → soft token distributions (identity target)
+        enc_out     = self.rule_input_encoder(idx, positions=pos)
+        tok_probs   = enc_out[:, :, :VOCAB_SIZE]                          # (B, T, V)
 
-        # 2. Soft W_E lookup + positional encoding (same as hard rule model, but soft)
-        soft_h = tok_probs @ self._W_E + self._W_pos[pos % 4].unsqueeze(0)  # (B, T, d)
+        # Soft W_E lookup for position 0 only, then broadcast to all positions
+        starter_emb = (tok_probs[:, 0:1, :] @ self._W_E).expand(B, T, -1)  # (B, T, RULE_D_MODEL)
 
-        # 3. Frozen causal self-attention (W_Q, W_K, W_V, W_O)
-        Q      = soft_h @ self._W_Q
-        K      = soft_h @ self._W_K
-        V      = soft_h @ self._W_V
-        scale  = self.rule_model._tracr.attn_scale
-        scores = (Q @ K.transpose(-2, -1)) * scale
-        causal = torch.ones(T, T, device=idx.device).tril().bool()
-        scores = scores.masked_fill(~causal, float('-inf'))
-        # nan_to_num: first 3 positions have no valid causal key → all -inf → NaN → 0
-        attn   = F.softmax(scores, dim=-1).nan_to_num(nan=0.0)
-        return (attn @ V) @ self._W_O
+        # Add next-position encoding so cross-attention knows position class
+        pos_next = (pos + 1) % 4
+        return starter_emb + self._W_pos[pos_next].unsqueeze(0)
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
