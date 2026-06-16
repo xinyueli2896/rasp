@@ -110,7 +110,10 @@ def load_yinyang(label, ckpt_path, args, device):
     enc_state = {k.removeprefix('rule_input_encoder.'): v
                  for k, v in state.items() if k.startswith('rule_input_encoder.')}
     if enc_state and hasattr(model, 'rule_input_encoder'):
-        model.rule_input_encoder.load_state_dict(enc_state, strict=False)
+        try:
+            model.rule_input_encoder.load_state_dict(enc_state, strict=False)
+        except RuntimeError as e:
+            print(f"  [warning] encoder state shape mismatch (old checkpoint?): {e}")
 
     ar_keys = {k: v for k, v in state.items()
                if k.startswith('ar_model.') and 'lora_' not in k}
@@ -417,27 +420,38 @@ def get_args():
 def inspect_encoder(model, label: str):
     """Print the learned token→token mapping for encoder_injected models."""
     enc = getattr(model, 'rule_input_encoder', None)
-    if enc is None:
-        enc = getattr(getattr(model, 'yinyang_attn', None), 'rule_input_encoder', None)
     if enc is None or not hasattr(enc, 'token_logits'):
         print(f"  [{label}] no softmax encoder found")
         return
 
     with torch.no_grad():
-        W = enc.token_logits.weight.cpu()          # (V, V)
-        probs  = torch.softmax(W, dim=-1)           # (V, V)
-        mapped = probs.argmax(dim=-1).tolist()       # hard mapping: input → output token
+        W = enc.token_logits.cpu() if isinstance(enc.token_logits, torch.Tensor) \
+            else enc.token_logits.weight.cpu()
 
-    V = W.shape[0]
+    if W.dim() == 2:
+        # Legacy: position-agnostic (V, V)
+        _print_encoder_table(W.unsqueeze(0), label, pos_names=["(all)"])
+    else:
+        # Position-aware: (4, V, V)
+        _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+
+
+def _print_encoder_table(W: torch.Tensor, label: str, pos_names: list):
+    """W: (n_pos, V, V)"""
     print(f"\nEncoder mapping [{label}]")
-    print(f"  {'in':>4}  {'→out':>5}  {'conf':>6}  {'top-3 (token:prob)':}")
-    print(f"  {'-'*50}")
-    for i in range(V):
-        top3 = probs[i].topk(3)
-        top3_str = "  ".join(f"{idx.item()}:{p.item():.2f}"
-                              for idx, p in zip(top3.indices, top3.values))
-        conf = probs[i, mapped[i]].item()
-        print(f"  {i:>4}  {mapped[i]:>5}  {conf:>6.3f}  {top3_str}")
+    for p, name in enumerate(pos_names):
+        probs  = torch.softmax(W[p], dim=-1)
+        mapped = probs.argmax(dim=-1).tolist()
+        V = W.shape[1]
+        print(f"\n  {name}:")
+        print(f"  {'in':>4}  {'→out':>5}  {'conf':>6}  {'top-3 (token:prob)':}")
+        print(f"  {'-'*50}")
+        for i in range(V):
+            top3 = probs[i].topk(3)
+            top3_str = "  ".join(f"{idx.item()}:{p2.item():.2f}"
+                                  for idx, p2 in zip(top3.indices, top3.values))
+            conf = probs[i, mapped[i]].item()
+            print(f"  {i:>4}  {mapped[i]:>5}  {conf:>6.3f}  {top3_str}")
 
 
 if __name__ == "__main__":

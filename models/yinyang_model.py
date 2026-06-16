@@ -133,13 +133,14 @@ class LearnedRuleInputEncoder(nn.Module):
         self.rule_d_model = rule_d_model
 
         if encoder_type == 'softmax':
-            # Learns a soft token-to-token mapping. Output dims 0-(V-1) are a
-            # probability distribution over vocab; dims V-(d-1) are left as zeros
-            # so W_pos can fill in position information cleanly.
-            # Init to scaled identity so softmax ≈ one-hot at the start.
-            self.token_logits = nn.Embedding(vocab_size, vocab_size)
-            nn.init.eye_(self.token_logits.weight)
-            self.token_logits.weight.data *= 10.0
+            # Position-aware: 4 separate V×V logit tables (one per pos%4 class).
+            # encoder(token, pos%4) → next_token probability distribution.
+            # Initialized to scaled identity so softmax ≈ one-hot(current_token);
+            # training shifts each table to the correct position-dependent permutation.
+            # Output dims 0-(V-1) are probs; dims V-(d-1) are zeros (W_pos fills them).
+            self.token_logits = nn.Parameter(
+                torch.eye(vocab_size).unsqueeze(0).expand(4, -1, -1).clone() * 10.0
+            )
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -161,13 +162,21 @@ class LearnedRuleInputEncoder(nn.Module):
         elif encoder_type not in ('embedding', 'softmax'):
             raise ValueError(f"encoder_type must be 'embedding', 'transformer', or 'softmax', got {encoder_type!r}")
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        # tokens: (B, T)
+    def forward(self, tokens: torch.Tensor,
+                positions: torch.Tensor | None = None) -> torch.Tensor:
+        # tokens: (B, T), positions: (T,) sequence indices (optional, used by softmax encoder)
         if self.encoder_type == 'softmax':
-            probs = F.softmax(self.token_logits(tokens), dim=-1)       # (B, T, vocab_size)
+            B, T = tokens.shape
+            if positions is not None:
+                pos_class = (positions % 4).long()               # (T,)
+                p = pos_class.unsqueeze(0).expand(B, -1)         # (B, T)
+                logits = self.token_logits[p, tokens]             # (B, T, V)
+            else:
+                logits = self.token_logits[0][tokens]             # fallback: use pos=0 table
+            probs = F.softmax(logits, dim=-1)
             pad   = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                 device=tokens.device)
-            return torch.cat([probs, pad], dim=-1)                     # (B, T, rule_d_model)
+            return torch.cat([probs, pad], dim=-1)               # (B, T, rule_d_model)
         h = self.embedding(tokens)   # (B, T, rule_d_model)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
@@ -433,28 +442,18 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Encoder-injected pipeline:
-          tokens → learned encoder → +W_pos[pos%4] → causal frozen W_Q/K/V/O → rule_hidden
+        Position-aware causal NEXT encoding — consistent with non-encoder-injected:
+          rule_hidden[q] = encoder(token[q], q%4) + W_pos[(q+1)%4]
 
-        W_Q routes query q to key (q-1)%4 (causal: always a past position).
-        A causal mask enforces no future token leakage.
-        rule_hidden[q] = encode(token[q]) + W_pos[q%4]  (CURRENT encoding)
+        The position-aware encoder (4×V×V table) learns the position-dependent
+        token → next_token mapping causally from (token[q], q%4) alone.
+        No W_Q/K/V/O routing needed; no future token access.
         """
-        B, T   = idx.shape
-        h_in   = self.rule_input_encoder(idx)                          # (B, T, d)
-        pos    = torch.arange(T, device=idx.device) % 4
-        h_in   = h_in + self._W_pos[pos].unsqueeze(0)                  # (B, T, d)
-        Q      = h_in @ self._W_Q.t()
-        K      = h_in @ self._W_K.t()
-        V      = h_in @ self._W_V.t()
-        scores = (Q @ K.transpose(-1, -2)) * 20.0
-        # Causal mask: position q can only attend to k <= q
-        causal = torch.triu(torch.ones(T, T, device=idx.device), diagonal=1).bool()
-        scores = scores.masked_fill(causal.unsqueeze(0), float('-inf'))
-        attn   = F.softmax(scores, dim=-1)
-        rule_out = (attn @ V) @ self._W_O.t()                         # (B, T, d)
-        rule_out = rule_out + self._W_pos[pos].unsqueeze(0)
-        return rule_out
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        h_in = self.rule_input_encoder(idx, positions=pos)             # (B, T, d)
+        pos_next = (pos + 1) % 4
+        return h_in + self._W_pos[pos_next].unsqueeze(0)              # NEXT encoding
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
