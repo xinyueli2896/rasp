@@ -71,11 +71,10 @@ class TracrPyTorchRuleModel(nn.Module):
         # idx: (B, T)
         # returns logits (B, T, VOCAB_SIZE) and optionally hidden (B, T, 16)
         #
-        # CURRENT encoding: rule_hidden[q] = [e_{cur_token[q]}, e_{q%4}]
-        # Causal: the attention routes q → (q-1)%4, so rule_hidden[q] only
-        # depends on tokens at positions <= q. No future token leakage.
-        # The analytical bypass computes rule_hidden directly from idx[:,0],
-        # which is equivalent and works for any T >= 1.
+        # Logits: predict next_token[q] = (x + OFFSETS[(q+1)%4]) % 12
+        # Hidden (return_hidden): NEXT encoding — rule_hidden[q] = [e_{next_token[q]}, e_{(q+1)%4}]
+        # so the non-encoder-injected yinyang adapter can read next_token directly at position q.
+        # Encoder-injected path computes its own causal hidden via _encoder_injected_rule_hidden.
         B, T   = idx.shape
         device = idx.device
         t_idx  = torch.arange(T, device=device)
@@ -90,10 +89,13 @@ class TracrPyTorchRuleModel(nn.Module):
         logits = logits.detach().requires_grad_(True)
 
         if return_hidden:
-            # h_out[q] = [e_{cur_token[q]}, e_{q%4}]
-            tok_cur = self.W_E[cur_t]                      # (B, T, 16)
-            pos_emb = self.W_pos[t_idx % 4]               # (T, 16)
-            h_out   = tok_cur + pos_emb.unsqueeze(0)       # (B, T, 16)
+            # h_out[q] = [e_{next_token[q]}, e_{(q+1)%4}]  (NEXT encoding)
+            # Non-encoder-injected yinyang adapter attends to rule_hidden[q] at AR
+            # position q to read next_token[q] directly — NEXT encoding is required.
+            # The encoder_injected path uses _encoder_injected_rule_hidden instead.
+            tok_next = self.W_E[next_t]                    # (B, T, 16)
+            pos_emb  = self.W_pos[(t_idx + 1) % 4]        # (T, 16)
+            h_out    = tok_next + pos_emb.unsqueeze(0)     # (B, T, 16)
             return logits, h_out
 
         return logits
