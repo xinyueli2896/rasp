@@ -139,10 +139,9 @@ class LearnedRuleInputEncoder(nn.Module):
             # concat(one_hot(token), one_hot(pos%4)) → fc1 → ReLU → fc2 → V-dim probs.
             # Concatenation + nonlinearity lets position MODULATE the token mapping,
             # so the network can learn the position-dependent cyclic shift rule.
-            # Parameter sharing across positions enables cross-position generalisation:
-            # token t seen at pos 1 informs what token t should map to at pos 0.
-            # For other tasks: replace the one_hot(token) branch with any encoder.
-            hidden = vocab_size * 2
+            # 128 hidden units: large enough to represent 4 independent permutation
+            # matrices (one per position class) without interference.
+            hidden = 128
             self.mlp_fc1 = nn.Linear(vocab_size + 4, hidden)
             self.mlp_fc2 = nn.Linear(hidden, vocab_size)
             nn.init.xavier_uniform_(self.mlp_fc1.weight)
@@ -470,28 +469,19 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Every position attends to position 0 (the starter, always causally available).
-        rule_hidden[q] = encoder(starter) @ W_E + W_pos[(q+1)%4]
-                       ≈ [one_hot(starter), one_hot((q+1)%4)]   if encoder learns identity
+        Bypass W_Q/K/V/O: encoder directly predicts next-token distribution.
+        rule_hidden[q] = encoder(token[q], q%4) + W_pos[(q+1)%4]
+                       ≈ [one_hot(next_token[q]), one_hot((q+1)%4)]
 
-        Advantages over causal W_Q/K/V/O:
-        - No cascade: reads from position 0 (original prompt), never generated tokens
-        - Valid from q=0: position 0 is always a causal key
-        - Enough info for cross-attention to learn (starter + shift[pos_class]) % 12
+        All 12 next_token values appear during adapter training (even without starters
+        6 and 8), so the yinyang cross-attention sees and generalizes across all values.
+        The encoder must learn (token, pos_class) → next_token via direct aux CE loss.
         """
         B, T = idx.shape
-        pos = torch.arange(T, device=idx.device)
-
-        # Encoder: AR tokens → soft token distributions (identity target)
-        enc_out     = self.rule_input_encoder(idx, positions=pos)
-        tok_probs   = enc_out[:, :, :VOCAB_SIZE]                          # (B, T, V)
-
-        # Soft W_E lookup for position 0 only, then broadcast to all positions
-        starter_emb = (tok_probs[:, 0:1, :] @ self._W_E).expand(B, T, -1)  # (B, T, RULE_D_MODEL)
-
-        # Add next-position encoding so cross-attention knows position class
+        pos  = torch.arange(T, device=idx.device)
+        h_in     = self.rule_input_encoder(idx, positions=pos)   # (B, T, RULE_D_MODEL)
         pos_next = (pos + 1) % 4
-        return starter_emb + self._W_pos[pos_next].unsqueeze(0)
+        return h_in + self._W_pos[pos_next].unsqueeze(0)
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
@@ -513,10 +503,9 @@ class YinyangModel(nn.Module):
     def get_encoder_logits(self, idx: torch.Tensor) -> torch.Tensor | None:
         """Pre-softmax logits (B, T, V) from the learned encoder for auxiliary supervision.
 
-        The encoder feeds into W_E (soft lookup), so it should learn identity:
-        token t → one_hot(t). Auxiliary CE loss should be against idx (current tokens),
-        not target (next tokens). Identity is trivial to learn and generalizes to unseen
-        token values because one-hot inputs are orthogonal.
+        Auxiliary CE loss should be against tgt (next tokens): the encoder must predict
+        next_token[q] from (token[q], pos_class[q]). Direct supervision forces the
+        encoder to learn the cyclic shift rule, enabling generalisation to unseen tokens.
         Returns None for encoder types without vocab-space logits.
         """
         if not (self.encoder_injected and hasattr(self, 'rule_input_encoder')):
