@@ -110,12 +110,10 @@ class LearnedRuleInputEncoder(nn.Module):
     encoder_type='transformer': embedding + bidirectional TransformerEncoder.
     encoder_type='softmax'    : position-separate 4×V×V tables. Cannot generalise
                                 to token values unseen at a given position class.
-    encoder_type='mlp'        : shared token_embed + shared pos_embed + shared
-                                out_proj. Cross-position parameter sharing lets the
-                                model generalise to unseen (token, pos) pairs and
-                                extends naturally to other tasks: swap token_embed
-                                for any modality-specific encoder (CNN, transformer,
-                                etc.) while keeping pos_embed + out_proj fixed.
+    encoder_type='mlp'        : concat(one_hot(token), one_hot(pos%4)) → fc1 →
+                                ReLU → fc2 → softmax. Nonlinear position-token
+                                interaction enables learning position-dependent
+                                cyclic shifts. Generalises across position classes.
     """
 
     def __init__(
@@ -138,18 +136,19 @@ class LearnedRuleInputEncoder(nn.Module):
                 torch.eye(vocab_size).unsqueeze(0).expand(4, -1, -1).clone() * 10.0
             )
         elif encoder_type == 'mlp':
-            # Shared backbone: token_embed + pos_embed → out_proj → V-dim probs.
-            # token_embed is shared across position classes so that seeing token t
-            # at any position updates the same weights, enabling cross-position
-            # generalisation to unseen (token, pos) combinations.
-            # For other tasks: replace token_embed with any modality encoder.
-            self.token_embed = nn.Embedding(vocab_size, vocab_size)
-            self.pos_embed   = nn.Embedding(4, vocab_size)
-            self.out_proj    = nn.Linear(vocab_size, vocab_size)
-            nn.init.eye_(self.token_embed.weight)
-            nn.init.zeros_(self.pos_embed.weight)
-            nn.init.eye_(self.out_proj.weight)
-            nn.init.zeros_(self.out_proj.bias)
+            # concat(one_hot(token), one_hot(pos%4)) → fc1 → ReLU → fc2 → V-dim probs.
+            # Concatenation + nonlinearity lets position MODULATE the token mapping,
+            # so the network can learn the position-dependent cyclic shift rule.
+            # Parameter sharing across positions enables cross-position generalisation:
+            # token t seen at pos 1 informs what token t should map to at pos 0.
+            # For other tasks: replace the one_hot(token) branch with any encoder.
+            hidden = vocab_size * 2
+            self.mlp_fc1 = nn.Linear(vocab_size + 4, hidden)
+            self.mlp_fc2 = nn.Linear(hidden, vocab_size)
+            nn.init.xavier_uniform_(self.mlp_fc1.weight)
+            nn.init.zeros_(self.mlp_fc1.bias)
+            nn.init.xavier_uniform_(self.mlp_fc2.weight)
+            nn.init.zeros_(self.mlp_fc2.bias)
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -191,10 +190,17 @@ class LearnedRuleInputEncoder(nn.Module):
             return torch.cat([probs, pad], dim=-1)
 
         if self.encoder_type == 'mlp':
-            h = self.token_embed(tokens)                          # (B, T, V)
+            B, T = tokens.shape
+            tok_oh = F.one_hot(tokens, num_classes=self.vocab_size).float()   # (B, T, V)
             if positions is not None:
-                h = h + self.pos_embed((positions % 4).long())   # (B, T, V)
-            logits = self.out_proj(h)                             # (B, T, V)
+                pos_class = (positions % 4).long()                            # (T,)
+                pos_oh = F.one_hot(pos_class, num_classes=4).float()          # (T, 4)
+                pos_oh = pos_oh.unsqueeze(0).expand(B, -1, -1)               # (B, T, 4)
+            else:
+                pos_oh = torch.zeros(B, T, 4, device=tokens.device)
+            x      = torch.cat([tok_oh, pos_oh], dim=-1)                     # (B, T, V+4)
+            h      = F.relu(self.mlp_fc1(x))                                 # (B, T, 2V)
+            logits = self.mlp_fc2(h)                                          # (B, T, V)
             probs  = F.softmax(logits, dim=-1)
             pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                  device=tokens.device)

@@ -83,7 +83,7 @@ def load_yinyang(label, ckpt_path, args, device):
     is_enc_inj    = any(k.startswith('rule_input_encoder.') for k in state)
     if any('token_logits' in k for k in state):
         enc_type = 'softmax'
-    elif any('token_embed' in k and 'rule_input_encoder' in k for k in state):
+    elif any('mlp_fc1' in k for k in state):
         enc_type = 'mlp'
     else:
         enc_type = 'embedding'
@@ -437,17 +437,21 @@ def inspect_encoder(model, label: str):
                 _print_encoder_table(W.unsqueeze(0), label, pos_names=["(all)"])
             else:
                 _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
-        elif hasattr(enc, 'token_embed') and hasattr(enc, 'pos_embed'):
+        elif hasattr(enc, 'mlp_fc1') and hasattr(enc, 'mlp_fc2'):
             # mlp encoder: compute effective mapping for each pos class
+            import torch.nn.functional as F
             V = enc.vocab_size
-            tokens = torch.arange(V).unsqueeze(0)           # (1, V)
+            tokens = torch.arange(V)                                  # (V,)
+            tok_oh = F.one_hot(tokens, num_classes=V).float()         # (V, V)
             tables = []
             for p in range(4):
-                pos = torch.full((V,), p, dtype=torch.long)
-                h   = enc.token_embed(tokens) + enc.pos_embed(pos.unsqueeze(0))
-                logits = enc.out_proj(h)                     # (1, V, V)
-                tables.append(logits.squeeze(0))
-            W = torch.stack(tables, dim=0)                   # (4, V, V)
+                pos_oh = F.one_hot(torch.tensor([p]), num_classes=4).float()  # (1, 4)
+                pos_oh = pos_oh.expand(V, -1)                                 # (V, 4)
+                x      = torch.cat([tok_oh, pos_oh], dim=-1)                  # (V, V+4)
+                h      = F.relu(enc.mlp_fc1(x))                               # (V, 2V)
+                logits = enc.mlp_fc2(h)                                        # (V, V)
+                tables.append(logits)
+            W = torch.stack(tables, dim=0)                             # (4, V, V)
             _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
         else:
             print(f"  [{label}] encoder type not inspectable")
