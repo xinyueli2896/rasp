@@ -38,35 +38,41 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
         model.rule_model.eval()
 
         total_loss, total_correct, total_tokens = 0.0, 0, 0
+        total_main_loss = 0.0
+        total_enc_loss, total_enc_correct = 0.0, 0
 
         enc_loss_weight = getattr(args, 'enc_loss_weight', 0.0)
 
         for inp, tgt in train_loader:
             inp, tgt = inp.to(device), tgt.to(device)
-            logits = model(inp)
-            loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+            logits    = model(inp)
+            main_loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+            loss      = main_loss
 
             if enc_loss_weight > 0:
                 enc_logits = model.get_encoder_logits(inp)
                 if enc_logits is not None:
-                    # Directly supervise encoder to predict next_token[q] from
-                    # (token[q], pos_class[q]): forces learning the cyclic shift rule.
-                    loss = loss + enc_loss_weight * criterion(
-                        enc_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)
-                    )
+                    enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+                    loss = loss + enc_loss_weight * enc_loss
+                    total_enc_loss    += enc_loss.item() * tgt.numel()
+                    total_enc_correct += (enc_logits.argmax(-1) == tgt).sum().item()
 
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
-            total_loss    += loss.item() * tgt.numel()
-            total_correct += (logits.argmax(-1) == tgt).sum().item()
-            total_tokens  += tgt.numel()
+            total_main_loss += main_loss.item() * tgt.numel()
+            total_loss      += loss.item() * tgt.numel()
+            total_correct   += (logits.argmax(-1) == tgt).sum().item()
+            total_tokens    += tgt.numel()
 
         scheduler.step()
-        train_loss = total_loss / total_tokens
+        train_loss = total_loss    / total_tokens
+        main_loss  = total_main_loss / total_tokens
         train_acc  = total_correct / total_tokens
+        enc_loss   = total_enc_loss    / total_tokens if total_enc_loss > 0 else float('nan')
+        enc_acc    = total_enc_correct / total_tokens if total_enc_loss > 0 else float('nan')
 
         model.eval()
         with torch.no_grad():
@@ -79,11 +85,19 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
         test_acc = test_correct / test_tokens
 
         if epoch % args.log_every == 0 or epoch == epochs:
-            print(
-                f'Epoch {epoch:4d}/{epochs}  '
-                f'train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  '
-                f'test_acc(unseen)={test_acc:.4f}'
-            )
+            if total_enc_loss > 0:
+                print(
+                    f'Epoch {epoch:4d}/{epochs}  '
+                    f'main_loss={main_loss:.4f}  train_acc={train_acc:.4f}  '
+                    f'enc_loss={enc_loss:.4f}  enc_acc={enc_acc:.4f}  '
+                    f'test_acc(unseen)={test_acc:.4f}'
+                )
+            else:
+                print(
+                    f'Epoch {epoch:4d}/{epochs}  '
+                    f'train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  '
+                    f'test_acc(unseen)={test_acc:.4f}'
+                )
 
         if test_acc > best_test_acc:
             best_test_acc = test_acc
