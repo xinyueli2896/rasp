@@ -445,9 +445,7 @@ class YinyangModel(nn.Module):
             # Initialize embedding to W_E so the pipeline is analytically correct
             # from epoch 0. Training refines rather than re-discovers the solution.
             with torch.no_grad():
-                if encoder_type in ('softmax', 'mlp'):
-                    pass  # already initialized in LearnedRuleInputEncoder.__init__
-                else:
+                if encoder_type not in ('softmax', 'mlp', 'additive'):
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
         assert n_layers % n_skip == 0, \
