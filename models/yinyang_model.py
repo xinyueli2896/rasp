@@ -500,6 +500,30 @@ class YinyangModel(nn.Module):
                                              indices_key=indices_key)
         return logits
 
+    def get_encoder_logits(self, idx: torch.Tensor) -> torch.Tensor | None:
+        """Pre-softmax logits (B, T, V) from the learned encoder for auxiliary supervision.
+
+        At position q, the encoder should predict next_token[q], so auxiliary CE loss
+        against target[q] directly teaches the cyclic shift rule.
+        Returns None for encoder types without vocab-space logits.
+        """
+        if not (self.encoder_injected and hasattr(self, 'rule_input_encoder')):
+            return None
+        enc = self.rule_input_encoder
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        if enc.encoder_type == 'mlp':
+            tok_oh    = F.one_hot(idx, num_classes=enc.vocab_size).float()
+            pos_class = (pos % 4).long()
+            pos_oh    = F.one_hot(pos_class, num_classes=4).float().unsqueeze(0).expand(B, -1, -1)
+            x         = torch.cat([tok_oh, pos_oh], dim=-1)
+            return enc.mlp_fc2(F.relu(enc.mlp_fc1(x)))           # (B, T, V) pre-softmax
+        elif enc.encoder_type == 'softmax':
+            pos_class = (pos % 4).long()
+            p         = pos_class.unsqueeze(0).expand(B, -1)
+            return enc.token_logits[p, idx]                       # (B, T, V) pre-softmax
+        return None
+
     @torch.no_grad()
     def generate(self, start_tokens: torch.Tensor, n_new: int) -> torch.Tensor:
         self.eval()

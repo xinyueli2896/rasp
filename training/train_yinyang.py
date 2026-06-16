@@ -39,10 +39,19 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
 
         total_loss, total_correct, total_tokens = 0.0, 0, 0
 
+        enc_loss_weight = getattr(args, 'enc_loss_weight', 0.0)
+
         for inp, tgt in train_loader:
             inp, tgt = inp.to(device), tgt.to(device)
             logits = model(inp)
             loss   = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+
+            if enc_loss_weight > 0:
+                enc_logits = model.get_encoder_logits(inp)
+                if enc_logits is not None:
+                    loss = loss + enc_loss_weight * criterion(
+                        enc_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1)
+                    )
 
             optimizer.zero_grad()
             loss.backward()
@@ -240,6 +249,9 @@ def get_args():
     p.add_argument('--bidirectional',      action='store_true', default=False,
                    help='Use bidirectional cross-attention: AR informs rule (round 1), '
                         'rule informs AR (round 2). Rule model input injection is skipped.')
+    p.add_argument('--enc_loss_weight',    type=float, default=1.0,
+                   help='Weight for auxiliary encoder CE loss (0 to disable). Only applies '
+                        'when --encoder_injected with mlp or softmax encoder.')
     p.add_argument('--force_fallback',     action='store_true')
     p.add_argument('--joint',              action='store_true', default=False,
                    help='Train on union of AR pretrain + adapter finetune starters')
