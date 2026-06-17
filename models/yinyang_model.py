@@ -9,23 +9,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.transformer              import AutoregressiveTransformer
-from models.rule_model               import RuleModelWrapper
-from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
-from data.dataset                    import VOCAB_SIZE
+from models.transformer import AutoregressiveTransformer
+from models.rule_model  import RuleModelWrapper
+from data.dataset       import VOCAB_SIZE
 
-# The rule model hidden dimension is fixed by the Tracr-equivalent architecture
-RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
+# rule_hidden is the next-token distribution: shape (B, T, VOCAB_SIZE)
+RULE_D_MODEL = VOCAB_SIZE   # 12
 
 
 class YinyangCrossAttention(nn.Module):
     # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
     #
     # Q is PURELY POSITIONAL (sin/cos encoding only, no q_proj on AR hidden).
-    # This ensures cross-attention alignment is token-independent and generalises
-    # to unseen starters: for any input, Q[q] attends to rule_hidden[q] based
-    # solely on position, then v_proj extracts next_t_q from dims 12-23.
-    # Using AR hidden in Q caused token-content leakage that overfit to training starters.
+    # rule_hidden[q] = one_hot(next_token[q]), shape (B, T, 12).
+    # Diagonal attention (Q[q]·K[q] dominates) reads rule_hidden[q] via v_proj,
+    # injecting the exact next-token signal into the AR residual stream.
 
     def __init__(
         self,
@@ -490,14 +488,6 @@ class YinyangModel(nn.Module):
             force_fallback = force_fallback,
         ).to(device)
 
-        # Cache rule model's frozen weight matrices (used by bidirectional and encoder_injected).
-        self.register_buffer('_W_E',   self.rule_model._tracr.W_E)    # (24, 28)
-        self.register_buffer('_W_pos', self.rule_model._tracr.W_pos)  # (4, 28)
-        self.register_buffer('_W_Q',   self.rule_model._tracr.W_Q)    # (28, 28)
-        self.register_buffer('_W_K',   self.rule_model._tracr.W_K)    # (28, 28)
-        self.register_buffer('_W_V',   self.rule_model._tracr.W_V)    # (28, 28)
-        self.register_buffer('_W_O',   self.rule_model._tracr.W_O)    # (28, 28)
-
         if encoder_injected:
             # Learned encoder replaces W_E[tokens] before the frozen W_Q/K/V/O block.
             # rule_d_model must stay 28 so shapes match.
@@ -559,31 +549,14 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Assembles a 28-dim rule_hidden consistent with the attention rule model layout:
-          dims  0-11 : current token e_{t_q}           (W_E lookup, same as rule model residual)
-          dims 12-23 : encoder's next-token prediction  (mirrors e_{t_{q+1}} from attention)
-          dims 24-27 : current position class e_{q%4}  (W_pos, same as rule model residual)
-
-        The encoder predicts the NEXT token from (current token, pos_class), so the adapter
-        can read dims 12-23 directly to learn what should come next — without needing
-        to run the attention that the non-encoder-injected path uses.
+        Returns rule_hidden of shape (B, T, 12): the encoder's next-token
+        probability distribution at each position, matching the format of the
+        non-encoder-injected path (rule_hidden = one_hot(next_token)).
         """
         B, T = idx.shape
         pos  = torch.arange(T, device=idx.device)
-
-        # dims 0-11: current token (W_E lookup, mirrors rule model residual)
-        cur_tok = self._W_E[idx]                                    # (B, T, 28)
-
-        # dims 12-23: encoder next-token prediction
-        enc_out   = self.rule_input_encoder(idx, positions=pos)     # (B, T, 28)
-        enc_probs = enc_out[:, :, :VOCAB_SIZE]                      # (B, T, 12)
-        next_pred = torch.zeros(B, T, RULE_D_MODEL, device=idx.device)
-        next_pred[:, :, VOCAB_SIZE:2 * VOCAB_SIZE] = enc_probs      # into dims 12-23
-
-        # dims 24-27: current position class (mirrors rule model residual)
-        pos_emb = self._W_pos[pos % 4]                              # (T, 28)
-
-        return cur_tok + next_pred + pos_emb.unsqueeze(0)
+        enc_out = self.rule_input_encoder(idx, positions=pos)   # (B, T, 28 or 12)
+        return enc_out[:, :, :VOCAB_SIZE]                       # (B, T, 12)
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
