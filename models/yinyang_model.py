@@ -557,19 +557,31 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Bypass W_Q/K/V/O: encoder directly predicts next-token distribution.
-        rule_hidden[q] = encoder(token[q], q%4) + W_pos[(q+1)%4]
-                       ≈ [one_hot(next_token[q]), one_hot((q+1)%4)]
+        Assembles a 28-dim rule_hidden consistent with the attention rule model layout:
+          dims  0-11 : current token e_{t_q}           (W_E lookup, same as rule model residual)
+          dims 12-23 : encoder's next-token prediction  (replaces e_{t_{q-1}} from attention)
+          dims 24-27 : current position class e_{q%4}  (W_pos, same as rule model residual)
 
-        All 12 next_token values appear during adapter training (even without starters
-        6 and 8), so the yinyang cross-attention sees and generalizes across all values.
-        The encoder must learn (token, pos_class) → next_token via direct aux CE loss.
+        The encoder predicts the NEXT token from (current token, pos_class), so the adapter
+        can read dims 12-23 directly to learn what should come next — without needing
+        to run the attention that the non-encoder-injected path uses.
         """
         B, T = idx.shape
         pos  = torch.arange(T, device=idx.device)
-        h_in     = self.rule_input_encoder(idx, positions=pos)   # (B, T, RULE_D_MODEL)
-        pos_next = (pos + 1) % 4
-        return h_in + self._W_pos[pos_next].unsqueeze(0)
+
+        # dims 0-11: current token (W_E lookup, mirrors rule model residual)
+        cur_tok = self._W_E[idx]                                    # (B, T, 28)
+
+        # dims 12-23: encoder next-token prediction
+        enc_out   = self.rule_input_encoder(idx, positions=pos)     # (B, T, 28)
+        enc_probs = enc_out[:, :, :VOCAB_SIZE]                      # (B, T, 12)
+        next_pred = torch.zeros(B, T, RULE_D_MODEL, device=idx.device)
+        next_pred[:, :, VOCAB_SIZE:2 * VOCAB_SIZE] = enc_probs      # into dims 12-23
+
+        # dims 24-27: current position class (mirrors rule model residual)
+        pos_emb = self._W_pos[pos % 4]                              # (T, 28)
+
+        return cur_tok + next_pred + pos_emb.unsqueeze(0)
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
