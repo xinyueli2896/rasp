@@ -9,12 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.transformer import AutoregressiveTransformer
-from models.rule_model  import RuleModelWrapper
-from data.dataset       import VOCAB_SIZE
+from models.transformer              import AutoregressiveTransformer
+from models.rule_model               import RuleModelWrapper
+from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
+from data.dataset                    import VOCAB_SIZE
 
-# rule_hidden is the next-token distribution: shape (B, T, VOCAB_SIZE)
-RULE_D_MODEL = VOCAB_SIZE   # 12
+# rule_hidden is the 28-dim hidden state of the TRACR-compiled rule transformer:
+#   dims  0-11 : one-hot current token
+#   dims 12-23 : one-hot next token (via causal attention for q >= 3)
+#   dims 24-27 : one-hot q % 4
+RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):

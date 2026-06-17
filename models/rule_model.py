@@ -7,34 +7,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
+from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 
 
 class RuleModelWrapper(nn.Module):
-    # Frozen analytical rule model.
-    # rule_d_model = VOCAB_SIZE = 12.
+    # Wraps the TRACR-compiled PyTorch rule model.
     # forward(idx, return_hidden=True) returns (logits, rule_hidden) where
-    # rule_hidden[q] = one_hot(next_token[q]) shape (B, T, 12) — the exact
-    # next-token distribution at every position, matching teacher-forced AR targets.
+    # rule_hidden is the actual 28-dim hidden state from the transformer:
+    #   dims  0-11 : one-hot of current token at position q
+    #   dims 12-23 : one-hot of next token  (via causal attention for q >= 3)
+    #   dims 24-27 : one-hot of q % 4
     # parameters() returns empty — no trainable parameters.
 
     def __init__(self, max_seq_len: int = 128,
-                 rule_d_model: int = None,   # ignored, always VOCAB_SIZE
+                 rule_d_model: int = None,   # ignored, always TRACR_D_MODEL
                  force_fallback: bool = False):
         super().__init__()
-        self.rule_d_model = VOCAB_SIZE   # 12
-        self.register_buffer("_offsets", torch.tensor(OFFSETS, dtype=torch.long))
+        self._tracr = TracrPyTorchRuleModel(max_seq_len=max_seq_len)
+        self.rule_d_model = self._tracr.TRACR_D_MODEL   # 28
 
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
-        B, T = idx.shape
-        device = idx.device
-        t_idx = torch.arange(T, device=device)
-        key = idx[:, 0]   # starter token determines the whole sequence
-        # next_token[q] = (key + OFFSETS[(q+1)%4]) % VOCAB_SIZE
-        next_t = (key[:, None] + self._offsets[(t_idx + 1) % 4][None, :]) % VOCAB_SIZE
-        logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()   # (B, T, 12)
-        if return_hidden:
-            return logits, logits   # rule_hidden = next-token distribution
-        return logits
+        return self._tracr(idx, return_hidden=return_hidden)
 
     def parameters(self, recurse=True):
         return iter([])
