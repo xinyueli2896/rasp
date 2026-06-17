@@ -561,7 +561,7 @@ class YinyangModel(nn.Module):
         """
         Assembles a 28-dim rule_hidden consistent with the attention rule model layout:
           dims  0-11 : current token e_{t_q}           (W_E lookup, same as rule model residual)
-          dims 12-23 : encoder's next-token prediction  (replaces e_{t_{q-1}} from attention)
+          dims 12-23 : encoder's next-token prediction  (mirrors e_{t_{q+1}} from attention)
           dims 24-27 : current position class e_{q%4}  (W_pos, same as rule model residual)
 
         The encoder predicts the NEXT token from (current token, pos_class), so the adapter

@@ -99,7 +99,7 @@ class TracrPyTorchRuleModel(nn.Module):
 
         Logits predict next_token[q] = (x + OFFSETS[(q+1)%4]) % V  (analytical).
         Hidden is computed by actual attention using W_Q/K/V/O:
-          h_out[q] = [e_{t_q} ; e_{t_{q-1}} ; e_{q%4}]
+          h_out[q] = [e_{t_q} ; e_{t_{q+1}} ; e_{q%4}]   (NEXT encoding for q>=3)
         """
         B, T   = idx.shape
         device = idx.device
@@ -119,7 +119,7 @@ class TracrPyTorchRuleModel(nn.Module):
         h = self.W_E[idx] + self.W_pos[t_idx % 4].unsqueeze(0)   # (B, T, 28)
 
         # Queries, Keys, Values
-        Q = h @ self.W_Q.t()    # (B, T, 28): e_{(q-1)%4} in dims 24-27
+        Q = h @ self.W_Q.t()    # (B, T, 28): e_{(q+1)%4} in dims 24-27 (forward shift)
         K = h @ self.W_K.t()    # (B, T, 28): e_{q%4}     in dims 24-27
         V = h @ self.W_V.t()    # (B, T, 28): e_{t_q}     in dims 12-23
 
@@ -132,7 +132,7 @@ class TracrPyTorchRuleModel(nn.Module):
         # Attended value + output projection
         attn_out = (attn @ V) @ self.W_O.t()                      # (B, T, 28)
 
-        # Residual: h_out[q] = [e_{t_q}(0-11) ; e_{t_{q-1}}(12-23) ; e_{q%4}(24-27)]
+        # Residual: h_out[q] = [e_{t_q}(0-11) ; e_{t_{q+1}}(12-23) ; e_{q%4}(24-27)]  (q>=3)
         h_out = h + attn_out                                       # (B, T, 28)
 
         return logits, h_out
