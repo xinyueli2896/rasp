@@ -94,8 +94,9 @@ def load_yinyang(label, ckpt_path, args, device):
     else:
         enc_type = 'embedding'
 
+    ar_ckpt = args.ar_ckpt if os.path.exists(args.ar_ckpt) else None
     model = build_yinyang_model(
-        ar_ckpt_path     = args.ar_ckpt,
+        ar_ckpt_path     = ar_ckpt,
         max_seq_len      = args.n_cycles * 4 + 10,
         d_model          = args.d_model,
         n_layers         = args.n_layers,
@@ -163,6 +164,29 @@ def rule_following_acc(model, starters, n_cycles, n_prompt, device):
         generated = model.generate(prompt, n_new=gen_len)[0, n_prompt:].cpu().tolist()
         results[x] = sum(g == e for g, e in zip(generated, expected)) / len(expected)
 
+    return results, float(np.mean(list(results.values())))
+
+
+@torch.no_grad()
+def encoder_next_token_acc(model, starters, n_cycles, device):
+    """Token-level next-token prediction accuracy of the learned encoder.
+
+    For each sequence from each starter, runs the encoder on the input tokens
+    with the correct position indices and compares argmax predictions to
+    ground-truth next tokens.  Returns None if the model has no encoder.
+    """
+    if not hasattr(model, 'rule_input_encoder'):
+        return None, None
+    results = {}
+    for x in starters:
+        seq = make_sequence(x, n_cycles)
+        inp = torch.tensor([seq[:-1]], dtype=torch.long, device=device)
+        tgt = torch.tensor([seq[1:]],  dtype=torch.long, device=device)
+        enc_logits = model.get_encoder_logits(inp)
+        if enc_logits is None:
+            return None, None
+        correct = (enc_logits.argmax(-1) == tgt).sum().item()
+        results[x] = correct / tgt.numel()
     return results, float(np.mean(list(results.values())))
 
 
@@ -243,6 +267,8 @@ def run_evaluation(args):
     # Evaluate all
     # results[label] = {cat_label: (per_starter, mean, std)}
     results = {}
+    # enc_results[label] = {cat_label: mean} or None if no encoder
+    enc_results = {}
     all_starters = EVAL_PRETRAIN_ONLY + EVAL_FINETUNE_ONLY + EVAL_BOTH + EVAL_NEITHER
     for lbl, mdls in single_models:
         results[lbl] = {}
@@ -258,6 +284,16 @@ def run_evaluation(args):
             results[lbl][cat_label] = (per, mean, std)
         per, mean, std = _eval_models(mdls, all_starters, args.n_cycles, n_prompt, device)
         results[lbl]["Overall"] = (per, mean, std)
+        # Encoder accuracy (seed 0 only — encoder weights are deterministic)
+        mdl0 = mdls[0]
+        if hasattr(mdl0, 'rule_input_encoder') and mdl0.get_encoder_logits(
+                torch.zeros(1, 1, dtype=torch.long, device=device)) is not None:
+            enc_results[lbl] = {}
+            for cat_label, starters, _ in categories:
+                _, mean = encoder_next_token_acc(mdl0, starters, args.n_cycles, device)
+                enc_results[lbl][cat_label] = mean
+            _, mean = encoder_next_token_acc(mdl0, all_starters, args.n_cycles, device)
+            enc_results[lbl]["Overall"] = mean
 
     # -----------------------------------------------------------------------
     # Summary table
@@ -296,6 +332,36 @@ def run_evaluation(args):
         row += " " + _fmt(mean, std, w, is_multi[lbl])
     print(row)
     print("=" * len(header))
+
+    # -----------------------------------------------------------------------
+    # Encoder next-token accuracy table (adapter models with learned encoder)
+    # -----------------------------------------------------------------------
+    if enc_results:
+        enc_labels = list(enc_results.keys())
+        col_w_e = 14
+        print()
+        print("=" * 70)
+        print("ENCODER NEXT-TOKEN ACCURACY  (argmax vs ground-truth next token)")
+        print("=" * 70)
+        enc_header = f"{'Data Split':<20} {'Starters':<18}"
+        for lbl in enc_labels:
+            enc_header += f" {lbl:>{col_w_e}}"
+        enc_sep = "-" * len(enc_header)
+        print(enc_header)
+        print(enc_sep)
+        for cat_label, _, starters_str in categories:
+            row = f"{cat_label:<20} {starters_str:<18}"
+            for lbl in enc_labels:
+                v = enc_results[lbl].get(cat_label)
+                row += f" {v:{col_w_e}.3f}" if v is not None else f" {'N/A':>{col_w_e}}"
+            print(row)
+        print(enc_sep)
+        row = f"{'Overall':<20} {'all starters':<18}"
+        for lbl in enc_labels:
+            v = enc_results[lbl].get("Overall")
+            row += f" {v:{col_w_e}.3f}" if v is not None else f" {'N/A':>{col_w_e}}"
+        print(row)
+        print("=" * len(enc_header))
 
     # -----------------------------------------------------------------------
     # Per-starter detail (uses seed-averaged per-starter scores)
