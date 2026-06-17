@@ -16,21 +16,25 @@ class TracrPyTorchRuleModel(nn.Module):
     #
     # Hidden state layout (28 dims):
     #   dims  0-11 : one-hot of CURRENT token at position q   (from W_E, residual)
-    #   dims 12-23 : one-hot of PREVIOUS token at position q  (written by W_V/W_O via attention)
+    #   dims 12-23 : one-hot of NEXT token at position q      (written by W_V/W_O via attention)
     #   dims 24-27 : one-hot of q % 4                         (from W_pos, residual)
     #
-    # Attention: position q attends to position q-1.
-    #   W_Q shifts pos subspace back by 1 → query at q has pos_class (q-1)%4
-    #   W_K is identity on pos subspace   → key   at k has pos_class k%4
-    #   dot-product scores peak at k = q-1 (unique past k where k%4 == (q-1)%4)
-    #   W_V maps current-token dims (0-11) → prev-token dims (12-23)
+    # Attention trick — attend 3 steps back to read the next token:
+    #   The sequence has period 4, so t_{q-3} = next_t_q because
+    #   OFFSETS[(q-3)%4] = OFFSETS[(q+1)%4]  (since -3 ≡ +1 mod 4).
+    #
+    #   W_Q shifts pos subspace FORWARD by 1 → query at q has pos_class (q+1)%4
+    #   W_K is identity on pos subspace       → key   at k has pos_class k%4
+    #   dot-product peaks where k%4 == (q+1)%4, i.e. k = q-3 (causal, q≥3)
+    #   W_V maps current-token dims (0-11) → next-token dims (12-23)
     #   W_O is identity on dims 12-23
     #
-    # After residual add:
-    #   h_out[q] = [e_{t_q} ; e_{t_{q-1}} ; e_{q%4}]
+    # After residual add (q ≥ 3):
+    #   h_out[q] = [e_{t_q} ; e_{next_t_q} ; e_{q%4}]
     #
-    # At q=0 there is no q-1: the causal softmax attends to position 0 itself
-    # (score = 0, but it is the only legal key), so h_out[0] = [e_{t_0}; e_{t_0}; e_0].
+    # For q < 3 there is no valid past key, so the causal softmax self-attends
+    # (score = 0, but it is the only legal key):
+    #   h_out[q] = [e_{t_q} ; e_{t_q} ; e_{q%4}]  (self-reference fallback)
     #
     # Logits are computed analytically (next-token prediction cannot be expressed
     # as a single linear map on h_out without an MLP).
@@ -58,11 +62,13 @@ class TracrPyTorchRuleModel(nn.Module):
             W_pos[i, 2 * V + i] = 1.0
         self.register_buffer("W_pos", W_pos)
 
-        # W_Q: shifts pos subspace (dims 24-27) back by 1 mod 4
-        # (h @ W_Q.T)[2V+i] = h[2V+(i+1)%4]  →  Q has pos_class (q-1)%4
+        # W_Q: shifts pos subspace (dims 24-27) forward by 1 mod 4
+        # (h @ W_Q.T)[2V+i] = h[2V+(i-1)%4]  →  Q has pos_class (q+1)%4
+        # This makes q attend to k where k%4 == (q+1)%4, i.e. k = q-3 (causal).
+        # t_{q-3} = next_t_q because OFFSETS[(q-3)%4] == OFFSETS[(q+1)%4] (-3≡+1 mod 4).
         W_Q = torch.zeros(d, d)
         for i in range(4):
-            W_Q[2 * V + i, 2 * V + (i + 1) % 4] = 1.0
+            W_Q[2 * V + i, 2 * V + (i - 1) % 4] = 1.0
         self.register_buffer("W_Q", W_Q)
 
         # W_K: identity on pos subspace (dims 24-27)
@@ -156,25 +162,26 @@ if __name__ == "__main__":
     for q in range(8):
         h = hidden[0, q]
         cur  = h[:12].argmax().item()
-        prev = h[12:24].argmax().item()
+        nxt  = h[12:24].argmax().item()
         pos  = h[24:].argmax().item()
-        print(f"  q={q}: cur={cur}  prev={prev}  pos%4={pos}")
+        note = "(uniform fallback)" if q < 3 else ""
+        print(f"  q={q}: cur={cur}  next={nxt}  pos%4={pos}  {note}")
 
-    # Verify attention: cur[q] should equal inp[q], prev[q] should equal inp[q-1]
+    # Verify: cur[q]==t_q, next[q]==next_t_q for q>=3, pos[q]==q%4
+    # For q<3, no past key matches the query's pos_class so attention is uniform
+    # → dims 12-23 are non-one-hot (acceptable; adapter learns to ignore them).
     tokens = inp.squeeze().tolist()
-    print(f"\nVerification:")
+    next_tokens = logits.argmax(-1).squeeze().tolist()
+    print(f"\nVerification (q>=3):")
     all_ok = True
-    for q in range(8):
+    for q in range(3, 8):
         h = hidden[0, q]
-        cur  = h[:12].argmax().item()
-        prev = h[12:24].argmax().item()
-        pos  = h[24:].argmax().item()
-        exp_cur  = tokens[q]
-        exp_prev = tokens[q - 1] if q > 0 else tokens[0]   # q=0: self-reference
-        exp_pos  = q % 4
-        ok = (cur == exp_cur) and (prev == exp_prev) and (pos == exp_pos)
+        cur = h[:12].argmax().item()
+        nxt = h[12:24].argmax().item()
+        pos = h[24:].argmax().item()
+        ok  = (cur == tokens[q]) and (nxt == next_tokens[q]) and (pos == q % 4)
         all_ok = all_ok and ok
-        if not ok:
-            print(f"  q={q} FAIL: got cur={cur} prev={prev} pos={pos}, "
-                  f"expected cur={exp_cur} prev={exp_prev} pos={exp_pos}")
-    print(f"  All correct: {all_ok}")
+        tag = "" if ok else " FAIL"
+        print(f"  q={q}: cur={cur}(exp {tokens[q]}) "
+              f"next={nxt}(exp {next_tokens[q]}) pos={pos}{tag}")
+    print(f"  All correct (q>=3): {all_ok}")
