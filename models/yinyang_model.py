@@ -20,10 +20,13 @@ RULE_D_MODEL = VOCAB_SIZE   # 12
 class YinyangCrossAttention(nn.Module):
     # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
     #
-    # Q is PURELY POSITIONAL (sin/cos encoding only, no q_proj on AR hidden).
+    # Q and K are BOTH PURELY POSITIONAL (scaled sin/cos, no learned projections).
     # rule_hidden[q] = one_hot(next_token[q]), shape (B, T, 12).
-    # Diagonal attention (Q[q]·K[q] dominates) reads rule_hidden[q] via v_proj,
-    # injecting the exact next-token signal into the AR residual stream.
+    # Scaling pe by PE_SCALE=20 gives diagonal Q·K advantage of ~70 per score unit,
+    # making attention nearly one-hot on the same position. V = v_proj(rule_hidden)
+    # extracts the next-token signal, which out_proj injects into the AR residual stream.
+
+    PE_SCALE = 20.0   # makes diagonal Q·K score >> off-diagonal; matches Tracr attn_scale
 
     def __init__(
         self,
@@ -40,8 +43,8 @@ class YinyangCrossAttention(nn.Module):
         self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
-        # No q_proj: Q is purely positional — see forward().
-        self.k_proj   = nn.Linear(rule_d_model, embed_dim)
+        # No q_proj or k_proj: both Q and K are purely positional.
+        # V is the only content-bearing projection.
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
 
@@ -50,22 +53,22 @@ class YinyangCrossAttention(nn.Module):
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Sinusoidal pos encoding in embed_dim space.
-        # Q = sin_pos[q] (token-independent); K = k_proj(rule_hidden[k]) + sin_pos[k].
-        # Diagonal score sin_pos[q]·sin_pos[q] = embed_dim/2 dominates off-diagonal,
-        # so attention focuses on rule_hidden[q] for any input token.
+        # Sinusoidal pos encoding scaled by PE_SCALE.
+        # score(q,k) = PE_SCALE² * (pe[q]·pe[k]) / sqrt(head_dim)
+        # Diagonal advantage per adjacent pair ≈ PE_SCALE² * 0.5 / sqrt(head_dim) ≈ 70.
         import math
         pe  = torch.zeros(max_seq_len, embed_dim)
         pos = torch.arange(max_seq_len).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
+        pe = pe * self.PE_SCALE
         self.register_buffer('pos_enc', pe.unsqueeze(0))  # (1, max_seq_len, embed_dim)
 
         self._init_weights()
 
     def _init_weights(self):
-        for linear in [self.k_proj, self.v_proj, self.out_proj]:
+        for linear in [self.v_proj, self.out_proj]:
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
@@ -83,7 +86,7 @@ class YinyangCrossAttention(nn.Module):
         pos_q = self.pos_enc[:, indices_query, :]                          # (1, T_q, embed_dim)
         pos_k = self.pos_enc[:, indices_key,   :]                          # (1, T_k, embed_dim)
         Q = pos_q.expand(B, -1, -1)                                        # (B, T_q, embed_dim) — purely positional
-        K = self.k_proj(rule_hidden) + pos_k                               # (B, T_k, embed_dim)
+        K = pos_k.expand(B, -1, -1)                                        # (B, T_k, embed_dim) — purely positional
         V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
