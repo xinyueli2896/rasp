@@ -20,11 +20,12 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 class YinyangCrossAttention(nn.Module):
     # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
-    # pos_proj removed: rule_hidden already encodes position in dims 24-27
     #
-    # Sinusoidal pos encoding (embed_dim-space) is added to BOTH Q and K so that
-    # Q[q] · K[q] is naturally high from initialization (diagonal attention bias).
-    # This fixes systematic failure at cycle positions where multiple keys compete.
+    # Q is PURELY POSITIONAL (sin/cos encoding only, no q_proj on AR hidden).
+    # This ensures cross-attention alignment is token-independent and generalises
+    # to unseen starters: for any input, Q[q] attends to rule_hidden[q] based
+    # solely on position, then v_proj extracts next_t_q from dims 12-23.
+    # Using AR hidden in Q caused token-content leakage that overfit to training starters.
 
     def __init__(
         self,
@@ -41,7 +42,7 @@ class YinyangCrossAttention(nn.Module):
         self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
-        self.q_proj   = nn.Linear(d_model,      embed_dim)
+        # No q_proj: Q is purely positional — see forward().
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
@@ -51,9 +52,10 @@ class YinyangCrossAttention(nn.Module):
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Sinusoidal pos encoding in embed_dim space — added to BOTH Q and K.
-        # Makes Q[q]·K[q] naturally larger than Q[q]·K[k≠q] from initialization,
-        # giving the adapter a diagonal attention prior without any learned projection.
+        # Sinusoidal pos encoding in embed_dim space.
+        # Q = sin_pos[q] (token-independent); K = k_proj(rule_hidden[k]) + sin_pos[k].
+        # Diagonal score sin_pos[q]·sin_pos[q] = embed_dim/2 dominates off-diagonal,
+        # so attention focuses on rule_hidden[q] for any input token.
         import math
         pe  = torch.zeros(max_seq_len, embed_dim)
         pos = torch.arange(max_seq_len).unsqueeze(1).float()
@@ -65,7 +67,7 @@ class YinyangCrossAttention(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        for linear in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+        for linear in [self.k_proj, self.v_proj, self.out_proj]:
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
@@ -82,7 +84,7 @@ class YinyangCrossAttention(nn.Module):
 
         pos_q = self.pos_enc[:, indices_query, :]                          # (1, T_q, embed_dim)
         pos_k = self.pos_enc[:, indices_key,   :]                          # (1, T_k, embed_dim)
-        Q = self.q_proj(ar_hidden)   + pos_q                               # (B, T_q, embed_dim)
+        Q = pos_q.expand(B, -1, -1)                                        # (B, T_q, embed_dim) — purely positional
         K = self.k_proj(rule_hidden) + pos_k                               # (B, T_k, embed_dim)
         V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
