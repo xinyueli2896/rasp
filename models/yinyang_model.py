@@ -120,6 +120,15 @@ class LearnedRuleInputEncoder(nn.Module):
                                 during adapter training (at different combinations),
                                 so W_tok and W_pos are fully trained. Their sum
                                 generalises to unseen (token, pos_class) pairs.
+    encoder_type='circular'   : circular convolution encoder.
+                                shift_logits[p] ∈ R^V represents the shift distribution
+                                for pos_class p.  For output token t' given input token t:
+                                  logit[t'] = shift_logits[pos_class, (t'-t) % V]
+                                Because the shift is purely a function of pos_class (not
+                                the token), all training pairs at pos_class p share the
+                                same ground-truth shift → overdetermined → unique
+                                convergence → generalises to ANY input token including
+                                unseen starters.
     """
 
     def __init__(
@@ -176,6 +185,13 @@ class LearnedRuleInputEncoder(nn.Module):
             self.register_buffer('fourier_feats', fourier_feats)
             # Init to identity: no rotation at start, training learns the right shift
             self.R = nn.Parameter(torch.eye(V).unsqueeze(0).expand(4, -1, -1).clone())
+        elif encoder_type == 'circular':
+            # shift_logits[p, s] = unnorm log-prob that shift at pos_class p equals s.
+            # Warm-start: expected shifts are pc0→5, pc1→2, pc2→5, pc3→0
+            self.shift_logits = nn.Parameter(torch.zeros(4, vocab_size))
+            with torch.no_grad():
+                for p, s in enumerate([5, 2, 5, 0]):
+                    self.shift_logits[p, s] = 4.0
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -194,10 +210,10 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive', 'fourier'):
+        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive', 'fourier', 'circular'):
             raise ValueError(
-                f"encoder_type must be 'embedding', 'transformer', 'softmax', 'mlp', 'additive', "
-                f"or 'fourier', got {encoder_type!r}"
+                f"encoder_type must be one of 'embedding', 'transformer', 'softmax', 'mlp', "
+                f"'additive', 'fourier', 'circular', got {encoder_type!r}"
             )
 
     def forward(self, tokens: torch.Tensor,
@@ -257,6 +273,23 @@ class LearnedRuleInputEncoder(nn.Module):
             R_p   = self.R[pos_class]                                         # (T, V, V)
             v     = torch.einsum('bti,tij->btj', phi, R_p)                   # (B, T, V)
             logits = v @ self.fourier_feats.t()                               # (B, T, V)
+            probs  = F.softmax(logits, dim=-1)
+            pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
+                                 device=tokens.device)
+            return torch.cat([probs, pad], dim=-1)
+
+        if self.encoder_type == 'circular':
+            B, T = tokens.shape
+            V = self.vocab_size
+            if positions is not None:
+                pos_class = (positions % 4).long()
+            else:
+                pos_class = torch.zeros(T, dtype=torch.long, device=tokens.device)
+            shift_p = self.shift_logits[pos_class]               # (T, V)
+            # logit for output t' given token t: shift_logits[pc, (t'-t) % V]
+            idx_v = torch.arange(V, device=tokens.device)
+            gather_idx = (idx_v[None, None, :] - tokens[:, :, None]) % V    # (B, T, V)
+            logits = shift_p[None, :, :].expand(B, -1, -1).gather(2, gather_idx)  # (B, T, V)
             probs  = F.softmax(logits, dim=-1)
             pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                  device=tokens.device)
@@ -476,7 +509,7 @@ class YinyangModel(nn.Module):
             # Initialize embedding to W_E so the pipeline is analytically correct
             # from epoch 0. Training refines rather than re-discovers the solution.
             with torch.no_grad():
-                if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier'):
+                if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier', 'circular'):
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
         assert n_layers % n_skip == 0, \
@@ -589,6 +622,13 @@ class YinyangModel(nn.Module):
             R_p  = enc.R[pos_class]                               # (T, V, V)
             v    = torch.einsum('bti,tij->btj', phi, R_p)        # (B, T, V)
             return v @ enc.fourier_feats.t()                      # (B, T, V) pre-softmax
+        elif enc.encoder_type == 'circular':
+            V = enc.vocab_size
+            pos_class = (pos % 4).long()
+            shift_p   = enc.shift_logits[pos_class]               # (T, V)
+            idx_v     = torch.arange(V, device=idx.device)
+            gather_idx = (idx_v[None, None, :] - idx[:, :, None]) % V        # (B, T, V)
+            return shift_p[None, :, :].expand(B, -1, -1).gather(2, gather_idx)  # (B, T, V)
         return None
 
     @torch.no_grad()

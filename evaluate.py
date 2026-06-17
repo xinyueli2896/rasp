@@ -89,6 +89,8 @@ def load_yinyang(label, ckpt_path, args, device):
         enc_type = 'additive'
     elif any('.R' in k and 'rule_input_encoder' in k for k in state):
         enc_type = 'fourier'
+    elif any('shift_logits' in k and 'rule_input_encoder' in k for k in state):
+        enc_type = 'circular'
     else:
         enc_type = 'embedding'
 
@@ -461,6 +463,30 @@ def inspect_encoder(model, label: str):
             tables = []
             for p in range(4):
                 logits = enc.W_tok[tokens] + enc.W_pos[p].unsqueeze(0)  # (V, V)
+                tables.append(logits)
+            W = torch.stack(tables, dim=0)
+            _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        elif hasattr(enc, 'fourier_feats') and hasattr(enc, 'R'):
+            import torch.nn.functional as F
+            V = enc.vocab_size
+            tokens = torch.arange(V)
+            phi = enc.fourier_feats[tokens]  # (V, V)
+            tables = []
+            for p in range(4):
+                v = phi @ enc.R[p]           # (V, V)
+                logits = v @ enc.fourier_feats.t()  # (V, V)
+                tables.append(logits)
+            W = torch.stack(tables, dim=0)
+            _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
+        elif hasattr(enc, 'shift_logits'):
+            V = enc.vocab_size
+            tokens = torch.arange(V)
+            idx_v  = torch.arange(V)
+            tables = []
+            for p in range(4):
+                # logit[t, t'] = shift_logits[p, (t'-t) % V]
+                gather_idx = (idx_v.unsqueeze(0) - tokens.unsqueeze(1)) % V  # (V, V)
+                logits = enc.shift_logits[p][gather_idx]                     # (V, V)
                 tables.append(logits)
             W = torch.stack(tables, dim=0)
             _print_encoder_table(W, label, pos_names=[f"pos%4={p}" for p in range(4)])
