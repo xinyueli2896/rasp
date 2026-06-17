@@ -511,6 +511,11 @@ class YinyangModel(nn.Module):
                 if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier', 'circular'):
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
+        # Learned scale for direct rule logit injection at q >= 3.
+        # Only for the non-encoder, non-bidirectional path.
+        if not (encoder_injected or bidirectional):
+            self.rule_alpha = nn.Parameter(torch.tensor(1.0))
+
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters  = n_layers // n_skip
@@ -528,6 +533,7 @@ class YinyangModel(nn.Module):
 
     def _forward_layerwise(self, idx: torch.Tensor,
                            rule_hidden:   torch.Tensor | None = None,
+                           rule_logits:   torch.Tensor | None = None,
                            indices_query: torch.Tensor | None = None,
                            indices_key:   torch.Tensor | None = None):
         ar = self._ar_base
@@ -552,6 +558,19 @@ class YinyangModel(nn.Module):
 
         hidden = ar.ln_f(x)
         logits = ar.lm_head(hidden)
+
+        # Direct rule signal injection for positions q >= 3.
+        # At q >= 3 the causal period-4 trick is valid: rule_logits[q] is a
+        # clean one-hot of the correct next token.  We add it directly to the
+        # output logits so it can override the AR model's wrong context bias.
+        # Positions 0-2 are masked to zero (rule signal is wrong there).
+        if rule_logits is not None and hasattr(self, 'rule_alpha'):
+            T = logits.shape[1]
+            q_mask = torch.zeros(T, device=logits.device)
+            if T > 3:
+                q_mask[3:] = 1.0
+            logits = logits + self.rule_alpha * rule_logits.detach() * q_mask.view(1, T, 1)
+
         return logits, hidden
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
@@ -568,16 +587,16 @@ class YinyangModel(nn.Module):
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
+        rule_logits = None
         if self.bidirectional:
-            # AR proxy drives rule attention via frozen W_Q/K/V/O — no rule token input.
             rule_hidden = None
         elif self.encoder_injected:
-            # Learned encoder replaces W_E before frozen rule attention.
             rule_hidden = self._encoder_injected_rule_hidden(idx)
         else:
-            _, rule_hidden = self.rule_model(idx, return_hidden=True)
-            rule_hidden    = rule_hidden.to(idx.device)
-        logits, _ = self._forward_layerwise(idx, rule_hidden,
+            rule_logits, rule_hidden = self.rule_model(idx, return_hidden=True)
+            rule_logits = rule_logits.to(idx.device)
+            rule_hidden = rule_hidden.to(idx.device)
+        logits, _ = self._forward_layerwise(idx, rule_hidden, rule_logits,
                                              indices_query=indices_query,
                                              indices_key=indices_key)
         return logits
