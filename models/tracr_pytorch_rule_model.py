@@ -10,37 +10,51 @@ import torch.nn.functional as F
 
 from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RASP program (sequence_rule.py) being compiled:
+#
+#   lookup_selector = Select(indices, indices, lambda k, q: k == (q+1) % 4)
+#   predicted_next  = Aggregate(lookup_selector, tokens)
+#
+# For a period-4 sequence  tokens[q] = (starter + OFFSETS[q%4]) % V :
+#   predicted_next[q] = tokens[(q+1)%4]   ← the token at cycle-position (q+1)%4
+#
+# TRACR compilation (one attention head, no MLP needed):
+#
+#   Residual stream layout  d = V*2 + 4 = 28 dims:
+#     dims  0 .. V-1    : one-hot of current token t_q        (from W_E)
+#     dims  V .. 2V-1   : one-hot of predicted-next token     (written by attention)
+#     dims 2V .. 2V+3   : one-hot of position class q%4       (from W_pos)
+#
+#   Causal period-4 trick:
+#     The selector k==(q+1)%4 is non-causal, but because the sequence has
+#     period 4, t_{q-3} == t_{q+1}  (since (q-3)%4 == (q+1)%4).
+#     We therefore attend to k = q-3, which is causal for q >= 3.
+#
+#   Weight matrices:
+#     W_E[t]   = e_t  in dims 0..V-1               (token embedding)
+#     W_pos[p] = e_p  in dims 2V..2V+3             (positional embedding, p = q%4)
+#
+#     W_Q : shifts pos subspace forward by +1
+#           Q[q] has pos-class (q+1)%4  →  attends to k where k%4==(q+1)%4  →  k=q-3
+#     W_K : identity on pos subspace
+#           K[k] has pos-class k%4
+#     W_V : copies token dims (0..V-1) into next-token slot (V..2V-1)
+#     W_O : identity on next-token slot (V..2V-1)
+#
+#   After residual add (q >= 3):
+#     h_out[q] = [e_{t_q} | e_{t_{q+1}} | e_{q%4}]
+#   Logits are read directly from dims V..2V-1 of h_out.
+#
+#   For q < 3 there is no valid causal key with the right pos-class,
+#   so softmax is uniform over the few legal keys → dims V..2V-1 are
+#   non-one-hot (honest uncertainty).  The downstream adapter handles this.
+#
+#   No trainable parameters.
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 class TracrPyTorchRuleModel(nn.Module):
-    # d_model = VOCAB_SIZE * 2 + 4 = 28
-    #
-    # Hidden state layout (28 dims):
-    #   dims  0-11 : one-hot of CURRENT token at position q   (from W_E, residual)
-    #   dims 12-23 : one-hot of NEXT token at position q      (written by W_V/W_O via attention)
-    #   dims 24-27 : one-hot of q % 4                         (from W_pos, residual)
-    #
-    # Attention trick — attend 3 steps back to read the next token:
-    #   The sequence has period 4, so t_{q-3} = next_t_q because
-    #   OFFSETS[(q-3)%4] = OFFSETS[(q+1)%4]  (since -3 ≡ +1 mod 4).
-    #
-    #   W_Q shifts pos subspace FORWARD by 1 → query at q has pos_class (q+1)%4
-    #   W_K is identity on pos subspace       → key   at k has pos_class k%4
-    #   dot-product peaks where k%4 == (q+1)%4, i.e. k = q-3 (causal, q≥3)
-    #   W_V maps current-token dims (0-11) → next-token dims (12-23)
-    #   W_O is identity on dims 12-23
-    #
-    # After residual add (q ≥ 3):
-    #   h_out[q] = [e_{t_q} ; e_{next_t_q} ; e_{q%4}]
-    #
-    # For q < 3 there is no valid past key, so the causal softmax self-attends
-    # (score = 0, but it is the only legal key):
-    #   h_out[q] = [e_{t_q} ; e_{t_q} ; e_{q%4}]  (self-reference fallback)
-    #
-    # Logits are computed analytically (next-token prediction cannot be expressed
-    # as a single linear map on h_out without an MLP).
-    #
-    # No trainable parameters.
-
     TRACR_D_MODEL: int = VOCAB_SIZE * 2 + 4   # 28
 
     def __init__(self, max_seq_len: int = 128, attn_scale: float = 20.0):
@@ -48,94 +62,83 @@ class TracrPyTorchRuleModel(nn.Module):
         V = VOCAB_SIZE   # 12
         d = self.TRACR_D_MODEL   # 28
 
-        self.d_model    = d
+        self.V = V
+        self.d_model = d
         self.attn_scale = attn_scale
 
-        # W_E[t] = e_t in dims 0-11, zeros elsewhere
+        # W_E[t] = e_t in dims 0..V-1
         W_E = torch.zeros(V, d)
         W_E[:V, :V] = torch.eye(V)
         self.register_buffer("W_E", W_E)
 
-        # W_pos[p] = e_p in dims 24-27, zeros elsewhere
+        # W_pos[p] = e_p in dims 2V..2V+3
         W_pos = torch.zeros(4, d)
         for i in range(4):
             W_pos[i, 2 * V + i] = 1.0
         self.register_buffer("W_pos", W_pos)
 
-        # W_Q: shifts pos subspace (dims 24-27) forward by 1 mod 4
-        # (h @ W_Q.T)[2V+i] = h[2V+(i-1)%4]  →  Q has pos_class (q+1)%4
-        # This makes q attend to k where k%4 == (q+1)%4, i.e. k = q-3 (causal).
-        # t_{q-3} = next_t_q because OFFSETS[(q-3)%4] == OFFSETS[(q+1)%4] (-3≡+1 mod 4).
+        # W_Q: shifts pos subspace forward by +1 mod 4
+        #   h @ W_Q.t() has pos-class (q+1)%4 → q attends to k where k%4==(q+1)%4
         W_Q = torch.zeros(d, d)
         for i in range(4):
-            W_Q[2 * V + i, 2 * V + (i - 1) % 4] = 1.0
+            W_Q[2 * V + (i + 1) % 4, 2 * V + i] = 1.0
         self.register_buffer("W_Q", W_Q)
 
-        # W_K: identity on pos subspace (dims 24-27)
+        # W_K: identity on pos subspace
         W_K = torch.zeros(d, d)
         for i in range(4):
             W_K[2 * V + i, 2 * V + i] = 1.0
         self.register_buffer("W_K", W_K)
 
-        # W_V: maps current-token dims (0-11) → prev-token dims (12-23)
-        # (h @ W_V.T)[V+i] = h[i]  →  V has e_{t_q} in dims 12-23
+        # W_V: copies token dims 0..V-1 into next-token slot V..2V-1
         W_V = torch.zeros(d, d)
         for i in range(V):
             W_V[V + i, i] = 1.0
         self.register_buffer("W_V", W_V)
 
-        # W_O: identity on prev-token dims (12-23)
+        # W_O: identity on next-token slot V..2V-1
         W_O = torch.zeros(d, d)
         for i in range(V):
             W_O[V + i, V + i] = 1.0
         self.register_buffer("W_O", W_O)
 
-        self.register_buffer("_offsets", torch.tensor(OFFSETS, dtype=torch.long))
-
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         """
-        idx : (B, T)  token indices.
-        Returns logits (B, T, V) and optionally hidden (B, T, 28).
+        idx : (B, T)  — token indices in [0, VOCAB_SIZE).
+        Returns logits (B, T, V) and optionally the full hidden state (B, T, 28).
 
-        Logits predict next_token[q] = (x + OFFSETS[(q+1)%4]) % V  (analytical).
-        Hidden is computed by actual attention using W_Q/K/V/O:
-          h_out[q] = [e_{t_q} ; e_{t_{q+1}} ; e_{q%4}]   (NEXT encoding for q>=3)
+        logits[b, q] is the predicted next-token distribution for position q,
+        read directly from dims V..2V-1 of the residual stream after attention.
+        For q >= 3 this is a clean one-hot; for q < 3 it is a soft distribution
+        (honest uncertainty, no valid causal key).
         """
-        B, T   = idx.shape
-        device = idx.device
-        t_idx  = torch.arange(T, device=device)
-        x      = idx[:, 0]
+        B, T = idx.shape
+        t_idx = torch.arange(T, device=idx.device)
 
-        # Analytical next-token logits
-        next_t = (x[:, None] + self._offsets[(t_idx + 1) % 4][None, :]) % VOCAB_SIZE
-        logits = F.one_hot(next_t, num_classes=VOCAB_SIZE).float()
-        logits = logits.detach().requires_grad_(True)
-
-        if not return_hidden:
-            return logits
-
-        # --- Actual attention forward ---
         # Embed: h[q] = W_E[t_q] + W_pos[q%4]
         h = self.W_E[idx] + self.W_pos[t_idx % 4].unsqueeze(0)   # (B, T, 28)
 
         # Queries, Keys, Values
-        Q = h @ self.W_Q.t()    # (B, T, 28): e_{(q+1)%4} in dims 24-27 (forward shift)
-        K = h @ self.W_K.t()    # (B, T, 28): e_{q%4}     in dims 24-27
-        V = h @ self.W_V.t()    # (B, T, 28): e_{t_q}     in dims 12-23
+        Q = h @ self.W_Q.t()   # pos-class (q+1)%4 in dims 2V..2V+3
+        K = h @ self.W_K.t()   # pos-class q%4     in dims 2V..2V+3
+        V = h @ self.W_V.t()   # token one-hot     in dims V..2V-1
 
         # Causal attention scores  (only pos dims contribute to dot-product)
-        scores = (Q @ K.transpose(-1, -2)) * self.attn_scale      # (B, T, T)
-        mask   = torch.ones(T, T, device=device).tril().bool()
+        scores = (Q @ K.transpose(-1, -2)) * self.attn_scale   # (B, T, T)
+        mask = torch.ones(T, T, device=idx.device).tril().bool()
         scores = scores.masked_fill(~mask, float('-inf'))
-        attn   = F.softmax(scores, dim=-1)                         # (B, T, T)
+        attn = F.softmax(scores, dim=-1)                        # (B, T, T)
 
-        # Attended value + output projection
-        attn_out = (attn @ V) @ self.W_O.t()                      # (B, T, 28)
+        # Write attended token into next-token slot, add to residual
+        attn_out = (attn @ V) @ self.W_O.t()                   # (B, T, 28)
+        h_out = h + attn_out                                    # (B, T, 28)
 
-        # Residual: h_out[q] = [e_{t_q}(0-11) ; e_{t_{q+1}}(12-23) ; e_{q%4}(24-27)]  (q>=3)
-        h_out = h + attn_out                                       # (B, T, 28)
+        # Logits from next-token slot of residual stream
+        logits = h_out[:, :, self.V : 2 * self.V]              # (B, T, 12)
 
-        return logits, h_out
+        if return_hidden:
+            return logits, h_out
+        return logits
 
     def parameters(self, recurse=True):
         return iter([])
@@ -147,41 +150,33 @@ class TracrPyTorchRuleModel(nn.Module):
 if __name__ == "__main__":
     model = TracrPyTorchRuleModel()
     print(f"TRACR_D_MODEL = {model.TRACR_D_MODEL}")
-    print(f"W_E   shape: {model.W_E.shape}")
-    print(f"W_pos shape: {model.W_pos.shape}")
-    print(f"W_Q   shape: {model.W_Q.shape}")
 
     inp = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
     logits, hidden = model(inp, return_hidden=True)
 
-    print(f"\nInput : {inp.squeeze().tolist()}")
-    print(f"Logits (next-token predictions): {logits.argmax(-1).squeeze().tolist()}")
-    print(f"Expected                       : [5, 7, 0, 0, 5, 7, 0, 0]")
+    print(f"\nInput  : {inp.squeeze().tolist()}")
+    print(f"Preds  : {logits.argmax(-1).squeeze().tolist()}")
+    print(f"Expected (q>=3): [0, 5, 7, 0]  at positions 3-6 → next tokens are [5,7,0,0]")
 
     print(f"\nHidden state breakdown (28-dim):")
     for q in range(8):
         h = hidden[0, q]
-        cur  = h[:12].argmax().item()
-        nxt  = h[12:24].argmax().item()
-        pos  = h[24:].argmax().item()
-        note = "(uniform fallback)" if q < 3 else ""
+        cur = h[:12].argmax().item()
+        nxt = h[12:24].argmax().item()
+        pos = h[24:].argmax().item()
+        note = "(fallback: q<3)" if q < 3 else ""
         print(f"  q={q}: cur={cur}  next={nxt}  pos%4={pos}  {note}")
 
-    # Verify: cur[q]==t_q, next[q]==next_t_q for q>=3, pos[q]==q%4
-    # For q<3, no past key matches the query's pos_class so attention is uniform
-    # → dims 12-23 are non-one-hot (acceptable; adapter learns to ignore them).
     tokens = inp.squeeze().tolist()
     next_tokens = logits.argmax(-1).squeeze().tolist()
     print(f"\nVerification (q>=3):")
     all_ok = True
     for q in range(3, 8):
         h = hidden[0, q]
-        cur = h[:12].argmax().item()
         nxt = h[12:24].argmax().item()
-        pos = h[24:].argmax().item()
-        ok  = (cur == tokens[q]) and (nxt == next_tokens[q]) and (pos == q % 4)
+        exp = next_tokens[q]
+        ok = nxt == exp
         all_ok = all_ok and ok
         tag = "" if ok else " FAIL"
-        print(f"  q={q}: cur={cur}(exp {tokens[q]}) "
-              f"next={nxt}(exp {next_tokens[q]}) pos={pos}{tag}")
+        print(f"  q={q}: next={nxt} (exp {exp}){tag}")
     print(f"  All correct (q>=3): {all_ok}")

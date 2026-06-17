@@ -45,4 +45,4 @@ if __name__ == "__main__":
     print("logits shape :", logits.shape)
     print("hidden shape :", hidden.shape)
     print("predictions  :", logits.argmax(-1).tolist())
-    print("expected     :", [[5, 7, 0, 0, 5, 7, 0, 0]])
+    print("expected(q>=3):", "positions 3-7 → [0, 5, 7, 0, 0]")
