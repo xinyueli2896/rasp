@@ -11,12 +11,12 @@ from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 
 
 class RuleModelWrapper(nn.Module):
-    # Wraps the TRACR-compiled PyTorch rule model (period-4 causal trick).
+    # Provides (current_token, pos_class) as hidden state for the adapter.
     # forward(idx, return_hidden=True) returns (logits, rule_hidden) where
-    # rule_hidden is the actual 28-dim hidden state from the transformer:
+    # rule_hidden is a 16-dim vector:
     #   dims  0-11 : one-hot of current token at position q
-    #   dims 12-23 : one-hot of next token (correct for q>=3, noisy for q<3)
-    #   dims 24-27 : one-hot of q % 4
+    #   dims 12-15 : one-hot of q % 4
+    # The adapter learns next_token = f(current_token, pos_class).
     # parameters() returns empty — no trainable parameters.
 
     def __init__(self, max_seq_len: int = 128,

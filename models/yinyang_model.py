@@ -14,11 +14,11 @@ from models.rule_model               import RuleModelWrapper
 from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 from data.dataset                    import VOCAB_SIZE
 
-# rule_hidden is the 28-dim hidden state of the TRACR-compiled rule transformer:
+# rule_hidden is the 16-dim hidden state from the rule model:
 #   dims  0-11 : one-hot of current token t_q
-#   dims 12-23 : one-hot of attended token (= next token for q>=3, noisy for q<3)
-#   dims 24-27 : one-hot of q % 4
-RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
+#   dims 12-15 : one-hot of q % 4
+# The adapter learns the rule: next_token = f(current_token, pos_class).
+RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 16
 
 
 class YinyangCrossAttention(nn.Module):
@@ -30,11 +30,11 @@ class YinyangCrossAttention(nn.Module):
     # exclusively to rule position k=q, so each AR position reads the rule
     # signal at the same sequence position.
     #
-    # Value input: rule_hidden[k] — the rule model's 28-dim hidden state at k:
+    # Value input: rule_hidden[k] — the rule model's 16-dim hidden state at k:
     #   dims  0-11 : one-hot current token t_k
-    #   dims 12-23 : one-hot attended token (= next token for k>=3, noisy for k<3)
-    #   dims 24-27 : one-hot k % 4
-    # v_proj maps 28 → embed_dim; out_proj maps embed_dim → d_model.
+    #   dims 12-15 : one-hot k % 4
+    # The adapter learns next_token = f(current_token, pos_class) itself.
+    # v_proj maps 16 → embed_dim; out_proj maps embed_dim → d_model.
 
     PE_SCALE = 20.0
 
@@ -81,10 +81,9 @@ class YinyangCrossAttention(nn.Module):
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         """
         ar_hidden  : (B, T_q, d_model)   — AR hidden state at current layer
-        rule_hidden: (B, T_k, RULE_D_MODEL=28) — rule model hidden states:
-                       dims  0-11 : one-hot current token  (always correct)
-                       dims 12-23 : one-hot next token     (correct for k>=3, noisy k<3)
-                       dims 24-27 : one-hot k % 4          (always correct)
+        rule_hidden: (B, T_k, RULE_D_MODEL=16) — rule model hidden states:
+                       dims  0-11 : one-hot current token t_k
+                       dims 12-15 : one-hot k % 4
         Returns    : (B, T_q, d_model)   — residual correction
         """
         B, T_q, _ = ar_hidden.shape
@@ -581,10 +580,9 @@ class YinyangModel(nn.Module):
         elif self.encoder_injected:
             rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
         else:
-            # rule_hidden: h_out (B, T, 28) from the TRACR transformer.
-            # dims  0-11 : one-hot current token  (always correct)
-            # dims 12-23 : one-hot next token     (correct for q>=3, noisy for q<3)
-            # dims 24-27 : one-hot q % 4          (always correct)
+            # rule_hidden: h (B, T, 16) — current token + pos class.
+            # dims  0-11 : one-hot current token t_q
+            # dims 12-15 : one-hot q % 4
             _, rule_hidden = self.rule_model(idx, return_hidden=True)
             rule_hidden = rule_hidden.to(idx.device)
         logits, _ = self._forward_layerwise(idx, rule_hidden,
