@@ -92,13 +92,13 @@ class BassRuleInputEncoder(nn.Module):
     representation compared to sparse one-hots.
     """
 
-    def __init__(self, n_pitches: int = 12, rule_d_model: int = TRACR_D_MODEL):
+    def __init__(self, n_pitches: int = 12):
         super().__init__()
-        self.embedding = nn.Embedding(n_pitches, rule_d_model)
+        self.embedding = nn.Embedding(n_pitches, n_pitches)
         nn.init.xavier_uniform_(self.embedding.weight)
 
     def forward(self, pc: torch.Tensor) -> torch.Tensor:
-        return self.embedding(pc)   # (B, T, rule_d_model)
+        return self.embedding(pc)   # (B, T, n_pitches)
 
 
 class BassTokMlpEncoder(nn.Module):
@@ -109,15 +109,15 @@ class BassTokMlpEncoder(nn.Module):
     information in the frozen part of the residual stream.
     """
 
-    def __init__(self, n_pitches: int = 12, rule_d_model: int = TRACR_D_MODEL, hidden: int = 64):
+    def __init__(self, n_pitches: int = 12, hidden: int = 64):
         super().__init__()
         self.n_pitches = n_pitches
         self.fc1 = nn.Linear(n_pitches, hidden)
-        self.fc2 = nn.Linear(hidden, rule_d_model)
+        self.fc2 = nn.Linear(hidden, n_pitches)
 
     def forward(self, pc: torch.Tensor) -> torch.Tensor:
         x = F.one_hot(pc, num_classes=self.n_pitches).float()
-        return self.fc2(F.relu(self.fc1(x)))   # (B, T, rule_d_model)
+        return self.fc2(F.relu(self.fc1(x)))   # (B, T, n_pitches)
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +272,12 @@ class CPYinyangTransformer(nn.Module):
 
         if encoder_injected:
             # Learned pitch-class encoder replaces the hard one-hot W_E lookup.
-            # W_pos is kept frozen; the encoder is shared across all adapter layers.
-            d = self.rule_model.d_model
+            # Encoder outputs N_ROOTS=12 dims only (dims 0-11); _encoder_injected_rule_hidden
+            # zero-pads to d_model before adding frozen W_pos.
             if encoder_type == 'token_mlp':
-                self.rule_input_encoder = BassTokMlpEncoder(rule_d_model=d)
+                self.rule_input_encoder = BassTokMlpEncoder()
             else:
-                self.rule_input_encoder = BassRuleInputEncoder(rule_d_model=d)
+                self.rule_input_encoder = BassRuleInputEncoder()
 
         if bidirectional:
             # Learned AR→rule projection (one per adapter layer).
@@ -311,7 +311,9 @@ class CPYinyangTransformer(nn.Module):
         """
         t_idx   = torch.arange(x_proc.shape[1], device=x_proc.device)
         cur_pc  = self._cur_pc(x_proc)                          # (B, T)
-        h       = self.rule_input_encoder(cur_pc)               # (B, T, d_model)
+        enc     = self.rule_input_encoder(cur_pc)               # (B, T, N_ROOTS=12)
+        d       = self.rule_model.d_model
+        h       = F.pad(enc, (0, d - enc.shape[-1]))            # (B, T, d_model)
         pos_emb = self.rule_model.W_pos[t_idx % 4]             # (T, d_model)
         return h + pos_emb.unsqueeze(0)
 
@@ -325,9 +327,9 @@ class CPYinyangTransformer(nn.Module):
         """
         if not self.encoder_injected:
             return None
-        cur_pc     = self._cur_pc(x_proc)                       # (B, T)
-        enc_out    = self.rule_input_encoder(cur_pc)             # (B, T, d_model)
-        return enc_out[:, :, :N_ROOTS], cur_pc                   # (B,T,12), (B,T)
+        cur_pc  = self._cur_pc(x_proc)                           # (B, T)
+        enc_out = self.rule_input_encoder(cur_pc)                # (B, T, N_ROOTS=12)
+        return enc_out, cur_pc                                   # (B,T,12), (B,T)
 
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
@@ -404,8 +406,10 @@ class CPYinyangTransformer(nn.Module):
             t_idx   = torch.arange(max_seq_len, device=x.device)
             offsets = self.rule_model._offsets[t_idx % 4]               # (max_seq_len,)
             cur_pc  = (pc_0[:, None] + offsets[None, :]) % 12           # (B, max_seq_len)
-            h_enc   = self.rule_input_encoder(cur_pc)                    # (B, max_seq_len, 16)
-            pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, 16)
+            d       = self.rule_model.d_model
+            h_enc   = self.rule_input_encoder(cur_pc)                    # (B, max_seq_len, 12)
+            h_enc   = F.pad(h_enc, (0, d - h_enc.shape[-1]))            # (B, max_seq_len, d)
+            pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, d)
             rule_hidden = h_enc + pos_emb.unsqueeze(0)
         elif not self.bidirectional:
             rule_hidden = self.rule_model.build_rule_hidden_analytic(pc_0, max_seq_len, x.device)

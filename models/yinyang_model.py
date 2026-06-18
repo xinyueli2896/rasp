@@ -213,15 +213,18 @@ class LearnedRuleInputEncoder(nn.Module):
                     self.shift_logits[p, s] = 4.0
         elif encoder_type == 'token_mlp':
             # one_hot(token) only — no pos_class. Two-layer MLP.
+            # Output is vocab_size dims (0-11 only); _encoder_injected_rule_hidden
+            # zero-pads to rule_d_model before adding W_pos.
             hidden = 64
             self.tok_fc1 = nn.Linear(vocab_size, hidden)
-            self.tok_fc2 = nn.Linear(hidden, rule_d_model)
+            self.tok_fc2 = nn.Linear(hidden, vocab_size)
             nn.init.xavier_uniform_(self.tok_fc1.weight)
             nn.init.zeros_(self.tok_fc1.bias)
             nn.init.xavier_uniform_(self.tok_fc2.weight)
             nn.init.zeros_(self.tok_fc2.bias)
         else:
-            self.embedding = nn.Embedding(vocab_size, rule_d_model)
+            # embedding: output vocab_size dims; zero-padded to rule_d_model externally.
+            self.embedding = nn.Embedding(vocab_size, vocab_size)
 
         if encoder_type == 'transformer':
             import warnings
@@ -326,9 +329,9 @@ class LearnedRuleInputEncoder(nn.Module):
 
         if self.encoder_type == 'token_mlp':
             tok_oh = F.one_hot(tokens, num_classes=self.vocab_size).float()  # (B, T, V)
-            return self.tok_fc2(F.relu(self.tok_fc1(tok_oh)))                # (B, T, rule_d_model)
+            return self.tok_fc2(F.relu(self.tok_fc1(tok_oh)))                # (B, T, V)
 
-        h = self.embedding(tokens)
+        h = self.embedding(tokens)   # (B, T, V)
         if self.encoder_type == 'transformer':
             h = self.transformer(h)
         return h
@@ -533,12 +536,14 @@ class YinyangModel(nn.Module):
                 n_layers     = encoder_n_layers,
                 n_heads      = encoder_n_heads,
             ).to(device)
-            # Initialize embedding to W_E so the pipeline starts from a correct state.
+            # Initialize embedding to W_E[:, :V] (identity block) so dims 0-11
+            # start as one-hots — the encoder only writes into those dims now.
             with torch.no_grad():
                 if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier',
                                         'circular', 'token_mlp'):
+                    V = self.rule_input_encoder.embedding.weight.shape[1]
                     self.rule_input_encoder.embedding.weight.copy_(
-                        self.rule_model._tracr.W_E
+                        self.rule_model._tracr.W_E[:, :V]
                     )
 
         assert n_layers % n_skip == 0, \
@@ -598,10 +603,13 @@ class YinyangModel(nn.Module):
         B, T = idx.shape
         pos  = torch.arange(T, device=idx.device)
 
-        # Learned token embedding replacing frozen W_E[idx]  →  (B, T, 28)
-        enc_emb = self.rule_input_encoder(idx, positions=pos)
-
-        rule = self.rule_model._tracr
+        # Learned token embedding replacing frozen W_E[idx].
+        # Encoder outputs vocab_size dims (0-11 only); pad zeros into dims 12-27
+        # so the encoder cannot write into the next-token or pos-class slots.
+        enc_emb = self.rule_input_encoder(idx, positions=pos)          # (B, T, V)
+        rule    = self.rule_model._tracr
+        d       = rule.W_E.shape[1]                                    # 28
+        enc_emb = F.pad(enc_emb, (0, d - enc_emb.shape[-1]))          # (B, T, 28)
 
         # h = enc_emb + frozen W_pos  (same structure as the base rule model)
         h = enc_emb + rule.W_pos[pos % 4].unsqueeze(0)                # (B, T, 28)
@@ -681,11 +689,10 @@ class YinyangModel(nn.Module):
             gather_idx = (idx_v[None, None, :] - idx[:, :, None]) % V        # (B, T, V)
             return shift_p[None, :, :].expand(B, -1, -1).gather(2, gather_idx)  # (B, T, V)
         elif enc.encoder_type in ('token_mlp', 'embedding'):
-            # These encoders replace W_E (current-token embedding).
-            # Dims 0-V of the raw output are the current-token logits — no TRACR attention.
+            # Encoder outputs vocab_size dims only (writes into dims 0-V exclusively).
             # Compare against idx (current token), not tgt.
             enc_emb = enc(idx, positions=torch.arange(idx.shape[1], device=idx.device))
-            return enc_emb[:, :, :enc.vocab_size]                        # (B, T, V)
+            return enc_emb                                               # (B, T, V)
         return None
 
     @torch.no_grad()
