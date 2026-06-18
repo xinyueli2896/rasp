@@ -678,6 +678,12 @@ class YinyangModel(nn.Module):
             idx_v     = torch.arange(V, device=idx.device)
             gather_idx = (idx_v[None, None, :] - idx[:, :, None]) % V        # (B, T, V)
             return shift_p[None, :, :].expand(B, -1, -1).gather(2, gather_idx)  # (B, T, V)
+        elif enc.encoder_type in ('token_mlp', 'embedding'):
+            # No direct next-token logits; use dims V:2V from the TRACR attention output.
+            # This measures how well the encoder+attention pipeline predicts the next token
+            # and also enables --enc_loss_weight auxiliary supervision.
+            h_out = self._encoder_injected_rule_hidden(idx)             # (B, T, 28)
+            return h_out[:, :, enc.vocab_size : 2 * enc.vocab_size]     # (B, T, V)
         return None
 
     @torch.no_grad()
