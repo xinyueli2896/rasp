@@ -322,10 +322,13 @@ def run_evaluation(args):
     is_multi   = {lbl: False for lbl, _ in single_models}
     is_multi.update({lbl: multi for lbl, _, multi in adapter_models})
 
+    def _short(lbl):
+        return lbl.removeprefix('yinyang_')
+
     header = f"{'Data Split':<20} {'Starters':<18}"
     for lbl in all_labels:
         w = col_w_ms if is_multi[lbl] else col_w
-        header += f" {lbl:>{w}}"
+        header += f" {_short(lbl):>{w}}"
     sep = "-" * len(header)
 
     print(header)
@@ -358,7 +361,7 @@ def run_evaluation(args):
         print("=" * 70)
         enc_header = f"{'Data Split':<20} {'Starters':<18}"
         for lbl in enc_labels:
-            enc_header += f" {lbl:>{col_w_e}}"
+            enc_header += f" {_short(lbl):>{col_w_e}}"
         enc_sep = "-" * len(enc_header)
         print(enc_header)
         print(enc_sep)
@@ -385,7 +388,7 @@ def run_evaluation(args):
         per_header = f"{'Starter':>8} {'Category':<18}"
         for lbl in all_labels:
             w = col_w_ms if is_multi[lbl] else col_w
-            per_header += f" {lbl:>{w}}"
+            per_header += f" {_short(lbl):>{w}}"
         per_sep = "-" * len(per_header)
         print(per_sep)
         print(per_header)
