@@ -181,15 +181,18 @@ def rule_following_acc(model, starters, n_cycles, n_prompt, device):
 
 
 @torch.no_grad()
-def encoder_next_token_acc(model, starters, n_cycles, device):
-    """Token-level next-token prediction accuracy of the learned encoder.
+def encoder_token_acc(model, starters, n_cycles, device):
+    """Token-level accuracy of the learned encoder.
 
-    For each sequence from each starter, runs the encoder on the input tokens
-    with the correct position indices and compares argmax predictions to
-    ground-truth next tokens.  Returns None if the model has no encoder.
+    For token_mlp/embedding encoders: measures current-token reconstruction
+    (argmax of dims 0-V vs inp).  For shift-predicting encoders (mlp, softmax,
+    additive, fourier, circular): measures next-token prediction (vs tgt).
+    Returns None if the model has no encoder.
     """
     if not hasattr(model, 'rule_input_encoder'):
         return None, None
+    enc_type = model.rule_input_encoder.encoder_type
+    current_token_mode = enc_type in ('token_mlp', 'embedding')
     results = {}
     for x in starters:
         seq = make_sequence(x, n_cycles)
@@ -198,8 +201,9 @@ def encoder_next_token_acc(model, starters, n_cycles, device):
         enc_logits = model.get_encoder_logits(inp)
         if enc_logits is None:
             return None, None
-        correct = (enc_logits.argmax(-1) == tgt).sum().item()
-        results[x] = correct / tgt.numel()
+        ref = inp if current_token_mode else tgt
+        correct = (enc_logits.argmax(-1) == ref).sum().item()
+        results[x] = correct / ref.numel()
     return results, float(np.mean(list(results.values())))
 
 
@@ -303,9 +307,9 @@ def run_evaluation(args):
                 torch.zeros(1, 1, dtype=torch.long, device=device)) is not None:
             enc_results[lbl] = {}
             for cat_label, starters, _ in categories:
-                _, mean = encoder_next_token_acc(mdl0, starters, args.n_cycles, device)
+                _, mean = encoder_token_acc(mdl0, starters, args.n_cycles, device)
                 enc_results[lbl][cat_label] = mean
-            _, mean = encoder_next_token_acc(mdl0, all_starters, args.n_cycles, device)
+            _, mean = encoder_token_acc(mdl0, all_starters, args.n_cycles, device)
             enc_results[lbl]["Overall"] = mean
 
     # -----------------------------------------------------------------------
@@ -356,7 +360,7 @@ def run_evaluation(args):
         enc_labels = list(enc_results.keys())
         def _enc_w(lbl): return max(len(_short(lbl)), 5)
         print()
-        print("ENCODER NEXT-TOKEN ACCURACY  (argmax vs ground-truth next token)")
+        print("ENCODER TOKEN ACCURACY  (token_mlp/embedding: current token; others: next token)")
         enc_header = f"{'Data Split':<20} {'Starters':<15}"
         for lbl in enc_labels:
             enc_header += f" {_short(lbl):>{_enc_w(lbl)}}"

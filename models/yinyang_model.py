@@ -638,11 +638,13 @@ class YinyangModel(nn.Module):
         return logits
 
     def get_encoder_logits(self, idx: torch.Tensor) -> torch.Tensor | None:
-        """Pre-softmax logits (B, T, V) from the learned encoder for auxiliary supervision.
+        """Pre-softmax logits (B, T, V) from the learned encoder.
 
-        Auxiliary CE loss should be against tgt (next tokens): the encoder must predict
-        next_token[q] from (token[q], pos_class[q]). Direct supervision forces the
-        encoder to learn the cyclic shift rule, enabling generalisation to unseen tokens.
+        For shift-predicting encoders (mlp, softmax, additive, fourier, circular):
+          returns next-token logits — compare against tgt.
+        For token-embedding encoders (token_mlp, embedding):
+          returns current-token logits from dims 0-V of the raw encoder output —
+          compare against idx (current token).
         Returns None for encoder types without vocab-space logits.
         """
         if not (self.encoder_injected and hasattr(self, 'rule_input_encoder')):
@@ -679,11 +681,11 @@ class YinyangModel(nn.Module):
             gather_idx = (idx_v[None, None, :] - idx[:, :, None]) % V        # (B, T, V)
             return shift_p[None, :, :].expand(B, -1, -1).gather(2, gather_idx)  # (B, T, V)
         elif enc.encoder_type in ('token_mlp', 'embedding'):
-            # No direct next-token logits; use dims V:2V from the TRACR attention output.
-            # This measures how well the encoder+attention pipeline predicts the next token
-            # and also enables --enc_loss_weight auxiliary supervision.
-            h_out = self._encoder_injected_rule_hidden(idx)             # (B, T, 28)
-            return h_out[:, :, enc.vocab_size : 2 * enc.vocab_size]     # (B, T, V)
+            # These encoders replace W_E (current-token embedding).
+            # Dims 0-V of the raw output are the current-token logits — no TRACR attention.
+            # Compare against idx (current token), not tgt.
+            enc_emb = enc(idx, positions=torch.arange(idx.shape[1], device=idx.device))
+            return enc_emb[:, :, :enc.vocab_size]                        # (B, T, V)
         return None
 
     @torch.no_grad()

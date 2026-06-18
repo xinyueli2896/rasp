@@ -52,10 +52,12 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
             if enc_loss_weight > 0:
                 enc_logits = model.get_encoder_logits(inp)
                 if enc_logits is not None:
-                    enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+                    enc_type = model.rule_input_encoder.encoder_type
+                    enc_tgt  = inp if enc_type in ('token_mlp', 'embedding') else tgt
+                    enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE), enc_tgt.reshape(-1))
                     loss = loss + enc_loss_weight * enc_loss
-                    total_enc_loss    += enc_loss.item() * tgt.numel()
-                    total_enc_correct += (enc_logits.argmax(-1) == tgt).sum().item()
+                    total_enc_loss    += enc_loss.item() * enc_tgt.numel()
+                    total_enc_correct += (enc_logits.argmax(-1) == enc_tgt).sum().item()
 
             optimizer.zero_grad()
             loss.backward()
