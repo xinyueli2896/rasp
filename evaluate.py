@@ -54,13 +54,23 @@ def load_finetune(args, device):
     return model
 
 
+def _detect_rule_mode(ckpt_path: str) -> str:
+    """Infer rule_mode from checkpoint filename; default 'period4'."""
+    if 'seed_broadcast' in os.path.basename(ckpt_path):
+        return 'seed_broadcast'
+    return 'period4'
+
+
 def load_yinyang(label, ckpt_path, args, device):
+    rule_mode = getattr(args, 'rule_mode', None) or _detect_rule_mode(ckpt_path)
+
     if not os.path.exists(ckpt_path):
         print(f"  {label:<12}: WARNING {ckpt_path} not found")
         model = build_yinyang_model(
             ar_ckpt_path=args.ar_ckpt, max_seq_len=args.n_cycles * 4 + 10,
             d_model=args.d_model, n_layers=args.n_layers, n_heads=args.n_heads,
             use_lora=False, force_fallback=args.force_fallback, device=str(device),
+            rule_mode=rule_mode,
         )
         model.eval()
         return model
@@ -109,6 +119,7 @@ def load_yinyang(label, ckpt_path, args, device):
         bidirectional    = is_bidir,
         encoder_injected = is_enc_inj,
         encoder_type     = enc_type,
+        rule_mode        = rule_mode,
     )
 
     yinyang_state = {k.removeprefix('yinyang_attn.'): v
@@ -489,6 +500,10 @@ def get_args():
                    help="Checkpoint stems to evaluate across seeds, e.g. --seed_stems yinyang_skip1 yinyang_skip2")
     p.add_argument("--adapter_stems",  type=str,  nargs="*", default=None,
                    help="Override adapter stems in main table (default: yinyang_skip1 yinyang_skip2 yinyang_skip4)")
+    p.add_argument("--rule_mode",      type=str,  default=None,
+                   choices=['period4', 'seed_broadcast'],
+                   help="Override rule_mode for all loaded yinyang checkpoints. "
+                        "If omitted, auto-detected from checkpoint filename.")
     p.add_argument("--inspect_encoder", action="store_true",
                    help="Print learned token mapping table for encoder_injected checkpoints")
     return p.parse_args()
