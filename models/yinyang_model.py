@@ -16,13 +16,13 @@ from data.dataset                    import VOCAB_SIZE
 
 # rule_hidden is the 28-dim hidden state of the TRACR-compiled rule transformer:
 #   dims  0-11 : one-hot current token
-#   dims 12-23 : one-hot next token (via causal attention for q >= 3)
+#   dims 12-23 : one-hot seed token tokens[0] (broadcast to every position via attention)
 #   dims 24-27 : one-hot q % 4
 RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):
-    # Cross-attention that injects the rule model's next-token signal into the
+    # Cross-attention that injects the rule model's hidden state into the
     # AR residual stream at each transformer layer.
     #
     # Q and K are BOTH PURELY POSITIONAL (scaled sin/cos, PE_SCALE=20).
@@ -30,10 +30,11 @@ class YinyangCrossAttention(nn.Module):
     # exclusively to rule position k=q, so each AR position reads the rule
     # signal at the same sequence position.
     #
-    # Value input: rule_logits[k] — the rule model's 12-dim next-token
-    # prediction at position k (one-hot for k >= 3, soft for k < 3).
-    # This is already in logit/vocabulary space, so v_proj maps 12 → embed_dim.
-    # out_proj maps embed_dim → d_model for residual addition into the AR stream.
+    # Value input: rule_hidden[k] — the rule model's 28-dim hidden state at k:
+    #   dims  0-11 : one-hot current token
+    #   dims 12-23 : one-hot seed token (broadcast from position 0, all positions)
+    #   dims 24-27 : one-hot k % 4
+    # v_proj maps 28 → embed_dim; out_proj maps embed_dim → d_model.
 
     PE_SCALE = 20.0
 
@@ -82,7 +83,7 @@ class YinyangCrossAttention(nn.Module):
         ar_hidden  : (B, T_q, d_model)   — AR hidden state at current layer
         rule_hidden: (B, T_k, RULE_D_MODEL=28) — rule model hidden states:
                        dims  0-11 : one-hot current token  (always correct)
-                       dims 12-23 : one-hot next token     (correct for k >= 3)
+                       dims 12-23 : one-hot seed tokens[0] (broadcast, always correct)
                        dims 24-27 : one-hot k % 4          (always correct)
         Returns    : (B, T_q, d_model)   — residual correction
         """
@@ -581,9 +582,9 @@ class YinyangModel(nn.Module):
             rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
         else:
             # rule_hidden: h_out (B, T, 28) from the TRACR transformer.
-            # dims  0-11 : one-hot current token (always correct)
-            # dims 12-23 : one-hot next token    (correct for q >= 3)
-            # dims 24-27 : one-hot q % 4         (always correct)
+            # dims  0-11 : one-hot current token  (always correct)
+            # dims 12-23 : one-hot seed tokens[0] (broadcast, always correct)
+            # dims 24-27 : one-hot q % 4          (always correct)
             _, rule_hidden = self.rule_model(idx, return_hidden=True)
             rule_hidden = rule_hidden.to(idx.device)
         logits, _ = self._forward_layerwise(idx, rule_hidden,
