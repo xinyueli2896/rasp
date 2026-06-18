@@ -101,6 +101,8 @@ def load_yinyang(label, ckpt_path, args, device):
         enc_type = 'fourier'
     elif any('shift_logits' in k and 'rule_input_encoder' in k for k in state):
         enc_type = 'circular'
+    elif any('tok_fc1' in k for k in state):
+        enc_type = 'token_mlp'
     else:
         enc_type = 'embedding'
 

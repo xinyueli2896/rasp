@@ -261,13 +261,16 @@ def get_args():
                    help='Replace W_E[tokens] with a learned encoder before the frozen '
                         'W_Q/K/V/O rule attention block.')
     p.add_argument('--encoder_type',       type=str, default='embedding',
-                   choices=['embedding', 'transformer', 'softmax', 'mlp', 'additive', 'fourier', 'circular'],
-                   help='embedding: plain token lookup; transformer: embedding + bidir transformer; '
+                   choices=['embedding', 'transformer', 'softmax', 'mlp', 'additive',
+                            'fourier', 'circular', 'token_mlp'],
+                   help='token_mlp: one_hot(token) only → MLP → 28-dim (no pos_class); '
+                        'embedding: plain token lookup (no pos_class); '
+                        'circular: shift_logits per pos_class, generalises to ANY input token; '
+                        'transformer: embedding + bidir transformer; '
                         'softmax: position-separate 4xVxV tables (does not generalise); '
-                        'mlp: concat one-hot inputs (memorises pairs, does not generalise); '
-                        'additive: W_tok+W_pos (cannot represent cyclic shift - fails); '
-                        'fourier: Fourier rotation R[p]@phi(token) (underdetermined, fails on unseen); '
-                        'circular: shift_logits per pos_class, generalises to ANY input token.')
+                        'mlp: concat one-hot+pos_class (memorises pairs, does not generalise); '
+                        'additive: W_tok+W_pos (cannot represent cyclic shift); '
+                        'fourier: Fourier rotation R[p]@phi(token).')
     p.add_argument('--encoder_n_layers',   type=int, default=2)
     p.add_argument('--encoder_n_heads',    type=int, default=4)
     p.add_argument('--bidirectional',      action='store_true', default=False,

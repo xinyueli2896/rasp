@@ -142,6 +142,12 @@ class LearnedRuleInputEncoder(nn.Module):
                                 same ground-truth shift → overdetermined → unique
                                 convergence → generalises to ANY input token including
                                 unseen starters.
+    encoder_type='token_mlp'  : one_hot(token) only — no pos_class input.
+                                one_hot(V) → Linear(V→64) → ReLU → Linear(64→rule_d_model).
+                                Simplest possible learned token encoder; pos_class is
+                                supplied by the frozen W_pos in the TRACR attention, not
+                                the encoder.  May or may not generalise to unseen starters
+                                depending on what the hidden layer learns.
     """
 
     def __init__(
@@ -205,6 +211,15 @@ class LearnedRuleInputEncoder(nn.Module):
             with torch.no_grad():
                 for p, s in enumerate([5, 2, 5, 0]):
                     self.shift_logits[p, s] = 4.0
+        elif encoder_type == 'token_mlp':
+            # one_hot(token) only — no pos_class. Two-layer MLP.
+            hidden = 64
+            self.tok_fc1 = nn.Linear(vocab_size, hidden)
+            self.tok_fc2 = nn.Linear(hidden, rule_d_model)
+            nn.init.xavier_uniform_(self.tok_fc1.weight)
+            nn.init.zeros_(self.tok_fc1.bias)
+            nn.init.xavier_uniform_(self.tok_fc2.weight)
+            nn.init.zeros_(self.tok_fc2.bias)
         else:
             self.embedding = nn.Embedding(vocab_size, rule_d_model)
 
@@ -223,10 +238,11 @@ class LearnedRuleInputEncoder(nn.Module):
                 self.transformer = nn.TransformerEncoder(
                     encoder_layer, num_layers=n_layers, enable_nested_tensor=False,
                 )
-        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive', 'fourier', 'circular'):
+        elif encoder_type not in ('embedding', 'softmax', 'mlp', 'additive',
+                                   'fourier', 'circular', 'token_mlp'):
             raise ValueError(
                 f"encoder_type must be one of 'embedding', 'transformer', 'softmax', 'mlp', "
-                f"'additive', 'fourier', 'circular', got {encoder_type!r}"
+                f"'additive', 'fourier', 'circular', 'token_mlp', got {encoder_type!r}"
             )
 
     def forward(self, tokens: torch.Tensor,
@@ -307,6 +323,10 @@ class LearnedRuleInputEncoder(nn.Module):
             pad    = torch.zeros(*probs.shape[:-1], self.rule_d_model - self.vocab_size,
                                  device=tokens.device)
             return torch.cat([probs, pad], dim=-1)
+
+        if self.encoder_type == 'token_mlp':
+            tok_oh = F.one_hot(tokens, num_classes=self.vocab_size).float()  # (B, T, V)
+            return self.tok_fc2(F.relu(self.tok_fc1(tok_oh)))                # (B, T, rule_d_model)
 
         h = self.embedding(tokens)
         if self.encoder_type == 'transformer':
@@ -515,7 +535,8 @@ class YinyangModel(nn.Module):
             ).to(device)
             # Initialize embedding to W_E so the pipeline starts from a correct state.
             with torch.no_grad():
-                if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier', 'circular'):
+                if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier',
+                                        'circular', 'token_mlp'):
                     self.rule_input_encoder.embedding.weight.copy_(
                         self.rule_model._tracr.W_E
                     )
