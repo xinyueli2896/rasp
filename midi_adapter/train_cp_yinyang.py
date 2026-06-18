@@ -210,18 +210,33 @@ class UnseenAccuracyCallback(L.Callback):
 
 class CPYinyangLightning(L.LightningModule):
 
-    def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int):
+    def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int,
+                 enc_loss_weight: float = 0.0):
         super().__init__()
-        self.model    = model
-        self.max_lr   = max_lr
-        self.max_steps = max_steps
+        self.model           = model
+        self.max_lr          = max_lr
+        self.max_steps       = max_steps
+        self.enc_loss_weight = enc_loss_weight
 
     def forward(self, x):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
         x, pitch_shift = batch
-        loss = self.model.loss(x, pitch_shift)
+        x_proc = self.model.base.preprocess(x, pitch_shift)
+        loss   = self.model.loss(x, pitch_shift)
+
+        if self.enc_loss_weight > 0:
+            result = self.model.get_encoder_logits(x_proc)
+            if result is not None:
+                enc_logits, cur_pc = result            # (B,T,12), (B,T)
+                enc_loss = F.cross_entropy(
+                    enc_logits.reshape(-1, enc_logits.shape[-1]),
+                    cur_pc.reshape(-1),
+                )
+                loss = loss + self.enc_loss_weight * enc_loss
+                self.log('enc_loss', enc_loss, on_step=True, on_epoch=False)
+
         self.log('train_loss', loss, on_step=True, on_epoch=False)
         scheduler = self.lr_schedulers()
         if scheduler is not None:
@@ -295,7 +310,8 @@ def main(args):
     n_frozen    = sum(p.numel() for p in adapter.parameters() if not p.requires_grad)
     print(f'Trainable: {n_trainable:,}   Frozen: {n_frozen:,}')
 
-    lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps)
+    lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps,
+                             enc_loss_weight=args.enc_loss_weight)
 
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
@@ -433,6 +449,10 @@ def get_args():
                    choices=['embedding', 'token_mlp'],
                    help='embedding: nn.Embedding(12, d_model); '
                         'token_mlp: one_hot(12)→Linear(64)→ReLU→Linear(d_model)')
+    p.add_argument('--enc_loss_weight', type=float, default=0.0,
+                   help='Auxiliary CE loss weight for encoder current-pitch-class reconstruction. '
+                        'Directly supervises dims 0-11 of encoder output to predict the current pc. '
+                        'Only active when --encoder_injected. Recommended: 1.0.')
     p.add_argument('--rule_mode', type=str, default='current',
                    choices=['current', 'period4', 'seed_broadcast'],
                    help='current: analytical 16-dim rule model (existing); '

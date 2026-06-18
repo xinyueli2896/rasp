@@ -294,6 +294,14 @@ class CPYinyangTransformer(nn.Module):
     # Training forward  (full sequence, layer-by-layer injection)
     # ------------------------------------------------------------------
 
+    def _cur_pc(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """Extract current pitch class at each position from preprocessed tokens."""
+        B, T = x_proc.shape[0], x_proc.shape[1]
+        key     = (x_proc[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,)
+        t_idx   = torch.arange(T, device=x_proc.device)
+        offsets = self.rule_model._offsets[t_idx % 4]           # (T,)
+        return (key[:, None] + offsets[None, :]) % 12           # (B, T)
+
     def _encoder_injected_rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Encoder-injected rule_hidden: learned embedding for each pitch class.
 
@@ -301,15 +309,25 @@ class CPYinyangTransformer(nn.Module):
         then returns encoder(cur_pc) + W_pos[t%4].  Mirrors the analytical rule
         model but with a learned dense embedding instead of one-hot.
         """
-        B, T = x_proc.shape[0], x_proc.shape[1]
-        pc_seq  = x_proc[:, :, 1] % 128 % 12               # (B, T)
-        key     = pc_seq[:, 0]                              # (B,)
-        t_idx   = torch.arange(T, device=x_proc.device)
-        offsets = self.rule_model._offsets[t_idx % 4]       # (T,)
-        cur_pc  = (key[:, None] + offsets[None, :]) % 12    # (B, T)
-        h       = self.rule_input_encoder(cur_pc)            # (B, T, TRACR_D_MODEL)
-        pos_emb = self.rule_model.W_pos[t_idx % 4]          # (T, TRACR_D_MODEL)
+        t_idx   = torch.arange(x_proc.shape[1], device=x_proc.device)
+        cur_pc  = self._cur_pc(x_proc)                          # (B, T)
+        h       = self.rule_input_encoder(cur_pc)               # (B, T, d_model)
+        pos_emb = self.rule_model.W_pos[t_idx % 4]             # (T, d_model)
         return h + pos_emb.unsqueeze(0)
+
+    def get_encoder_logits(self, x_proc: torch.Tensor):
+        """Dims 0-11 of the raw encoder output as current-pitch-class logits.
+
+        Returns (enc_logits, cur_pc) where:
+          enc_logits : (B, T, 12)  — softmax should peak at cur_pc[b, t]
+          cur_pc     : (B, T)      — ground-truth current pitch class
+        Returns None if encoder_injected is False.
+        """
+        if not self.encoder_injected:
+            return None
+        cur_pc     = self._cur_pc(x_proc)                       # (B, T)
+        enc_out    = self.rule_input_encoder(cur_pc)             # (B, T, d_model)
+        return enc_out[:, :, :N_ROOTS], cur_pc                   # (B,T,12), (B,T)
 
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
