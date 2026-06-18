@@ -158,12 +158,15 @@ def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_d
 def load_model(base_ckpt: str | None, adapter_ckpt: str,
                model_size: int, adapter_rank: int, n_skip: int,
                bidirectional: bool, encoder_injected: bool,
-               device: torch.device) -> CPYinyangTransformer:
+               encoder_type: str = 'embedding', rule_mode: str = 'current',
+               device: torch.device = None) -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
     model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip,
                                  bidirectional=bidirectional,
-                                 encoder_injected=encoder_injected)
+                                 encoder_injected=encoder_injected,
+                                 encoder_type=encoder_type,
+                                 rule_mode=rule_mode)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
         print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
@@ -222,7 +225,8 @@ def run_evaluation(args) -> None:
 
     model = load_model(getattr(args, 'base_ckpt', None), args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip,
-                       args.bidirectional, args.encoder_injected, device)
+                       args.bidirectional, args.encoder_injected,
+                       args.encoder_type, args.rule_mode, device)
 
     rows       = []
     all_errors = []
@@ -281,7 +285,13 @@ def get_args():
     p.add_argument('--bidirectional',    action='store_true',
                    help='Must match the flag used during training (no-input-to-rule-model variant)')
     p.add_argument('--encoder_injected', action='store_true',
-                   help='Must match the flag used during training (learned pitch-class embedding)')
+                   help='Must match the flag used during training')
+    p.add_argument('--encoder_type', type=str, default='embedding',
+                   choices=['embedding', 'token_mlp'],
+                   help='Must match the flag used during training')
+    p.add_argument('--rule_mode', type=str, default='current',
+                   choices=['current', 'period4', 'seed_broadcast'],
+                   help='Must match the flag used during training')
     p.add_argument('--save_midi_dir',  type=str, default=None,
                    help='Directory for MIDI output (default: eval_midi/<adapter_name>/)')
     return p.parse_args()
