@@ -52,9 +52,9 @@ class YinyangCrossAttention(nn.Module):
         self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
-        # V reads from rule logits (VOCAB_SIZE=12); output goes to AR residual (d_model)
-        self.v_proj   = nn.Linear(VOCAB_SIZE, embed_dim)
-        self.out_proj = nn.Linear(embed_dim,  d_model)
+        # V reads from rule hidden state (RULE_D_MODEL=28); output goes to AR residual (d_model)
+        self.v_proj   = nn.Linear(RULE_D_MODEL, embed_dim)
+        self.out_proj = nn.Linear(embed_dim,    d_model)
 
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
@@ -75,16 +75,19 @@ class YinyangCrossAttention(nn.Module):
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
-    def forward(self, ar_hidden: torch.Tensor, rule_logits: torch.Tensor,
+    def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         """
-        ar_hidden  : (B, T_q, d_model)  — AR hidden state at current layer
-        rule_logits: (B, T_k, VOCAB_SIZE) — rule model next-token predictions
-        Returns    : (B, T_q, d_model)  — residual correction
+        ar_hidden  : (B, T_q, d_model)   — AR hidden state at current layer
+        rule_hidden: (B, T_k, RULE_D_MODEL=28) — rule model hidden states:
+                       dims  0-11 : one-hot current token  (always correct)
+                       dims 12-23 : one-hot next token     (correct for k >= 3)
+                       dims 24-27 : one-hot k % 4          (always correct)
+        Returns    : (B, T_q, d_model)   — residual correction
         """
         B, T_q, _ = ar_hidden.shape
-        B, T_k, _ = rule_logits.shape
+        B, T_k, _ = rule_hidden.shape
 
         if indices_query is None:
             indices_query = torch.arange(T_q, device=ar_hidden.device)
@@ -95,7 +98,7 @@ class YinyangCrossAttention(nn.Module):
         pos_k = self.pos_enc[:, indices_key,   :]
         Q = pos_q.expand(B, -1, -1)                                        # purely positional
         K = pos_k.expand(B, -1, -1)                                        # purely positional
-        V = self.v_proj(rule_logits)                                       # (B, T_k, embed_dim)
+        V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
@@ -529,7 +532,7 @@ class YinyangModel(nn.Module):
         ]).to(device)
 
     def _forward_layerwise(self, idx: torch.Tensor,
-                           rule_hidden:   torch.Tensor | None = None,   # rule logits (B,T,12)
+                           rule_hidden:   torch.Tensor | None = None,
                            indices_query: torch.Tensor | None = None,
                            indices_key:   torch.Tensor | None = None):
         ar = self._ar_base
@@ -573,15 +576,17 @@ class YinyangModel(nn.Module):
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
         if self.bidirectional:
-            rule_signal = None
+            rule_hidden = None
         elif self.encoder_injected:
-            rule_signal = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
+            rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
         else:
-            # Use rule model's next-token logits (VOCAB_SIZE-dim, logit space).
-            # For q >= 3 these are clean one-hots; for q < 3 soft/wrong.
-            rule_signal, _ = self.rule_model(idx, return_hidden=True)
-            rule_signal = rule_signal.to(idx.device)
-        logits, _ = self._forward_layerwise(idx, rule_signal,
+            # rule_hidden: h_out (B, T, 28) from the TRACR transformer.
+            # dims  0-11 : one-hot current token (always correct)
+            # dims 12-23 : one-hot next token    (correct for q >= 3)
+            # dims 24-27 : one-hot q % 4         (always correct)
+            _, rule_hidden = self.rule_model(idx, return_hidden=True)
+            rule_hidden = rule_hidden.to(idx.device)
+        logits, _ = self._forward_layerwise(idx, rule_hidden,
                                              indices_query=indices_query,
                                              indices_key=indices_key)
         return logits
