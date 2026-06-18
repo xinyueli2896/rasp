@@ -249,23 +249,23 @@ def run_evaluation(args):
     stem_models = [(s, _load_seed_models(s, args, device)) for s in stems]
 
     print()
-    print(f"Pretrain  set A : {AR_TRAIN_STARTERS}")
-    print(f"Finetune  set B : {FINETUNE_STARTERS}")
-    print(f"Eval partitions :")
-    print(f"  Pretrain-only (A\\B) = {EVAL_PRETRAIN_ONLY}")
-    print(f"  Finetune-only (B\\A) = {EVAL_FINETUNE_ONLY}")
-    print(f"  Both          (A∩B) = {EVAL_BOTH}")
-    print(f"  Neither             = {EVAL_NEITHER}")
+    print(f"AR pretrain starters   : {AR_TRAIN_STARTERS}")
+    print(f"Adapter train starters : {FINETUNE_STARTERS}")
+    print(f"Eval partitions:")
+    print(f"  AR-only  (AR \\ adapter) = {EVAL_PRETRAIN_ONLY}")
+    print(f"  Adapter-only (adapter \\ AR) = {EVAL_FINETUNE_ONLY}")
+    print(f"  Both     (AR ∩ adapter) = {EVAL_BOTH}")
+    print(f"  Test     (neither)      = {EVAL_NEITHER}")
     for s, mdls in stem_models:
         print(f"  {s}: {len(mdls)} seed(s)")
 
     n_prompt = args.prompt_len
 
     categories = [
-        ("Pretrain-only", EVAL_PRETRAIN_ONLY,  "A\\B = {0,1}"),
-        ("Finetune-only", EVAL_FINETUNE_ONLY,  "B\\A = {6..15}"),
-        ("Both          ", EVAL_BOTH,           "A∩B = {2..5}"),
-        ("Neither       ", EVAL_NEITHER,        "{17,19,20,21}"),
+        ("AR-only       ", EVAL_PRETRAIN_ONLY,  "AR\\adapter = {5,9}"),
+        ("Adapter-only  ", EVAL_FINETUNE_ONLY,  "adapter\\AR = {1,2,3,4,7,10,11}"),
+        ("Both          ", EVAL_BOTH,           "AR∩adapter = {0}"),
+        ("Test (unseen) ", EVAL_NEITHER,        "test = {6,8}"),
     ]
 
     # Single-model entries (Pretrain, Finetune) + multi-seed adapter entries
@@ -410,10 +410,10 @@ def run_evaluation(args):
         + [(s, mdls[0]) for s, mdls in stem_models]
     )
     for cat_label, x in (
-        [("Pretrain-only", EVAL_PRETRAIN_ONLY[0]),
-         ("Finetune-only", EVAL_FINETUNE_ONLY[0]),
+        [("AR-only       ", EVAL_PRETRAIN_ONLY[0]),
+         ("Adapter-only  ", EVAL_FINETUNE_ONLY[0]),
          ("Both          ", EVAL_BOTH[0])]
-        + [("Neither       ", x) for x in EVAL_NEITHER]
+        + [("Test (unseen) ", x) for x in EVAL_NEITHER]
     ):
         seq      = make_sequence(x, args.n_cycles)
         prompt   = torch.tensor([seq[:n_prompt]], dtype=torch.long, device=device)

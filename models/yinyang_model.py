@@ -513,11 +513,12 @@ class YinyangModel(nn.Module):
                 n_layers     = encoder_n_layers,
                 n_heads      = encoder_n_heads,
             ).to(device)
-            # Initialize embedding to W_E so the pipeline is analytically correct
-            # from epoch 0. Training refines rather than re-discovers the solution.
+            # Initialize embedding to W_E so the pipeline starts from a correct state.
             with torch.no_grad():
                 if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier', 'circular'):
-                    self.rule_input_encoder.embedding.weight.copy_(self._W_E)
+                    self.rule_input_encoder.embedding.weight.copy_(
+                        self.rule_model._tracr.W_E
+                    )
 
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
@@ -566,14 +567,35 @@ class YinyangModel(nn.Module):
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
         """
-        Returns rule_hidden of shape (B, T, 12): the encoder's next-token
-        probability distribution at each position, matching the format of the
-        non-encoder-injected path (rule_hidden = one_hot(next_token)).
+        Replace W_E with the learned encoder, then run the frozen TRACR attention.
+        Returns full 28-dim h_out, identical in shape to the non-injected path.
+
+        dims  0-11 : encoder output (learned token representation)
+        dims 12-23 : aggregated via frozen W_V/W_O attention (encoder-dependent)
+        dims 24-27 : one-hot q % 4 from frozen W_pos
         """
         B, T = idx.shape
         pos  = torch.arange(T, device=idx.device)
-        enc_out = self.rule_input_encoder(idx, positions=pos)   # (B, T, 28 or 12)
-        return enc_out[:, :, :VOCAB_SIZE]                       # (B, T, 12)
+
+        # Learned token embedding replacing frozen W_E[idx]  →  (B, T, 28)
+        enc_emb = self.rule_input_encoder(idx, positions=pos)
+
+        rule = self.rule_model._tracr
+
+        # h = enc_emb + frozen W_pos  (same structure as the base rule model)
+        h = enc_emb + rule.W_pos[pos % 4].unsqueeze(0)                # (B, T, 28)
+
+        # Frozen TRACR attention (rule_mode = period4 or seed_broadcast via W_Q)
+        Q      = h @ rule.W_Q.t()
+        K      = h @ rule.W_K.t()
+        V_mat  = h @ rule.W_V.t()
+        scores = (Q @ K.transpose(-1, -2)) * rule.attn_scale
+        mask   = torch.ones(T, T, device=idx.device).tril().bool()
+        scores = scores.masked_fill(~mask, float('-inf'))
+        attn   = F.softmax(scores, dim=-1)
+        h_out  = h + (attn @ V_mat) @ rule.W_O.t()                    # (B, T, 28)
+
+        return h_out
 
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
@@ -581,7 +603,7 @@ class YinyangModel(nn.Module):
         if self.bidirectional:
             rule_hidden = None
         elif self.encoder_injected:
-            rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
+            rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 28)
         else:
             # rule_hidden: h_out (B, T, 28) from the rule transformer.
             # dims  0-11 : one-hot current token t_q
