@@ -264,10 +264,10 @@ def run_evaluation(args):
     n_prompt = args.prompt_len
 
     categories = [
-        ("AR-only       ", EVAL_PRETRAIN_ONLY,  "AR\\adapter = {5,9}"),
-        ("Adapter-only  ", EVAL_FINETUNE_ONLY,  "adapter\\AR = {1,2,3,4,7,10,11}"),
-        ("Both          ", EVAL_BOTH,           "AR∩adapter = {0}"),
-        ("Test (unseen) ", EVAL_NEITHER,        "test = {6,8}"),
+        ("AR-only       ", EVAL_PRETRAIN_ONLY,  "{5,9}"),
+        ("Adapter-only  ", EVAL_FINETUNE_ONLY,  "{1,2,3,4,7,10,11}"),
+        ("Both          ", EVAL_BOTH,           "{0}"),
+        ("Test (unseen) ", EVAL_NEITHER,        "{6,8}"),
     ]
 
     # Single-model entries (Pretrain, Finetune) + multi-seed adapter entries
