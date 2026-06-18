@@ -316,8 +316,6 @@ def run_evaluation(args):
     print(f"RULE-FOLLOWING ACCURACY  (generation from {n_prompt}-token prompt)")
     print("=" * 80)
 
-    col_w     = 14   # single-value columns
-    col_w_ms  = 16   # mean±std columns (wider)
     all_labels = [lbl for lbl, _ in single_models] + [lbl for lbl, _, _ in adapter_models]
     is_multi   = {lbl: False for lbl, _ in single_models}
     is_multi.update({lbl: multi for lbl, _, multi in adapter_models})
@@ -325,27 +323,29 @@ def run_evaluation(args):
     def _short(lbl):
         return lbl.removeprefix('yinyang_')
 
-    header = f"{'Data Split':<20} {'Starters':<18}"
+    # Column width = max(label length, data width) so nothing overflows or wastes space
+    def _col_w(lbl):
+        data_w = 11 if is_multi[lbl] else 5   # "0.123±0.045" or "0.123"
+        return max(len(_short(lbl)), data_w)
+
+    header = f"{'Data Split':<20} {'Starters':<15}"
     for lbl in all_labels:
-        w = col_w_ms if is_multi[lbl] else col_w
-        header += f" {_short(lbl):>{w}}"
+        header += f" {_short(lbl):>{_col_w(lbl)}}"
     sep = "-" * len(header)
 
     print(header)
     print(sep)
     for cat_label, _, starters_str in categories:
-        row = f"{cat_label:<20} {starters_str:<18}"
+        row = f"{cat_label:<20} {starters_str:<15}"
         for lbl in all_labels:
-            w = col_w_ms if is_multi[lbl] else col_w
-            _, mean, std = results[lbl][cat_label]
-            row += " " + _fmt(mean, std, w, is_multi[lbl])
+            row += " " + _fmt(results[lbl][cat_label][1], results[lbl][cat_label][2],
+                               _col_w(lbl), is_multi[lbl])
         print(row)
     print(sep)
-    row = f"{'Overall':<20} {'all 16 starters':<18}"
+    row = f"{'Overall':<20} {'all starters':<15}"
     for lbl in all_labels:
-        w = col_w_ms if is_multi[lbl] else col_w
-        _, mean, std = results[lbl]["Overall"]
-        row += " " + _fmt(mean, std, w, is_multi[lbl])
+        row += " " + _fmt(results[lbl]["Overall"][1], results[lbl]["Overall"][2],
+                          _col_w(lbl), is_multi[lbl])
     print(row)
     print("=" * len(header))
 
@@ -354,28 +354,28 @@ def run_evaluation(args):
     # -----------------------------------------------------------------------
     if enc_results:
         enc_labels = list(enc_results.keys())
-        col_w_e = 14
+        def _enc_w(lbl): return max(len(_short(lbl)), 5)
         print()
-        print("=" * 70)
         print("ENCODER NEXT-TOKEN ACCURACY  (argmax vs ground-truth next token)")
-        print("=" * 70)
-        enc_header = f"{'Data Split':<20} {'Starters':<18}"
+        enc_header = f"{'Data Split':<20} {'Starters':<15}"
         for lbl in enc_labels:
-            enc_header += f" {_short(lbl):>{col_w_e}}"
+            enc_header += f" {_short(lbl):>{_enc_w(lbl)}}"
         enc_sep = "-" * len(enc_header)
         print(enc_header)
         print(enc_sep)
         for cat_label, _, starters_str in categories:
-            row = f"{cat_label:<20} {starters_str:<18}"
+            row = f"{cat_label:<20} {starters_str:<15}"
             for lbl in enc_labels:
                 v = enc_results[lbl].get(cat_label)
-                row += f" {v:{col_w_e}.3f}" if v is not None else f" {'N/A':>{col_w_e}}"
+                w = _enc_w(lbl)
+                row += f" {v:{w}.3f}" if v is not None else f" {'N/A':>{w}}"
             print(row)
         print(enc_sep)
-        row = f"{'Overall':<20} {'all starters':<18}"
+        row = f"{'Overall':<20} {'all starters':<15}"
         for lbl in enc_labels:
             v = enc_results[lbl].get("Overall")
-            row += f" {v:{col_w_e}.3f}" if v is not None else f" {'N/A':>{col_w_e}}"
+            w = _enc_w(lbl)
+            row += f" {v:{w}.3f}" if v is not None else f" {'N/A':>{w}}"
         print(row)
         print("=" * len(enc_header))
 
@@ -385,21 +385,19 @@ def run_evaluation(args):
     if args.verbose:
         print()
         print("Per-starter breakdown")
-        per_header = f"{'Starter':>8} {'Category':<18}"
+        per_header = f"{'Starter':>8} {'Category':<20}"
         for lbl in all_labels:
-            w = col_w_ms if is_multi[lbl] else col_w
-            per_header += f" {_short(lbl):>{w}}"
+            per_header += f" {_short(lbl):>{_col_w(lbl)}}"
         per_sep = "-" * len(per_header)
         print(per_sep)
         print(per_header)
         print(per_sep)
         for cat_label, starters, _ in categories:
             for x in starters:
-                row = f"{x:>8} {cat_label:<18}"
+                row = f"{x:>8} {cat_label:<20}"
                 for lbl in all_labels:
-                    w = col_w_ms if is_multi[lbl] else col_w
                     per, _, _ = results[lbl][cat_label]
-                    row += f" {per[x]:{w}.3f}"
+                    row += f" {per[x]:{_col_w(lbl)}.3f}"
                 print(row)
         print(per_sep)
 
