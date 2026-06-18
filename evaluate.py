@@ -251,21 +251,21 @@ def run_evaluation(args):
     stem_models = [(s, _load_seed_models(s, args, device)) for s in stems]
 
     print()
-    print(f"AR pretrain starters   : {AR_TRAIN_STARTERS}")
-    print(f"Adapter train starters : {FINETUNE_STARTERS}")
+    print(f"Pretrain starters  : {AR_TRAIN_STARTERS}")
+    print(f"Finetune starters  : {FINETUNE_STARTERS}")
     print(f"Eval partitions:")
-    print(f"  AR-only  (AR \\ adapter) = {EVAL_PRETRAIN_ONLY}")
-    print(f"  Adapter-only (adapter \\ AR) = {EVAL_FINETUNE_ONLY}")
-    print(f"  Both     (AR ∩ adapter) = {EVAL_BOTH}")
-    print(f"  Test     (neither)      = {EVAL_NEITHER}")
+    print(f"  Pretrain-only = {EVAL_PRETRAIN_ONLY}")
+    print(f"  Finetune-only = {EVAL_FINETUNE_ONLY}")
+    print(f"  Both          = {EVAL_BOTH}")
+    print(f"  Test (unseen) = {EVAL_NEITHER}")
     for s, mdls in stem_models:
         print(f"  {s}: {len(mdls)} seed(s)")
 
     n_prompt = args.prompt_len
 
     categories = [
-        ("AR-only       ", EVAL_PRETRAIN_ONLY,  "{5,9}"),
-        ("Adapter-only  ", EVAL_FINETUNE_ONLY,  "{1,2,3,4,7,10,11}"),
+        ("Pretrain-only ", EVAL_PRETRAIN_ONLY,  "{5,9}"),
+        ("Finetune-only ", EVAL_FINETUNE_ONLY,  "{1,2,3,4,7,10,11}"),
         ("Both          ", EVAL_BOTH,           "{0}"),
         ("Test (unseen) ", EVAL_NEITHER,        "{6,8}"),
     ]
@@ -412,8 +412,8 @@ def run_evaluation(args):
         + [(s, mdls[0]) for s, mdls in stem_models]
     )
     for cat_label, x in (
-        [("AR-only       ", EVAL_PRETRAIN_ONLY[0]),
-         ("Adapter-only  ", EVAL_FINETUNE_ONLY[0]),
+        [("Pretrain-only ", EVAL_PRETRAIN_ONLY[0]),
+         ("Finetune-only ", EVAL_FINETUNE_ONLY[0]),
          ("Both          ", EVAL_BOTH[0])]
         + [("Test (unseen) ", x) for x in EVAL_NEITHER]
     ):
