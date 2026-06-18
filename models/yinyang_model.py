@@ -448,6 +448,7 @@ class YinyangModel(nn.Module):
         encoder_type:     str  = 'embedding',  # 'embedding' | 'transformer'
         encoder_n_layers: int  = 2,
         encoder_n_heads:  int  = 4,
+        rule_mode:        str  = 'period4',    # 'period4' | 'seed_broadcast'
     ):
         super().__init__()
         self.n_layers         = n_layers
@@ -499,6 +500,7 @@ class YinyangModel(nn.Module):
             max_seq_len    = max_seq_len,
             rule_d_model   = rule_d_model,
             force_fallback = force_fallback,
+            rule_mode      = rule_mode,
         ).to(device)
 
         if encoder_injected:
@@ -667,6 +669,7 @@ def build_yinyang_model(
     encoder_type:      str  = 'embedding',
     encoder_n_layers:  int  = 2,
     encoder_n_heads:   int  = 4,
+    rule_mode:         str  = 'period4',
 ) -> YinyangModel:
     return YinyangModel(
         ar_ckpt_path     = ar_ckpt_path,
@@ -687,6 +690,7 @@ def build_yinyang_model(
         encoder_type     = encoder_type,
         encoder_n_layers = encoder_n_layers,
         encoder_n_heads  = encoder_n_heads,
+        rule_mode        = rule_mode,
     )
 
 

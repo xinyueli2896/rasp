@@ -147,6 +147,8 @@ def train(args):
     print(f'Adapter train starters: {ADAPTER_TRAIN_STARTERS}')
     print(f'Test starters         : {TEST_STARTERS}')
 
+    print(f'Rule mode             : {args.rule_mode}')
+
     if args.joint:
         joint_starters = sorted(set(AR_TRAIN_STARTERS) | set(ADAPTER_TRAIN_STARTERS))
         print(f'Joint training starters: {joint_starters}')
@@ -163,7 +165,9 @@ def train(args):
             n_seqs_per_starter = args.n_seqs_per_starter,
         )
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    ckpt_path = os.path.join(args.ckpt_dir, f'{args.ckpt_name}.pt')
+    # Auto-tag checkpoint name with rule_mode so both runs don't overwrite each other.
+    ckpt_base = args.ckpt_name if args.ckpt_name != 'yinyang' else f'yinyang_{args.rule_mode}'
+    ckpt_path = os.path.join(args.ckpt_dir, f'{ckpt_base}.pt')
 
     def _build(use_lora):
         ar_ckpt = args.ar_ckpt if (args.ar_ckpt and os.path.exists(args.ar_ckpt)) else None
@@ -188,6 +192,7 @@ def train(args):
             encoder_type     = args.encoder_type,
             encoder_n_layers = args.encoder_n_layers,
             encoder_n_heads  = args.encoder_n_heads,
+            rule_mode        = args.rule_mode,
         )
 
     if args.phase2_epochs > 0:
@@ -196,7 +201,7 @@ def train(args):
         # Phase 1: AR frozen, only yinyang_attn trains
         # Phase 2: add LoRA to AR, warm-start yinyang_attn from phase 1
         # ------------------------------------------------------------------ #
-        phase1_path = os.path.join(args.ckpt_dir, f'{args.ckpt_name}_phase1.pt')
+        phase1_path = os.path.join(args.ckpt_dir, f'{ckpt_base}_phase1.pt')
 
         print(f'\n=== Phase 1 (no LoRA, {args.epochs} epochs) ===')
         model = _build(use_lora=False)
@@ -276,6 +281,11 @@ def get_args():
     p.add_argument('--joint',              action='store_true', default=False,
                    help='Train on union of AR pretrain + adapter finetune starters')
     p.add_argument('--seed',               type=int,   default=42)
+    p.add_argument('--rule_mode',          type=str,   default='period4',
+                   choices=['period4', 'seed_broadcast'],
+                   help='period4: rule model attends to k=q-3, dims 12-23 = e_{next_token}. '
+                        'seed_broadcast: all queries attend to seed positions (k%%4==0), '
+                        'dims 12-23 = e_{starter}. Adapter must do more work in seed_broadcast.')
     return p.parse_args()
 
 

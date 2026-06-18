@@ -11,20 +11,25 @@ from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 
 
 class RuleModelWrapper(nn.Module):
-    # Wraps the rule transformer (TRACR-style period-4 causal attention).
+    # Wraps the rule transformer (TRACR-style causal attention).
     # forward(idx, return_hidden=True) returns (logits, rule_hidden) where
     # rule_hidden is a 28-dim hidden state:
     #   dims  0-11 : one-hot of current token at position q
-    #   dims 12-23 : one-hot of next token (q>=3 sharp; q<3 honest uncertainty)
     #   dims 24-27 : one-hot of q % 4
+    #   dims 12-23 : depends on rule_mode —
+    #     'period4'      : e_{next_token}  (q>=3 sharp; q<3 honest uncertainty)
+    #     'seed_broadcast': e_{starter}    (always, all positions)
     # parameters() returns empty — no trainable parameters.
 
     def __init__(self, max_seq_len: int = 128,
                  rule_d_model: int = None,   # ignored, always TRACR_D_MODEL
-                 force_fallback: bool = False):
+                 force_fallback: bool = False,
+                 rule_mode: str = 'period4'):
         super().__init__()
-        self._tracr = TracrPyTorchRuleModel(max_seq_len=max_seq_len)
+        self._tracr = TracrPyTorchRuleModel(max_seq_len=max_seq_len,
+                                            rule_mode=rule_mode)
         self.rule_d_model = self._tracr.TRACR_D_MODEL   # 28
+        self.rule_mode = rule_mode
 
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         return self._tracr(idx, return_hidden=return_hidden)
