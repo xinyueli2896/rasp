@@ -265,7 +265,7 @@ def run_evaluation(args):
 
     categories = [
         ("Pretrain-only ", EVAL_PRETRAIN_ONLY,  "{5,9}"),
-        ("Finetune-only ", EVAL_FINETUNE_ONLY,  "{1,2,3,4,7,10,11}"),
+        ("Finetune-only ", EVAL_FINETUNE_ONLY,  "{1-4,7,10,11}"),
         ("Both          ", EVAL_BOTH,           "{0}"),
         ("Test (unseen) ", EVAL_NEITHER,        "{6,8}"),
     ]
