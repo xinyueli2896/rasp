@@ -206,9 +206,12 @@ class CPYinyangTransformer(nn.Module):
         lora_rank:        int  = 0,
         bidirectional:    bool = False,
         encoder_injected: bool = False,
+        rule_mode:        str  = 'current',
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
+        assert not (encoder_injected and rule_mode != 'current'), \
+            "encoder_injected only supported with rule_mode='current'"
         super().__init__()
         self.base             = base_model
         self.n_skip           = n_skip
@@ -233,12 +236,12 @@ class CPYinyangTransformer(nn.Module):
         n_adapters = n_layers // n_skip
 
         # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
-        self.rule_model = BassTracrRuleModel()
+        self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
                 d_model      = self.base.hidden_size,
-                rule_d_model = TRACR_D_MODEL,
+                rule_d_model = self.rule_model.d_model,
                 embed_dim    = adapter_rank,
                 n_heads      = 8,
             )
@@ -361,8 +364,7 @@ class CPYinyangTransformer(nn.Module):
             pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, 16)
             rule_hidden = h_enc + pos_emb.unsqueeze(0)
         elif not self.bidirectional:
-            dummy  = pc_0.unsqueeze(1).expand(-1, max_seq_len)          # (B, max_seq_len)
-            _, rule_hidden = self.rule_model(dummy, return_hidden=True)  # (B, max_seq_len, 16)
+            rule_hidden = self.rule_model.build_rule_hidden_analytic(pc_0, max_seq_len, x.device)
         else:
             rule_hidden = None
 

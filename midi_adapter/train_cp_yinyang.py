@@ -254,10 +254,11 @@ class CPYinyangLightning(L.LightningModule):
 def main(args):
     n_gpus   = max(torch.cuda.device_count(), 1)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
-    lora_suffix = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
+    lora_suffix  = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
+    rule_suffix  = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
     run_name = (
         args.run_name
-        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}'
+        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}{rule_suffix}'
     )
 
     # Build base CP transformer and load pretrained weights
@@ -280,6 +281,7 @@ def main(args):
         lora_rank         = args.lora_rank,
         bidirectional     = args.bidirectional,
         encoder_injected  = args.encoder_injected,
+        rule_mode         = args.rule_mode,
     )
 
     if args.unfreeze_base:
@@ -425,6 +427,11 @@ def get_args():
                    help='No-input-to-rule-model variant: AR hidden states are projected to rule space via a learned linear instead of reading the key from the sequence')
     p.add_argument('--encoder_injected', action='store_true',
                    help='Replace the one-hot W_E pitch-class lookup with a learned nn.Embedding(12) before feeding into the rule hidden; W_pos stays frozen')
+    p.add_argument('--rule_mode', type=str, default='current',
+                   choices=['current', 'period4', 'seed_broadcast'],
+                   help='current: analytical 16-dim rule model (existing); '
+                        'period4: TRACR attention 28-dim, dims 12-23=next pc; '
+                        'seed_broadcast: 28-dim, dims 12-23=seed pc.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)

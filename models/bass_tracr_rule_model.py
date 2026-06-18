@@ -9,20 +9,27 @@ Rule:  sequence[t] = (x + OFFSETS[t % 4]) % 12,   OFFSETS = [0, 5, 7, 0]
 
 Input : pitch class indices  (B, T)   int64, values in 0-11
 Output: logits               (B, T, 12)
-        hidden               (B, T, TRACR_D_MODEL=16)   if return_hidden=True
+        hidden               (B, T, d_model)   if return_hidden=True
 
-Hidden state format:
-  dims  0-11 : one-hot of CURRENT pitch class at position t  (key + OFFSETS[t%4])
-  dims 12-15 : one-hot of t % 4
+rule_mode='current' (default, d_model=16):
+  Hidden state format:
+    dims  0-11 : one-hot of CURRENT pitch class at position t  (key + OFFSETS[t%4])
+    dims 12-15 : one-hot of t % 4
+  Analytical forward (no attention). TRACR_D_MODEL class attribute = 16.
 
-CURRENT encoding is used (not NEXT) because the causal mask in
-CPYinyangCrossAttention blocks rule_hidden[t+1] from the query at t.
-With CURRENT encoding the adapter learns to attend rule_hidden[0] (always
-accessible, always = embed(key)) and uses the query's positional encoding to
-derive the next note — a purely positional routing that generalises to unseen
-keys. NEXT encoding causes a pathological local minimum where the model
-collapses to attending rule_hidden[1] (= embed(key+7)) for all positions,
-yielding 0.25 accuracy on unseen keys.
+rule_mode='period4' (d_model=28):
+  Uses TRACR attention (causal mask).
+  dims  0-11 : one-hot of CURRENT pitch class at position t
+  dims 12-23 : one-hot of NEXT pitch class  (key + OFFSETS[(t+1)%4])
+  dims 24-27 : one-hot of t % 4
+  W_Q shifts pos_class +1: W_Q[24+(i+1)%4, 24+i] = 1
+
+rule_mode='seed_broadcast' (d_model=28):
+  Uses TRACR attention (causal mask).
+  dims  0-11 : one-hot of CURRENT pitch class at position t
+  dims 12-23 : one-hot of SEED pitch class  (key = pc_0, constant)
+  dims 24-27 : one-hot of t % 4
+  W_Q maps all pos_class→0: W_Q[24+0, 24+i] = 1 for all i
 
 No trainable parameters.
 """
@@ -36,55 +43,84 @@ from rasp_program.sequence_rule import OFFSETS
 
 N_ROOTS  = 12
 N_POS    = 4
-TRACR_D_MODEL = N_ROOTS + N_POS   # 16
+TRACR_D_MODEL = N_ROOTS + N_POS   # 16  — kept for backward compat
 
 
 class BassTracrRuleModel(nn.Module):
 
-    TRACR_D_MODEL: int = TRACR_D_MODEL
+    TRACR_D_MODEL: int = TRACR_D_MODEL   # class attribute, always 16
 
-    def __init__(self, max_seq_len: int = 512, attn_scale: float = 20.0):
+    def __init__(
+        self,
+        rule_mode:    str   = 'current',
+        max_seq_len:  int   = 512,
+        attn_scale:   float = 20.0,
+    ):
+        assert rule_mode in ('current', 'period4', 'seed_broadcast'), \
+            f"rule_mode must be 'current', 'period4', or 'seed_broadcast', got {rule_mode!r}"
         super().__init__()
-        V = N_ROOTS
-        d = TRACR_D_MODEL
+        self.rule_mode  = rule_mode
         self.attn_scale = attn_scale
 
-        # W_E[r] = [e_r (12-dim one-hot), 0_4]
+        V = N_ROOTS
+
+        if rule_mode == 'current':
+            d = N_ROOTS + N_POS   # 16
+        else:
+            d = N_ROOTS * 2 + N_POS   # 28
+
+        # Instance attribute — reflects the actual dimension for this instance
+        self.d_model = d
+
+        # W_E[r] = one-hot(r) in dims 0..V-1, zeros elsewhere
         W_E = torch.zeros(V, d)
         W_E[:V, :V] = torch.eye(V)
         self.register_buffer('W_E', W_E)
 
-        # W_pos[p] = [0_12, e_{p%4}]
+        # W_pos[p] = one-hot(p) in dims (d-N_POS)..(d-1)
         W_pos = torch.zeros(N_POS, d)
         for i in range(N_POS):
-            W_pos[i, V + i] = 1.0
+            W_pos[i, d - N_POS + i] = 1.0
         self.register_buffer('W_pos', W_pos)
 
-        # W_Q: shifts position subspace by +1 mod 4
-        W_Q = torch.zeros(d, d)
-        for i in range(N_POS):
-            W_Q[V + i, V + (i - 1) % N_POS] = 1.0
-        self.register_buffer('W_Q', W_Q)
+        if rule_mode != 'current':
+            # --- attention matrices for period4 / seed_broadcast ---
+            pos_base = d - N_POS   # = 24
 
-        # W_K: identity on position subspace
-        W_K = torch.zeros(d, d)
-        for i in range(N_POS):
-            W_K[V + i, V + i] = 1.0
-        self.register_buffer('W_K', W_K)
+            # W_Q  (d, d)
+            W_Q = torch.zeros(d, d)
+            if rule_mode == 'period4':
+                # shift pos_class +1: query pos i ← key pos (i+1)%4
+                for i in range(N_POS):
+                    W_Q[pos_base + (i + 1) % N_POS, pos_base + i] = 1.0
+            else:  # seed_broadcast: all pos → slot 0
+                for i in range(N_POS):
+                    W_Q[pos_base + 0, pos_base + i] = 1.0
+            self.register_buffer('W_Q', W_Q)
 
-        # W_V: identity on root subspace
-        W_V = torch.zeros(d, d)
-        for i in range(V):
-            W_V[i, i] = 1.0
-        self.register_buffer('W_V', W_V)
+            # W_K: identity on pos subspace (dims pos_base..d-1)
+            W_K = torch.zeros(d, d)
+            for i in range(N_POS):
+                W_K[pos_base + i, pos_base + i] = 1.0
+            self.register_buffer('W_K', W_K)
 
-        # W_O: identity on root subspace
-        W_O = torch.zeros(d, d)
-        for i in range(V):
-            W_O[i, i] = 1.0
-        self.register_buffer('W_O', W_O)
+            # W_V: copies dims 0-11 to dims 12-23
+            W_V = torch.zeros(d, d)
+            for i in range(V):
+                W_V[V + i, i] = 1.0
+            self.register_buffer('W_V', W_V)
+
+            # W_O: identity on dims 12-23
+            W_O = torch.zeros(d, d)
+            for i in range(V):
+                W_O[V + i, V + i] = 1.0
+            self.register_buffer('W_O', W_O)
 
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         """
@@ -92,21 +128,105 @@ class BassTracrRuleModel(nn.Module):
         """
         B, T   = idx.shape
         device = idx.device
-
         t_idx  = torch.arange(T, device=device)
-        o      = self._offsets[t_idx % N_POS]                  # CURRENT pitch class at t
-        key    = idx[:, 0]                                     # starting pitch class
-        cur_r  = (key[:, None] + o[None, :]) % N_ROOTS        # (B, T) current pitch class
 
-        logits = F.one_hot(cur_r, num_classes=N_ROOTS).float()
+        key   = idx[:, 0]                                    # (B,)
+        o_cur = self._offsets[t_idx % N_POS]                 # (T,) CURRENT offsets
+        cur_r = (key[:, None] + o_cur[None, :]) % N_ROOTS   # (B, T)
+
+        if self.rule_mode == 'current':
+            logits = F.one_hot(cur_r, num_classes=N_ROOTS).float()
+            if return_hidden:
+                tok_cur = self.W_E[cur_r]                    # (B, T, 16)
+                pos_emb = self.W_pos[t_idx % N_POS]         # (T, 16)
+                h_out   = tok_cur + pos_emb.unsqueeze(0)    # (B, T, 16)
+                return logits, h_out
+            return logits
+
+        # --- period4 / seed_broadcast: run TRACR attention ---
+        # Build residual stream embeddings
+        tok_cur = self.W_E[cur_r]                            # (B, T, 28) — dims 0-11
+        pos_emb = self.W_pos[t_idx % N_POS]                 # (T, 28) — dims 24-27
+        x = tok_cur + pos_emb.unsqueeze(0)                  # (B, T, 28)
+
+        # Queries, keys, values
+        Q = x @ self.W_Q.T                                  # (B, T, 28)
+        K = x @ self.W_K.T                                  # (B, T, 28)
+        V = x @ self.W_V.T                                  # (B, T, 28)
+
+        # Attention scores with causal mask
+        scores = (Q @ K.transpose(-2, -1)) * self.attn_scale  # (B, T, T)
+        causal = torch.tril(torch.ones(T, T, device=device, dtype=torch.bool))
+        scores = scores.masked_fill(~causal, float('-inf'))
+        attn   = F.softmax(scores, dim=-1)                   # (B, T, T)
+
+        # Weighted sum, project through W_O, add residual
+        h_out = x + (attn @ V) @ self.W_O.T                 # (B, T, 28)
+
+        # Logits from dims 12-23 (next/seed pc)
+        logits = h_out[:, :, N_ROOTS:N_ROOTS * 2]           # (B, T, 12)
 
         if return_hidden:
-            tok_cur = self.W_E[cur_r]                          # (B, T, 16) root dims
-            pos_emb = self.W_pos[t_idx % N_POS]               # (T, 16) pos dims
-            h_out   = tok_cur + pos_emb.unsqueeze(0)           # (B, T, 16)
             return logits, h_out
-
         return logits
+
+    # ------------------------------------------------------------------
+    # Analytic rule_hidden construction (no attention needed)
+    # ------------------------------------------------------------------
+
+    def build_rule_hidden_analytic(
+        self,
+        pc_0:   torch.Tensor,   # (B,) starting pitch class
+        T:      int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Build rule_hidden analytically without running attention.
+
+        Returns (B, T, d_model).
+
+        current   : dims 0-11 = one_hot((pc_0+OFFSETS[t%4])%12),  dims 12-15 = one_hot(t%4)
+        period4   : dims 0-11 = current pc, dims 12-23 = next pc,  dims 24-27 = one_hot(t%4)
+        seed_bcast: dims 0-11 = current pc, dims 12-23 = seed pc,  dims 24-27 = one_hot(t%4)
+        """
+        B      = pc_0.shape[0]
+        t_idx  = torch.arange(T, device=device)
+        offsets_buf = self._offsets.to(device)
+
+        o_cur  = offsets_buf[t_idx % N_POS]                 # (T,)
+        cur_r  = (pc_0[:, None].to(device) + o_cur[None, :]) % N_ROOTS  # (B, T)
+
+        d = self.d_model
+        h = torch.zeros(B, T, d, device=device)
+
+        # dims 0-11: current pitch class
+        h[:, :, :N_ROOTS] = F.one_hot(cur_r, num_classes=N_ROOTS).float()
+
+        if self.rule_mode == 'current':
+            # dims 12-15: pos_class
+            pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()  # (T, 4)
+            h[:, :, N_ROOTS:N_ROOTS + N_POS] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+
+        elif self.rule_mode == 'period4':
+            # dims 12-23: next pitch class
+            o_next  = offsets_buf[(t_idx + 1) % N_POS]      # (T,)
+            next_r  = (pc_0[:, None].to(device) + o_next[None, :]) % N_ROOTS  # (B, T)
+            h[:, :, N_ROOTS:N_ROOTS * 2] = F.one_hot(next_r, num_classes=N_ROOTS).float()
+            # dims 24-27: pos_class
+            pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()
+            h[:, :, N_ROOTS * 2:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+
+        else:  # seed_broadcast
+            # dims 12-23: seed/key pitch class (constant)
+            seed_oh = F.one_hot(pc_0.to(device) % N_ROOTS, num_classes=N_ROOTS).float()  # (B, 12)
+            h[:, :, N_ROOTS:N_ROOTS * 2] = seed_oh.unsqueeze(1).expand(-1, T, -1)
+            # dims 24-27: pos_class
+            pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()
+            h[:, :, N_ROOTS * 2:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+
+        return h
+
+    # ------------------------------------------------------------------
 
     def parameters(self, recurse=True):
         return iter([])
@@ -117,10 +237,9 @@ class BassTracrRuleModel(nn.Module):
 
 if __name__ == '__main__':
     model = BassTracrRuleModel()
-    print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}')
+    print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}  d_model = {model.d_model}')
 
     # key=0 (C): sequence = [0,5,7,0,0,5,7,0,...]
-    # CURRENT pitch class at each position: [0,5,7,0, 0,5,7,0]  (same as input)
     idx = torch.tensor([[0, 5, 7, 0, 0, 5, 7, 0]], dtype=torch.long)
     logits, hidden = model(idx, return_hidden=True)
     preds = logits.argmax(-1).squeeze().tolist()
