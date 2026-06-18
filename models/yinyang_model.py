@@ -22,20 +22,25 @@ RULE_D_MODEL = TracrPyTorchRuleModel.TRACR_D_MODEL   # 28
 
 
 class YinyangCrossAttention(nn.Module):
-    # query=AR hidden, key/value=rule hidden, causal mask, output scaled by learnable gate
+    # Cross-attention that injects the rule model's next-token signal into the
+    # AR residual stream at each transformer layer.
     #
-    # Q and K are BOTH PURELY POSITIONAL (scaled sin/cos, no learned projections).
-    # rule_hidden[q] = one_hot(next_token[q]), shape (B, T, 12).
-    # Scaling pe by PE_SCALE=20 gives diagonal Q·K advantage of ~70 per score unit,
-    # making attention nearly one-hot on the same position. V = v_proj(rule_hidden)
-    # extracts the next-token signal, which out_proj injects into the AR residual stream.
+    # Q and K are BOTH PURELY POSITIONAL (scaled sin/cos, PE_SCALE=20).
+    # The causal mask + diagonal PE advantage makes position q attend almost
+    # exclusively to rule position k=q, so each AR position reads the rule
+    # signal at the same sequence position.
+    #
+    # Value input: rule_logits[k] — the rule model's 12-dim next-token
+    # prediction at position k (one-hot for k >= 3, soft for k < 3).
+    # This is already in logit/vocabulary space, so v_proj maps 12 → embed_dim.
+    # out_proj maps embed_dim → d_model for residual addition into the AR stream.
 
-    PE_SCALE = 20.0   # makes diagonal Q·K score >> off-diagonal; matches Tracr attn_scale
+    PE_SCALE = 20.0
 
     def __init__(
         self,
         d_model:      int,
-        rule_d_model: int,
+        rule_d_model: int,   # kept for API compat (unused; input is always VOCAB_SIZE)
         embed_dim:    int,
         n_heads:      int = 4,
         dropout:      float = 0.1,
@@ -47,19 +52,13 @@ class YinyangCrossAttention(nn.Module):
         self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
-        # No q_proj or k_proj: both Q and K are purely positional.
-        # V is the only content-bearing projection.
-        self.v_proj   = nn.Linear(rule_d_model, embed_dim)
-        self.out_proj = nn.Linear(embed_dim,    d_model)
+        # V reads from rule logits (VOCAB_SIZE=12); output goes to AR residual (d_model)
+        self.v_proj   = nn.Linear(VOCAB_SIZE, embed_dim)
+        self.out_proj = nn.Linear(embed_dim,  d_model)
 
-        # gate=1 at init: full contribution from start, can scale up/down during training
-        # (do NOT init to 0 — with frozen AR, gate=0 kills gradients for all adapter weights)
         self.gate      = nn.Parameter(torch.ones(1))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Sinusoidal pos encoding scaled by PE_SCALE.
-        # score(q,k) = PE_SCALE² * (pe[q]·pe[k]) / sqrt(head_dim)
-        # Diagonal advantage per adjacent pair ≈ PE_SCALE² * 0.5 / sqrt(head_dim) ≈ 70.
         import math
         pe  = torch.zeros(max_seq_len, embed_dim)
         pos = torch.arange(max_seq_len).unsqueeze(1).float()
@@ -76,36 +75,39 @@ class YinyangCrossAttention(nn.Module):
             nn.init.xavier_uniform_(linear.weight)
             nn.init.zeros_(linear.bias)
 
-    def forward(self, ar_hidden: torch.Tensor, rule_hidden: torch.Tensor,
+    def forward(self, ar_hidden: torch.Tensor, rule_logits: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
+        """
+        ar_hidden  : (B, T_q, d_model)  — AR hidden state at current layer
+        rule_logits: (B, T_k, VOCAB_SIZE) — rule model next-token predictions
+        Returns    : (B, T_q, d_model)  — residual correction
+        """
         B, T_q, _ = ar_hidden.shape
-        B, T_k, _ = rule_hidden.shape
+        B, T_k, _ = rule_logits.shape
 
         if indices_query is None:
             indices_query = torch.arange(T_q, device=ar_hidden.device)
         if indices_key is None:
             indices_key = torch.arange(T_k, device=ar_hidden.device)
 
-        pos_q = self.pos_enc[:, indices_query, :]                          # (1, T_q, embed_dim)
-        pos_k = self.pos_enc[:, indices_key,   :]                          # (1, T_k, embed_dim)
-        Q = pos_q.expand(B, -1, -1)                                        # (B, T_q, embed_dim) — purely positional
-        K = pos_k.expand(B, -1, -1)                                        # (B, T_k, embed_dim) — purely positional
-        V = self.v_proj(rule_hidden)                                       # (B, T_k, embed_dim)
+        pos_q = self.pos_enc[:, indices_query, :]
+        pos_k = self.pos_enc[:, indices_key,   :]
+        Q = pos_q.expand(B, -1, -1)                                        # purely positional
+        K = pos_k.expand(B, -1, -1)                                        # purely positional
+        V = self.v_proj(rule_logits)                                       # (B, T_k, embed_dim)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, T_k, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)       # (B, n_heads, T_q, T_k)
-
+        scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)
         causal = torch.ones(T_q, T_k, device=ar_hidden.device).tril().bool()
         scores = scores.masked_fill(~causal, float('-inf'))
-
         attn = self.attn_drop(F.softmax(scores, dim=-1))
 
         out = (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.embed_dim)
-        return self.out_proj(out) * self.gate
+        return self.out_proj(out) * self.gate                              # (B, T_q, d_model)
 
 
 class LearnedRuleInputEncoder(nn.Module):
@@ -511,11 +513,6 @@ class YinyangModel(nn.Module):
                 if encoder_type not in ('softmax', 'mlp', 'additive', 'fourier', 'circular'):
                     self.rule_input_encoder.embedding.weight.copy_(self._W_E)
 
-        # Learned scale for direct rule logit injection at q >= 3.
-        # Only for the non-encoder, non-bidirectional path.
-        if not (encoder_injected or bidirectional):
-            self.rule_alpha = nn.Parameter(torch.tensor(1.0))
-
         assert n_layers % n_skip == 0, \
             f"n_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters  = n_layers // n_skip
@@ -532,8 +529,7 @@ class YinyangModel(nn.Module):
         ]).to(device)
 
     def _forward_layerwise(self, idx: torch.Tensor,
-                           rule_hidden:   torch.Tensor | None = None,
-                           rule_logits:   torch.Tensor | None = None,
+                           rule_hidden:   torch.Tensor | None = None,   # rule logits (B,T,12)
                            indices_query: torch.Tensor | None = None,
                            indices_key:   torch.Tensor | None = None):
         ar = self._ar_base
@@ -552,25 +548,14 @@ class YinyangModel(nn.Module):
                         x, self._W_Q, self._W_K, self._W_V, self._W_O
                     )
                 else:
-                    x = x + self.yinyang_attn[adapter_idx](x, rule_hidden,
-                                                            indices_query=indices_query,
-                                                            indices_key=indices_key)
+                    x = x + self.yinyang_attn[adapter_idx](
+                        x, rule_hidden,
+                        indices_query=indices_query,
+                        indices_key=indices_key,
+                    )
 
         hidden = ar.ln_f(x)
         logits = ar.lm_head(hidden)
-
-        # Direct rule signal injection for positions q >= 3.
-        # At q >= 3 the causal period-4 trick is valid: rule_logits[q] is a
-        # clean one-hot of the correct next token.  We add it directly to the
-        # output logits so it can override the AR model's wrong context bias.
-        # Positions 0-2 are masked to zero (rule signal is wrong there).
-        if rule_logits is not None and hasattr(self, 'rule_alpha'):
-            T = logits.shape[1]
-            q_mask = torch.zeros(T, device=logits.device)
-            if T > 3:
-                q_mask[3:] = 1.0
-            logits = logits + self.rule_alpha * rule_logits.detach() * q_mask.view(1, T, 1)
-
         return logits, hidden
 
     def _encoder_injected_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
@@ -587,16 +572,16 @@ class YinyangModel(nn.Module):
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
-        rule_logits = None
         if self.bidirectional:
-            rule_hidden = None
+            rule_signal = None
         elif self.encoder_injected:
-            rule_hidden = self._encoder_injected_rule_hidden(idx)
+            rule_signal = self._encoder_injected_rule_hidden(idx)   # (B, T, 12)
         else:
-            rule_logits, rule_hidden = self.rule_model(idx, return_hidden=True)
-            rule_logits = rule_logits.to(idx.device)
-            rule_hidden = rule_hidden.to(idx.device)
-        logits, _ = self._forward_layerwise(idx, rule_hidden, rule_logits,
+            # Use rule model's next-token logits (VOCAB_SIZE-dim, logit space).
+            # For q >= 3 these are clean one-hots; for q < 3 soft/wrong.
+            rule_signal, _ = self.rule_model(idx, return_hidden=True)
+            rule_signal = rule_signal.to(idx.device)
+        logits, _ = self._forward_layerwise(idx, rule_signal,
                                              indices_query=indices_query,
                                              indices_key=indices_key)
         return logits
