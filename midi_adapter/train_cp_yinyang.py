@@ -353,14 +353,19 @@ def main(args):
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
+    if args.unseen_data and os.path.exists(args.unseen_data):
+        ckpt_monitor, ckpt_mode, ckpt_filename = 'unseen_acc', 'max', run_name + '.{epoch:02d}.{unseen_acc:.4f}'
+    else:
+        ckpt_monitor, ckpt_mode, ckpt_filename = 'val_loss',   'min', run_name + '.{epoch:02d}.{val_loss:.5f}'
     checkpoint_cb = L.callbacks.ModelCheckpoint(
-        monitor           = 'val_loss',
+        monitor           = ckpt_monitor,
+        mode              = ckpt_mode,
         save_top_k        = 5,
         save_last         = True,
         save_weights_only = True,
         enable_version_counter = False,
         dirpath    = os.path.join(args.ckpt_dir, run_name),
-        filename   = run_name + '.{epoch:02d}.{val_loss:.5f}',
+        filename   = ckpt_filename,
     )
 
     loggers = []
