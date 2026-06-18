@@ -256,9 +256,10 @@ def main(args):
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
     lora_suffix  = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
     rule_suffix  = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
+    enc_suffix   = f'_{args.encoder_type}' if args.encoder_injected else ''
     run_name = (
         args.run_name
-        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}{rule_suffix}'
+        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}{rule_suffix}{enc_suffix}'
     )
 
     # Build base CP transformer and load pretrained weights
@@ -281,6 +282,7 @@ def main(args):
         lora_rank         = args.lora_rank,
         bidirectional     = args.bidirectional,
         encoder_injected  = args.encoder_injected,
+        encoder_type      = args.encoder_type,
         rule_mode         = args.rule_mode,
     )
 
@@ -426,7 +428,11 @@ def get_args():
     p.add_argument('--bidirectional',     action='store_true',
                    help='No-input-to-rule-model variant: AR hidden states are projected to rule space via a learned linear instead of reading the key from the sequence')
     p.add_argument('--encoder_injected', action='store_true',
-                   help='Replace the one-hot W_E pitch-class lookup with a learned nn.Embedding(12) before feeding into the rule hidden; W_pos stays frozen')
+                   help='Replace the one-hot W_E pitch-class lookup with a learned encoder; W_pos stays frozen')
+    p.add_argument('--encoder_type', type=str, default='embedding',
+                   choices=['embedding', 'token_mlp'],
+                   help='embedding: nn.Embedding(12, d_model); '
+                        'token_mlp: one_hot(12)→Linear(64)→ReLU→Linear(d_model)')
     p.add_argument('--rule_mode', type=str, default='current',
                    choices=['current', 'period4', 'seed_broadcast'],
                    help='current: analytical 16-dim rule model (existing); '

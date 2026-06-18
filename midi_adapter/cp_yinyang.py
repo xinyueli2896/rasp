@@ -101,6 +101,25 @@ class BassRuleInputEncoder(nn.Module):
         return self.embedding(pc)   # (B, T, rule_d_model)
 
 
+class BassTokMlpEncoder(nn.Module):
+    """
+    Token-only MLP encoder: one_hot(pc, 12) → Linear(12→64) → ReLU → Linear(64→rule_d_model).
+    No positional information — only the pitch class token is used as input.
+    W_pos is still added in _encoder_injected_rule_hidden, keeping positional
+    information in the frozen part of the residual stream.
+    """
+
+    def __init__(self, n_pitches: int = 12, rule_d_model: int = TRACR_D_MODEL, hidden: int = 64):
+        super().__init__()
+        self.n_pitches = n_pitches
+        self.fc1 = nn.Linear(n_pitches, hidden)
+        self.fc2 = nn.Linear(hidden, rule_d_model)
+
+    def forward(self, pc: torch.Tensor) -> torch.Tensor:
+        x = F.one_hot(pc, num_classes=self.n_pitches).float()
+        return self.fc2(F.relu(self.fc1(x)))   # (B, T, rule_d_model)
+
+
 # ---------------------------------------------------------------------------
 # Cross-attention with bar-aligned causal mask
 # ---------------------------------------------------------------------------
@@ -206,12 +225,15 @@ class CPYinyangTransformer(nn.Module):
         lora_rank:        int  = 0,
         bidirectional:    bool = False,
         encoder_injected: bool = False,
+        encoder_type:     str  = 'embedding',
         rule_mode:        str  = 'current',
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
         assert not (encoder_injected and rule_mode != 'current'), \
             "encoder_injected only supported with rule_mode='current'"
+        assert encoder_type in ('embedding', 'token_mlp'), \
+            f"encoder_type must be 'embedding' or 'token_mlp', got {encoder_type!r}"
         super().__init__()
         self.base             = base_model
         self.n_skip           = n_skip
@@ -249,9 +271,13 @@ class CPYinyangTransformer(nn.Module):
         ])
 
         if encoder_injected:
-            # Learned pitch-class embedding replaces the hard one-hot W_E lookup.
-            # W_pos is kept frozen; the embedding is shared across all adapter layers.
-            self.rule_input_encoder = BassRuleInputEncoder()
+            # Learned pitch-class encoder replaces the hard one-hot W_E lookup.
+            # W_pos is kept frozen; the encoder is shared across all adapter layers.
+            d = self.rule_model.d_model
+            if encoder_type == 'token_mlp':
+                self.rule_input_encoder = BassTokMlpEncoder(rule_d_model=d)
+            else:
+                self.rule_input_encoder = BassRuleInputEncoder(rule_d_model=d)
 
         if bidirectional:
             # Learned AR→rule projection (one per adapter layer).
