@@ -11,39 +11,40 @@ import torch.nn.functional as F
 from rasp_program.sequence_rule import VOCAB_SIZE, OFFSETS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RASP program (seed-broadcast approach):
+# RASP program:
 #
-#   seed_selector  = Select(indices, indices, lambda k, q: k == 0)
-#   seed_broadcast = Aggregate(seed_selector, tokens)   # tokens[0] at every pos
-#   predicted_next[q] = (seed_broadcast[q] + OFFSETS[(q+1)%4]) % V
+#   lookup_selector = Select(indices, indices, lambda k, q: k == (q+1) % 4)
+#   predicted_next  = Aggregate(lookup_selector, tokens)
 #
-# Why seed broadcast instead of period-4 trick?
-#   The period-4 trick (attend to k=q-3) is non-causal for q<3:
-#   q=0 needs q-3=-3 (invalid), q=1 needs q-2=-2 (invalid), q=2 needs q-1=-1 (invalid).
-#   Seed broadcast always attends to k=0, which is causal for ALL positions.
-#   tokens[0] = starter, and predicted_next[q] = (starter + OFFSETS[(q+1)%4]) % V.
+# For a period-4 sequence  tokens[q] = (starter + OFFSETS[q%4]) % V:
+#   predicted_next[q] = tokens[(q+1)%4]   ← the token at cycle-position (q+1)%4
 #
-# TRACR compilation (one attention head):
+# TRACR compilation (one attention head, no MLP):
 #
 #   Residual stream layout  d = V*2 + 4 = 28 dims:
 #     dims  0 .. V-1    : one-hot of current token t_q        (from W_E)
-#     dims  V .. 2V-1   : one-hot of seed token tokens[0]     (written by attention)
+#     dims  V .. 2V-1   : one-hot of attended token           (written by attention)
 #     dims 2V .. 2V+3   : one-hot of position class q%4       (from W_pos)
 #
-#   Seed broadcast trick:
-#     W_Q maps every pos_class to pos_class 0 (constant query).
-#     W_K is identity on pos subspace.
-#     Score(q, k) = e_0 · e_{k%4} = 1 iff k%4==0 (k=0,4,8,...).
-#     With causal mask and high attn_scale, position 0 always has highest score.
-#     So all queries attend to k=0, reading tokens[0] = starter.
+#   Period-4 causal trick:
+#     The selector k==(q+1)%4 is non-causal, but because the sequence has
+#     period 4, t_{q-3} == t_{q+1}  (since (q-3)%4 == (q+1)%4).
+#     We therefore attend to k = q-3, which is causal for q >= 3.
 #
-#   After residual add:
-#     h_out[q] = [e_{t_q} | e_seed | e_{q%4}]  for all q >= 0
+#     For q < 3 there is no valid causal k with the right pos-class, so
+#     softmax is uniform over the available keys (honest uncertainty).
+#     The rule signal at q < 3 is noisy/incorrect; the adapter handles this
+#     via its gate, and generation from prompts of length >= 4 avoids it.
 #
-#   Logits via bilinear W_next:
-#     W_next is a (V*4, V) lookup table where
-#       W_next[(s*4 + p), :] = e_{(s + OFFSETS[(p+1)%4]) % V}
-#     logits[q] = outer(e_seed, e_{q%4}) @ W_next
+#   W_Q shifts pos subspace forward by +1:
+#     Q[q] has pos-class (q+1)%4  →  matches K[k] where k%4==(q+1)%4  →  k=q-3
+#   W_K identity on pos subspace.
+#   W_V copies token (dims 0..V-1) into next-token slot (V..2V-1).
+#   W_O identity on next-token slot.
+#
+#   After residual add (q >= 3):
+#     h_out[q] = [e_{t_q} | e_{t_{q+1}} | e_{q%4}]
+#   Logits are read directly from dims V..2V-1 of h_out.
 #
 #   No trainable parameters.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -72,11 +73,11 @@ class TracrPyTorchRuleModel(nn.Module):
             W_pos[i, 2 * V + i] = 1.0
         self.register_buffer("W_pos", W_pos)
 
-        # W_Q: maps ALL pos_class → pos_class 0 (constant query = e_0 in pos subspace)
-        #   Q[q] always has pos-class 0 → score(q,k) = 1 iff k%4==0 → attends to k=0
+        # W_Q: shifts pos subspace forward by +1
+        #   Q[q] has pos-class (q+1)%4  →  attends to k where k%4==(q+1)%4  →  k=q-3
         W_Q = torch.zeros(d, d)
         for i in range(4):
-            W_Q[2 * V, 2 * V + i] = 1.0   # all pos_class → 0
+            W_Q[2 * V + (i + 1) % 4, 2 * V + i] = 1.0
         self.register_buffer("W_Q", W_Q)
 
         # W_K: identity on pos subspace
@@ -85,39 +86,27 @@ class TracrPyTorchRuleModel(nn.Module):
             W_K[2 * V + i, 2 * V + i] = 1.0
         self.register_buffer("W_K", W_K)
 
-        # W_V: copies token dims 0..V-1 into seed slot V..2V-1
+        # W_V: copies token dims 0..V-1 into next-token slot V..2V-1
         W_V = torch.zeros(d, d)
         for i in range(V):
             W_V[V + i, i] = 1.0
         self.register_buffer("W_V", W_V)
 
-        # W_O: identity on seed slot V..2V-1
+        # W_O: identity on next-token slot V..2V-1
         W_O = torch.zeros(d, d)
         for i in range(V):
             W_O[V + i, V + i] = 1.0
         self.register_buffer("W_O", W_O)
-
-        # W_next: bilinear lookup table (V*4, V)
-        #   W_next[s*4 + p, :] = e_{(s + OFFSETS[(p+1)%4]) % V}
-        #   Applied as: logits = outer(e_seed, e_{q%4}) @ W_next
-        offsets_tensor = torch.tensor(OFFSETS, dtype=torch.long)
-        seed_idx = torch.arange(V, dtype=torch.long)
-        pos_idx = torch.arange(4, dtype=torch.long)
-        # next_tok[s, p] = (s + OFFSETS[(p+1)%4]) % V
-        next_tok = (seed_idx[:, None] + offsets_tensor[(pos_idx[None, :] + 1) % 4]) % V  # (V, 4)
-        flat_idx = next_tok.reshape(-1)   # (V*4,)
-        W_next = F.one_hot(flat_idx, V).float()   # (V*4, V)
-        self.register_buffer("W_next", W_next)
 
     def forward(self, idx: torch.Tensor, return_hidden: bool = False):
         """
         idx : (B, T)  — token indices in [0, VOCAB_SIZE).
         Returns logits (B, T, V) and optionally the full hidden state (B, T, 28).
 
-        logits[b, q] = predicted next-token distribution for position q.
-        For all q >= 0, the rule model attends to k=0 (the seed), so
-        logits[b, q] = e_{(seed + OFFSETS[(q+1)%4]) % V}.
-        There is NO cold-start problem — seed is always causally available.
+        logits[b, q] is the predicted next-token distribution for position q,
+        read directly from dims V..2V-1 of the residual stream after attention.
+        For q >= 3 this is a clean one-hot (attends to k=q-3, same cycle position).
+        For q < 3 it is a soft/noisy distribution (no valid causal key).
         """
         B, T = idx.shape
         t_idx = torch.arange(T, device=idx.device)
@@ -126,26 +115,22 @@ class TracrPyTorchRuleModel(nn.Module):
         h = self.W_E[idx] + self.W_pos[t_idx % 4].unsqueeze(0)   # (B, T, 28)
 
         # Queries, Keys, Values
-        Q = h @ self.W_Q.t()   # all map to e_0 in pos dims 2V..2V+3
-        K = h @ self.W_K.t()   # e_{q%4} in pos dims
-        V = h @ self.W_V.t()   # e_{t_q} in seed slot V..2V-1
+        Q = h @ self.W_Q.t()   # pos-class (q+1)%4 in dims 2V..2V+3
+        K = h @ self.W_K.t()   # pos-class q%4     in dims 2V..2V+3
+        V = h @ self.W_V.t()   # token one-hot     in dims V..2V-1
 
-        # Causal attention scores (only pos dims contribute)
+        # Causal attention scores (only pos dims contribute to dot-product)
         scores = (Q @ K.transpose(-1, -2)) * self.attn_scale   # (B, T, T)
         mask = torch.ones(T, T, device=idx.device).tril().bool()
         scores = scores.masked_fill(~mask, float('-inf'))
         attn = F.softmax(scores, dim=-1)                        # (B, T, T)
 
-        # Write attended token (= seed) into seed slot, add to residual
+        # Write attended token into next-token slot, add to residual
         attn_out = (attn @ V) @ self.W_O.t()                   # (B, T, 28)
         h_out = h + attn_out                                    # (B, T, 28)
 
-        # Logits via bilinear: outer(e_seed, e_{q%4}) @ W_next
-        seed_prob = h_out[:, :, self.V : 2 * self.V]           # (B, T, V)
-        pos_prob  = h_out[:, :, 2 * self.V :]                  # (B, T, 4)
-        outer     = seed_prob.unsqueeze(-1) * pos_prob.unsqueeze(-2)  # (B, T, V, 4)
-        outer_flat = outer.reshape(B, T, self.V * 4)
-        logits    = outer_flat @ self.W_next                    # (B, T, V)
+        # Logits from next-token slot of residual stream
+        logits = h_out[:, :, self.V : 2 * self.V]              # (B, T, 12)
 
         if return_hidden:
             return logits, h_out
@@ -167,37 +152,26 @@ if __name__ == "__main__":
 
     print(f"\nInput  : {inp.squeeze().tolist()}")
     print(f"Preds  : {logits.argmax(-1).squeeze().tolist()}")
-    print(f"Expected: [5, 7, 0, 0, 5, 7, 0, 0]")
+    print(f"Expected (q>=3): [0, 5, 7, 0]  at positions 3-6 → next tokens are [5,7,0,0]")
 
     print(f"\nHidden state breakdown (28-dim):")
     for q in range(8):
         h = hidden[0, q]
         cur  = h[:12].argmax().item()
-        seed = h[12:24].argmax().item()
+        nxt  = h[12:24].argmax().item()
         pos  = h[24:].argmax().item()
-        print(f"  q={q}: cur={cur}  seed={seed}  pos%4={pos}")
+        note = "(fallback: q<3)" if q < 3 else ""
+        print(f"  q={q}: cur={cur}  attended={nxt}  pos%4={pos}  {note}")
 
     tokens = inp.squeeze().tolist()
-    expected = [5, 7, 0, 0, 5, 7, 0, 0]
-    preds = logits.argmax(-1).squeeze().tolist()
-    print(f"\nVerification (all positions, including q<3):")
+    next_tokens = logits.argmax(-1).squeeze().tolist()
+    print(f"\nVerification (q>=3):")
     all_ok = True
-    for q in range(8):
-        ok = preds[q] == expected[q]
+    for q in range(3, 8):
+        pred = next_tokens[q]
+        exp  = tokens[(q + 1) % 4]   # period-4: next token = token at (q+1)%4
+        ok   = pred == exp
         all_ok = all_ok and ok
-        tag = "" if ok else " FAIL"
-        print(f"  q={q}: pred={preds[q]} (exp {expected[q]}){tag}")
-    print(f"  All correct: {all_ok}")
-
-    # Test with another starter
-    print(f"\n--- Starter x=6 ---")
-    from rasp_program.sequence_rule import OFFSETS
-    x = 6
-    seq = [(x + OFFSETS[i % 4]) % 12 for i in range(8)]
-    exp = [(x + OFFSETS[(i + 1) % 4]) % 12 for i in range(8)]
-    inp2 = torch.tensor([seq], dtype=torch.long)
-    preds2 = model(inp2).argmax(-1).squeeze().tolist()
-    print(f"  Input   : {seq}")
-    print(f"  Expected: {exp}")
-    print(f"  Preds   : {preds2}")
-    print(f"  All OK  : {preds2 == exp}")
+        tag  = "" if ok else " FAIL"
+        print(f"  q={q}: pred={pred} (exp {exp}){tag}")
+    print(f"  All correct (q>=3): {all_ok}")

@@ -11,13 +11,12 @@ from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 
 
 class RuleModelWrapper(nn.Module):
-    # Wraps the TRACR-compiled PyTorch rule model (seed-broadcast variant).
+    # Wraps the TRACR-compiled PyTorch rule model (period-4 causal trick).
     # forward(idx, return_hidden=True) returns (logits, rule_hidden) where
     # rule_hidden is the actual 28-dim hidden state from the transformer:
     #   dims  0-11 : one-hot of current token at position q
-    #   dims 12-23 : one-hot of seed token tokens[0] (broadcast from position 0)
+    #   dims 12-23 : one-hot of next token (correct for q>=3, noisy for q<3)
     #   dims 24-27 : one-hot of q % 4
-    # All positions are valid — no cold-start problem.
     # parameters() returns empty — no trainable parameters.
 
     def __init__(self, max_seq_len: int = 128,
@@ -46,4 +45,4 @@ if __name__ == "__main__":
     print("logits shape :", logits.shape)
     print("hidden shape :", hidden.shape)
     print("predictions  :", logits.argmax(-1).tolist())
-    print("expected(all):", "positions 0-7 → [5, 7, 0, 0, 5, 7, 0, 0]")
+    print("expected(q>=3):", "positions 3-7 → [0, 5, 7, 0, 0]")
