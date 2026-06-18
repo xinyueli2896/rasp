@@ -11,11 +11,11 @@ from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 
 
 class RuleModelWrapper(nn.Module):
-    # Wraps the rule transformer (period-4 causal attention + MLP patch for q<3).
+    # Wraps the rule transformer (TRACR-style period-4 causal attention).
     # forward(idx, return_hidden=True) returns (logits, rule_hidden) where
     # rule_hidden is a 28-dim hidden state:
     #   dims  0-11 : one-hot of current token at position q
-    #   dims 12-23 : one-hot of next token (all positions)
+    #   dims 12-23 : one-hot of next token (q>=3 sharp; q<3 honest uncertainty)
     #   dims 24-27 : one-hot of q % 4
     # parameters() returns empty — no trainable parameters.
 
