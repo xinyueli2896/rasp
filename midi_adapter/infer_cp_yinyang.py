@@ -25,8 +25,24 @@ import pretty_midi
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer, CPTokenizer
-from preprocess_large_midi_dataset import preprocess_midi, DURATION_TEMPLATES
 from midi_adapter.cp_yinyang import CPYinyangTransformer
+from midi_adapter.generate_synthetic_bass import (
+    _preprocess_pm, pitch_sort_cp,
+    DURATION_TEMPLATES, SECONDS_PER_SUBBEAT, CONSTANT_TEMPO,
+)
+
+try:
+    from preprocess_large_midi_dataset import preprocess_midi as _preprocess_midi_ext
+    def _load_midi(midi_path: str, max_polyphony: int = 4):
+        return _preprocess_midi_ext(midi_path, max_polyphony)[0]
+except ImportError:
+    def _load_midi(midi_path: str, max_polyphony: int = 4):
+        pm = pretty_midi.PrettyMIDI(midi_path)
+        total_sec = pm.get_end_time()
+        n_subbeats = max(1, int(round(total_sec / SECONDS_PER_SUBBEAT)))
+        data, _ = _preprocess_pm(pm, n_subbeats, max_polyphony)
+        data = pitch_sort_cp(data)
+        return data.numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +119,7 @@ def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100,
 # ---------------------------------------------------------------------------
 
 def decompress(model: CPYinyangTransformer, byte_arr):
-    x = torch.tensor(byte_arr).unsqueeze(0).cuda()
+    x = torch.tensor(np.array(byte_arr)).unsqueeze(0).cuda()
     return model.base.preprocess(x, pitch_shift=torch.zeros(1, dtype=torch.int8).cuda())
 
 
@@ -114,7 +130,7 @@ def decompress(model: CPYinyangTransformer, byte_arr):
 def continuation(model: CPYinyangTransformer, midi_path: str,
                  prompt_length: int = 4, generation_length: int = 32,
                  temperature: float = 1.0, n_samples: int = 1):
-    x = decompress(model, preprocess_midi(midi_path, 4)[0])
+    x = decompress(model, _load_midi(midi_path, max_polyphony=4))
     print(x.shape)
     x = x[:, :prompt_length]
 
