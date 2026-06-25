@@ -229,11 +229,16 @@ class CPYinyangLightning(L.LightningModule):
         if self.enc_loss_weight > 0:
             result = self.model.get_encoder_logits(x_proc)
             if result is not None:
-                enc_logits, cur_pc = result            # (B,T,12), (B,T)
-                enc_loss = F.cross_entropy(
-                    enc_logits.reshape(-1, enc_logits.shape[-1]),
-                    cur_pc.reshape(-1),
-                )
+                enc_logits, target = result
+                if self.model.approach == 'chord':
+                    # target: (B,T,12) binary chromagram — use BCE loss
+                    enc_loss = F.binary_cross_entropy_with_logits(enc_logits, target)
+                else:
+                    # target: (B,T) long current pitch class — use CE loss
+                    enc_loss = F.cross_entropy(
+                        enc_logits.reshape(-1, enc_logits.shape[-1]),
+                        target.reshape(-1),
+                    )
                 loss = loss + self.enc_loss_weight * enc_loss
                 self.log('enc_loss', enc_loss, on_step=True, on_epoch=False)
 
@@ -269,12 +274,14 @@ class CPYinyangLightning(L.LightningModule):
 def main(args):
     n_gpus   = max(torch.cuda.device_count(), 1)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
-    lora_suffix  = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
-    rule_suffix  = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
-    enc_suffix   = f'_{args.encoder_type}' if args.encoder_injected else ''
+    lora_suffix     = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
+    rule_suffix     = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
+    enc_suffix      = f'_{args.encoder_type}' if args.encoder_injected else ''
+    approach_suffix = f'_{args.approach}' if args.approach != 'bass' else ''
     run_name = (
         args.run_name
-        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}{lora_suffix}{rule_suffix}{enc_suffix}'
+        or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}'
+           f'{lora_suffix}{rule_suffix}{enc_suffix}{approach_suffix}'
     )
 
     # Build base CP transformer and load pretrained weights
@@ -299,6 +306,7 @@ def main(args):
         encoder_injected  = args.encoder_injected,
         encoder_type      = args.encoder_type,
         rule_mode         = args.rule_mode,
+        approach          = args.approach,
     )
 
     if args.unfreeze_base:
@@ -463,6 +471,12 @@ def get_args():
                    help='current: analytical 16-dim rule model (existing); '
                         'period4: TRACR attention 28-dim, dims 12-23=next pc; '
                         'seed_broadcast: 28-dim, dims 12-23=seed pc.')
+    p.add_argument('--approach', type=str, default='bass',
+                   choices=['bass', 'chord'],
+                   help='bass: regulate the bass note (slot 0 pitch class) with BassTracrRuleModel; '
+                        'chord: regulate the chord progression (all-voice chromagram) with '
+                        'CPChordRuleModel. Use --encoder_injected to inject a learned '
+                        'ChordEncoder for chord approach training.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)

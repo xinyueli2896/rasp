@@ -225,6 +225,31 @@ def generate_song(
 # Preprocessing  (no xf_midi dependency needed for synthetic data)
 # ---------------------------------------------------------------------------
 
+def pitch_sort_cp(data: torch.Tensor, tuple_size: int = 4) -> torch.Tensor:
+    """Sort voices at each timestep by ascending pitch (lowest first).
+
+    Required for Approach 1 (bass note regulation) when using polyphonic CP data:
+    ensures voice 0 always contains the lowest-pitched note so that
+    x_proc[:, :, 1] % 128 % 12 gives the bass pitch class.
+
+    data : (n_subbeats, max_polyphony * tuple_size)  raw uint8 CP tensor
+           Each voice v occupies slots [v*tuple_size : (v+1)*tuple_size]
+           = [prog, pitch, dur, vel].  Padding = 255; EOS prog = 254.
+
+    Returns a tensor of the same shape with voices sorted by pitch ascending,
+    padding and EOS entries sorted to the end.
+    """
+    n_sub, flat = data.shape
+    n_voices = flat // tuple_size
+    d = data.view(n_sub, n_voices, tuple_size)  # (n, v, 4)
+
+    pitch = d[:, :, 1].long()   # (n, v)  — 255 for pad, real pitch for notes
+    # Sort key: pitch ascending; padding (255) sorts last because 255 > all real pitches
+    sort_idx = pitch.argsort(dim=1, stable=True)   # (n, v)
+    sorted_d = d.gather(1, sort_idx.unsqueeze(-1).expand_as(d))
+    return sorted_d.reshape(n_sub, flat)
+
+
 def _preprocess_pm(
     pm:            pretty_midi.PrettyMIDI,
     n_subbeats:    int,
@@ -279,6 +304,7 @@ def generate_dataset(
     max_polyphony: int       = 4,
     allowed_keys:  list[int] | None = None,
     seed:          int       = 42,
+    pitch_sort:    bool      = False,
 ) -> None:
     """
     Generate n_songs synthetic bass songs and save all output files.
@@ -311,8 +337,10 @@ def generate_dataset(
         pm.write(midi_path)
         txt_lines.append(f'{i}\t{rel_path}')
 
-        # Preprocess to CP tensor
+        # Preprocess to CP tensor (optionally sort voices by pitch ascending)
         data, shift = _preprocess_pm(pm, n_subbeats, max_polyphony)
+        if pitch_sort:
+            data = pitch_sort_cp(data)
         all_data.append(data)
         all_shift.append(shift)
 
@@ -353,6 +381,10 @@ def main():
     p.add_argument('--keys',          type=int,   nargs='*', default=None,
                    help='Allowed root semitones (0-11). Default: all 12.')
     p.add_argument('--seed',          type=int,   default=42)
+    p.add_argument('--pitch_sort',    action='store_true',
+                   help='Sort voices at each timestep by ascending pitch so voice 0 '
+                        'always holds the lowest note (bass note). Required for '
+                        'Approach 1 (bass note regulation) with polyphonic CP data.')
     args = p.parse_args()
 
     print(f'Generating {args.n_songs} songs, {args.n_bars} bars each')
@@ -367,6 +399,7 @@ def main():
         max_polyphony = args.max_polyphony,
         allowed_keys  = args.keys,
         seed          = args.seed,
+        pitch_sort    = args.pitch_sort,
     )
 
 

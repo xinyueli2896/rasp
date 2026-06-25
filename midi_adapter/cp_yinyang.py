@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
+from models.bass_tracr_rule_model import BassTracrRuleModel, CPChordRuleModel, TRACR_D_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +99,36 @@ class BassRuleInputEncoder(nn.Module):
 
     def forward(self, pc: torch.Tensor) -> torch.Tensor:
         return self.embedding(pc)   # (B, T, n_pitches)
+
+
+class ChordEncoder(nn.Module):
+    """
+    Learned encoder for chord chromagram → rule-space embedding.
+
+    Approach 2 (chord progression): at training time the observed chromagram
+    (extracted from ALL voices at each timestep) is available as a paired input.
+    The encoder maps it to the same 12-dim space that CPChordRuleModel uses so
+    that the cross-attention adapter can learn chord-conditioned generation.
+
+    Input : (B, T, 12) float binary chromagram
+    Output: (B, T, 12) learned embedding  (dims 0-11 only; zero-padded externally)
+
+    At inference, build_rule_hidden_analytic is used instead of the encoder,
+    exactly like BassTracrRuleModel's analytical path.
+    """
+
+    def __init__(self, hidden: int = 64):
+        super().__init__()
+        self.fc1 = nn.Linear(12, hidden)
+        self.fc2 = nn.Linear(hidden, 12)
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, chroma: torch.Tensor) -> torch.Tensor:
+        """chroma: (B, T, 12)  →  (B, T, 12)"""
+        return self.fc2(F.relu(self.fc1(chroma)))
 
 
 class BassTokMlpEncoder(nn.Module):
@@ -227,6 +257,7 @@ class CPYinyangTransformer(nn.Module):
         encoder_injected: bool = False,
         encoder_type:     str  = 'embedding',
         rule_mode:        str  = 'current',
+        approach:         str  = 'bass',
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -234,12 +265,17 @@ class CPYinyangTransformer(nn.Module):
             "encoder_injected only supported with rule_mode='current'"
         assert encoder_type in ('embedding', 'token_mlp'), \
             f"encoder_type must be 'embedding' or 'token_mlp', got {encoder_type!r}"
+        assert approach in ('bass', 'chord'), \
+            f"approach must be 'bass' or 'chord', got {approach!r}"
+        assert not (approach == 'chord' and rule_mode != 'current'), \
+            "chord approach only supported with rule_mode='current'"
         super().__init__()
         self.base             = base_model
         self.n_skip           = n_skip
         self.lora_rank        = lora_rank
         self.bidirectional    = bidirectional
         self.encoder_injected = encoder_injected
+        self.approach         = approach
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -258,7 +294,10 @@ class CPYinyangTransformer(nn.Module):
         n_adapters = n_layers // n_skip
 
         # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
-        self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
+        if approach == 'chord':
+            self.rule_model = CPChordRuleModel()
+        else:
+            self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
@@ -271,10 +310,13 @@ class CPYinyangTransformer(nn.Module):
         ])
 
         if encoder_injected:
-            # Learned pitch-class encoder replaces the hard one-hot W_E lookup.
-            # Encoder outputs N_ROOTS=12 dims only (dims 0-11); _encoder_injected_rule_hidden
-            # zero-pads to d_model before adding frozen W_pos.
-            if encoder_type == 'token_mlp':
+            # Learned encoder replaces the analytical rule model's embedding lookup.
+            # For bass approach: encodes pitch class → 12-dim embedding.
+            # For chord approach: encodes observed chromagram → 12-dim embedding.
+            # Both output 12 dims only; _encoder_injected_rule_hidden zero-pads to d_model.
+            if approach == 'chord':
+                self.rule_input_encoder = ChordEncoder()
+            elif encoder_type == 'token_mlp':
                 self.rule_input_encoder = BassTokMlpEncoder()
             else:
                 self.rule_input_encoder = BassRuleInputEncoder()
@@ -302,45 +344,88 @@ class CPYinyangTransformer(nn.Module):
         offsets = self.rule_model._offsets[t_idx % 4]           # (T,)
         return (key[:, None] + offsets[None, :]) % 12           # (B, T)
 
-    def _encoder_injected_rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
-        """Encoder-injected rule_hidden: learned embedding for each pitch class.
+    def _extract_chromagram(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """Extract binary chromagram from all voices at each timestep.
 
-        Reads key = pc[:, 0], computes cur_pc[t] = (key + OFFSETS[t%4]) % 12,
-        then returns encoder(cur_pc) + W_pos[t%4].  Mirrors the analytical rule
-        model but with a learned dense embedding instead of one-hot.
+        x_proc : (B, T, S)  preprocessed CP tokens (S = n_voices * 2)
+            Slot 2v   = program token (0-127 for valid notes; eos/pad otherwise)
+            Slot 2v+1 = pitch + (dur+1)*128 token; % 128 gives MIDI pitch
+
+        Returns (B, T, 12) float binary chromagram.
+        A pitch class is 1 if ANY valid voice plays that pc at that timestep.
+        """
+        B, T, S = x_proc.shape
+        n_voices = S // 2
+        pad_tok  = self.base.tokenizer.pad_token
+        eos_tok  = self.base.tokenizer.eos_token
+        device   = x_proc.device
+
+        chroma = torch.zeros(B, T, 12, device=device, dtype=torch.float)
+        for v in range(n_voices):
+            prog_slot  = x_proc[:, :, 2 * v]          # (B, T)
+            pitch_slot = x_proc[:, :, 2 * v + 1]      # (B, T)
+            valid = (prog_slot != pad_tok) & (prog_slot != eos_tok)  # (B, T)
+            pitch = pitch_slot % 128                   # (B, T) MIDI pitch 0-127
+            pc    = (pitch % 12).clamp(0, 11)          # (B, T) pitch class
+            pc_oh = F.one_hot(pc.long(), num_classes=12).float()     # (B, T, 12)
+            chroma = torch.clamp(chroma + pc_oh * valid.unsqueeze(-1).float(), 0, 1)
+        return chroma
+
+    def _encoder_injected_rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """Encoder-injected rule_hidden: learned embedding for rule input.
+
+        Bass approach  : encodes cur_pc[t] = (key + OFFSETS[t%4]) % 12
+        Chord approach : encodes observed chromagram from all voices
+
+        Returns encoder(input) zero-padded to d_model, plus frozen W_pos[t%4].
         """
         t_idx   = torch.arange(x_proc.shape[1], device=x_proc.device)
-        cur_pc  = self._cur_pc(x_proc)                          # (B, T)
-        enc     = self.rule_input_encoder(cur_pc)               # (B, T, N_ROOTS=12)
         d       = self.rule_model.d_model
-        h       = F.pad(enc, (0, d - enc.shape[-1]))            # (B, T, d_model)
-        pos_emb = self.rule_model.W_pos[t_idx % 4]             # (T, d_model)
+
+        if self.approach == 'chord':
+            chroma = self._extract_chromagram(x_proc)            # (B, T, 12)
+            enc    = self.rule_input_encoder(chroma)             # (B, T, 12)
+        else:
+            cur_pc = self._cur_pc(x_proc)                        # (B, T)
+            enc    = self.rule_input_encoder(cur_pc)             # (B, T, 12)
+
+        h       = F.pad(enc, (0, d - enc.shape[-1]))             # (B, T, d_model)
+        pos_emb = self.rule_model.W_pos[t_idx % 4]              # (T, d_model)
         return h + pos_emb.unsqueeze(0)
 
     def get_encoder_logits(self, x_proc: torch.Tensor):
-        """Dims 0-11 of the raw encoder output as current-pitch-class logits.
+        """Raw encoder output and its paired ground-truth target.
 
-        Returns (enc_logits, cur_pc) where:
-          enc_logits : (B, T, 12)  — softmax should peak at cur_pc[b, t]
-          cur_pc     : (B, T)      — ground-truth current pitch class
+        Bass approach:
+            Returns (enc_logits, cur_pc): (B,T,12), (B,T) long
+            Supervised by CE loss — encoder should learn to reconstruct cur_pc.
+        Chord approach:
+            Returns (enc_logits, chromagram): (B,T,12), (B,T,12) float binary
+            Supervised by BCE loss — encoder should reconstruct the chromagram.
+
         Returns None if encoder_injected is False.
         """
         if not self.encoder_injected:
             return None
-        cur_pc  = self._cur_pc(x_proc)                           # (B, T)
-        enc_out = self.rule_input_encoder(cur_pc)                # (B, T, N_ROOTS=12)
-        return enc_out, cur_pc                                   # (B,T,12), (B,T)
+        if self.approach == 'chord':
+            chroma  = self._extract_chromagram(x_proc)            # (B, T, 12)
+            enc_out = self.rule_input_encoder(chroma)             # (B, T, 12)
+            return enc_out, chroma                                 # logits, BCE target
+        else:
+            cur_pc  = self._cur_pc(x_proc)                        # (B, T)
+            enc_out = self.rule_input_encoder(cur_pc)             # (B, T, 12)
+            return enc_out, cur_pc                                 # logits, CE target
 
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
-        """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
+        """Compute frozen analytical rule_hidden from preprocessed tokens.
 
-        x_proc : (B, T, subseq_len)  preprocessed CP tokens
-          slot 1 = pitch + (dur+1)*128  →  pitch = slot1 % 128  →  pc = pitch % 12
-        Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
-        hidden[t] encodes the CURRENT pitch class: (key + OFFSETS[t%4]) % 12.
+        Reads key = pc[b, 0] from voice 0 (slot 1) and runs the rule model:
+          bass  : BassTracrRuleModel  → (B, T, 16/28) with one-hot pitch encoding
+          chord : CPChordRuleModel    → (B, T, 16) with binary chromagram encoding
+        Both models encode (key, t) → expected rule signal at position t.
         """
-        pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
-        _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
+        pc = x_proc[:, :, 1] % 128 % 12   # (B, T) voice-0 pitch class; pc[b,0] = key
+        _, h = self.rule_model(pc, return_hidden=True)   # (B, T, d_model)
         return h
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -401,8 +486,9 @@ class CPYinyangTransformer(nn.Module):
 
         # Pre-compute rule_hidden for standard and encoder_injected modes.
         # Bidirectional computes rule_hidden on-the-fly from AR states each step.
-        pc_0 = (x[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,) starting pitch class
-        if self.encoder_injected:
+        pc_0 = (x[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,) starting pitch class / key
+        if self.encoder_injected and self.approach == 'bass':
+            # Bass encoder: cur_pc is computable analytically → run learned encoder at inference.
             t_idx   = torch.arange(max_seq_len, device=x.device)
             offsets = self.rule_model._offsets[t_idx % 4]               # (max_seq_len,)
             cur_pc  = (pc_0[:, None] + offsets[None, :]) % 12           # (B, max_seq_len)
@@ -412,6 +498,10 @@ class CPYinyangTransformer(nn.Module):
             pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, d)
             rule_hidden = h_enc + pos_emb.unsqueeze(0)
         elif not self.bidirectional:
+            # Analytical rule model (both bass non-encoder-injected, chord encoder-injected,
+            # and chord non-encoder-injected).  Chord encoder is bypassed at inference since
+            # the observed chromagram is not available; build_rule_hidden_analytic provides
+            # the expected chromagram from the key analytically.
             rule_hidden = self.rule_model.build_rule_hidden_analytic(pc_0, max_seq_len, x.device)
         else:
             rule_hidden = None

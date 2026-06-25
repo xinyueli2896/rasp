@@ -235,6 +235,109 @@ class BassTracrRuleModel(nn.Module):
         return iter([])
 
 
+class CPChordRuleModel(nn.Module):
+    """
+    Rule model for chord-progression regulation.
+
+    For each timestep t, outputs the EXPECTED major-triad chromagram:
+        root  = (key + OFFSETS[t % 4]) % 12
+        chord = {root, root+4, root+7}  (major triad)
+
+    as a 12-dim binary one-hot-OR vector (1 where a chord tone lands, 0 elsewhere).
+
+    Input : bass pitch class sequence  (B, T)   int64, idx[:, 0] = key
+    Output: chromagram targets          (B, T, 12) float binary
+            hidden                      (B, T, d_model=16) if return_hidden=True
+
+    Hidden state format (d_model=16):
+        dims  0-11 : 12-dim binary chromagram of expected major triad
+        dims 12-15 : one-hot of t % 4  (positional class)
+
+    No trainable parameters.
+    """
+
+    CHORD_INTERVALS: tuple = (0, 4, 7)   # major triad
+    d_model:         int   = N_ROOTS + N_POS   # 16
+    TRACR_D_MODEL:   int   = N_ROOTS + N_POS   # 16
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
+        W_pos = torch.zeros(N_POS, self.d_model)
+        for i in range(N_POS):
+            W_pos[i, N_ROOTS + i] = 1.0
+        self.register_buffer('W_pos', W_pos)
+
+    # ------------------------------------------------------------------
+
+    def _root_to_chromagram(self, root: torch.Tensor) -> torch.Tensor:
+        """root: (B, T)  →  chromagram: (B, T, 12) binary float."""
+        chroma = torch.zeros(*root.shape, N_ROOTS,
+                             device=root.device, dtype=torch.float)
+        for interval in self.CHORD_INTERVALS:
+            idx = (root + interval) % N_ROOTS
+            chroma.scatter_(-1, idx.unsqueeze(-1), 1.0)
+        return chroma
+
+    # ------------------------------------------------------------------
+
+    def forward(self, idx: torch.Tensor, return_hidden: bool = False):
+        """
+        idx : (B, T)  pitch-class sequence; idx[:, 0] is the key.
+        Returns chromagram (B, T, 12) float binary, optionally also hidden (B, T, 16).
+        """
+        B, T   = idx.shape
+        device = idx.device
+        t_idx  = torch.arange(T, device=device)
+
+        key      = idx[:, 0]                                         # (B,)
+        o_cur    = self._offsets[t_idx % N_POS]                      # (T,)
+        cur_root = (key[:, None] + o_cur[None, :]) % N_ROOTS        # (B, T)
+        chroma   = self._root_to_chromagram(cur_root)                # (B, T, 12)
+
+        if return_hidden:
+            h = torch.zeros(B, T, self.d_model, device=device)
+            h[:, :, :N_ROOTS] = chroma
+            pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()  # (T, 4)
+            h[:, :, N_ROOTS:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+            return chroma, h
+        return chroma
+
+    # ------------------------------------------------------------------
+
+    def build_rule_hidden_analytic(
+        self,
+        pc_0:   torch.Tensor,   # (B,) starting pitch class (= key)
+        T:      int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build rule_hidden analytically without any sequence input.
+
+        Returns (B, T, d_model=16):
+            dims  0-11 : binary chromagram of major triad at (key+OFFSETS[t%4])%12
+            dims 12-15 : one-hot of t % 4
+        """
+        B      = pc_0.shape[0]
+        t_idx  = torch.arange(T, device=device)
+        o_cur  = self._offsets.to(device)[t_idx % N_POS]            # (T,)
+        cur_root = (pc_0[:, None].to(device) + o_cur[None, :]) % N_ROOTS  # (B, T)
+        chroma   = self._root_to_chromagram(cur_root)                # (B, T, 12)
+
+        h = torch.zeros(B, T, self.d_model, device=device)
+        h[:, :, :N_ROOTS] = chroma
+        pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()
+        h[:, :, N_ROOTS:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+        return h
+
+    # ------------------------------------------------------------------
+
+    def parameters(self, recurse=True):
+        return iter([])
+
+    def named_parameters(self, prefix='', recurse=True, remove_duplicate=True):
+        return iter([])
+
+
 if __name__ == '__main__':
     model = BassTracrRuleModel()
     print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}  d_model = {model.d_model}')
@@ -248,3 +351,13 @@ if __name__ == '__main__':
     print(f'expect : [0, 5, 7, 0, 0, 5, 7, 0]  (current pitch class)')
     print(f'hidden shape: {hidden.shape}')
     print(f'All correct: {preds == [0, 5, 7, 0, 0, 5, 7, 0]}')
+
+    # Test CPChordRuleModel
+    chord_model = CPChordRuleModel()
+    print(f'\nCPChordRuleModel d_model={chord_model.d_model}')
+    idx2 = torch.tensor([[0, 5, 7, 0]], dtype=torch.long)  # key=C=0
+    chroma, h2 = chord_model(idx2, return_hidden=True)
+    print(f'key=C  chromagrams: {chroma.squeeze().tolist()}')
+    # t=0: root=0 → C major {0,4,7}; t=1: root=5 → F major {5,9,0}
+    # t=2: root=7 → G major {7,11,2}; t=3: root=0 → C major {0,4,7}
+    print(f'hidden shape: {h2.shape}')

@@ -159,6 +159,7 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                model_size: int, adapter_rank: int, n_skip: int,
                bidirectional: bool, encoder_injected: bool,
                encoder_type: str = 'embedding', rule_mode: str = 'current',
+               approach: str = 'bass',
                device: torch.device = None) -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
@@ -166,7 +167,8 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                                  bidirectional=bidirectional,
                                  encoder_injected=encoder_injected,
                                  encoder_type=encoder_type,
-                                 rule_mode=rule_mode)
+                                 rule_mode=rule_mode,
+                                 approach=approach)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
         print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
@@ -226,7 +228,7 @@ def run_evaluation(args) -> None:
     model = load_model(getattr(args, 'base_ckpt', None), args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip,
                        args.bidirectional, args.encoder_injected,
-                       args.encoder_type, args.rule_mode, device)
+                       args.encoder_type, args.rule_mode, args.approach, device)
 
     rows       = []
     all_errors = []
@@ -291,6 +293,9 @@ def get_args():
                    help='Must match the flag used during training')
     p.add_argument('--rule_mode', type=str, default='current',
                    choices=['current', 'period4', 'seed_broadcast'],
+                   help='Must match the flag used during training')
+    p.add_argument('--approach', type=str, default='bass',
+                   choices=['bass', 'chord'],
                    help='Must match the flag used during training')
     p.add_argument('--save_midi_dir',  type=str, default=None,
                    help='Directory for MIDI output (default: eval_midi/<adapter_name>/)')
