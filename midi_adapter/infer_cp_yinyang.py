@@ -28,7 +28,7 @@ from cp_transformer import RoFormerSymbolicTransformer, CPTokenizer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import (
     _preprocess_pm, pitch_sort_cp,
-    DURATION_TEMPLATES, SECONDS_PER_SUBBEAT, CONSTANT_TEMPO,
+    DURATION_TEMPLATES, DURATION_BOUNDARIES, SECONDS_PER_SUBBEAT, CONSTANT_TEMPO,
 )
 
 try:
@@ -37,10 +37,35 @@ try:
         return _preprocess_midi_ext(midi_path, max_polyphony)[0]
 except ImportError:
     def _load_midi(midi_path: str, max_polyphony: int = 4):
-        pm = pretty_midi.PrettyMIDI(midi_path)
-        total_sec = pm.get_end_time()
-        n_subbeats = max(1, int(round(total_sec / SECONDS_PER_SUBBEAT)))
-        data, _ = _preprocess_pm(pm, n_subbeats, max_polyphony)
+        """Load MIDI and quantize to beats using the file's actual tempo map."""
+        pm          = pretty_midi.PrettyMIDI(midi_path)
+        beat_times  = pm.get_beats()          # actual beat times (handles tempo changes)
+        n_subbeats  = len(beat_times)
+
+        rolls            = np.full((n_subbeats, max_polyphony, 4), 255, dtype=np.uint8)
+        polyphony_counts = np.zeros(n_subbeats, dtype=np.uint8)
+
+        for inst in pm.instruments:
+            if inst.is_drum:
+                continue
+            for note in inst.notes:
+                s = int(np.searchsorted(beat_times, note.start, side='right')) - 1
+                e = int(np.searchsorted(beat_times, note.end,   side='right')) - 1
+                if s < 0 or s >= n_subbeats:
+                    continue
+                if polyphony_counts[s] >= max_polyphony:
+                    continue
+                dur_idx = int(np.searchsorted(DURATION_BOUNDARIES, max(0, e - s)))
+                rolls[s, polyphony_counts[s]] = [
+                    inst.program, note.pitch, dur_idx, note.velocity
+                ]
+                polyphony_counts[s] += 1
+
+        for i in range(n_subbeats):
+            if polyphony_counts[i] < max_polyphony:
+                rolls[i, polyphony_counts[i], 0] = 254   # EOS
+
+        data = torch.tensor(rolls.reshape(n_subbeats, max_polyphony * 4), dtype=torch.uint8)
         data = pitch_sort_cp(data)
         return data.numpy()
 
@@ -53,7 +78,7 @@ def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100,
                   with_velocity=False, extra_instruments=None, fixed_program=None):
     tokenizer = CPTokenizer(with_velocity=with_velocity)
     midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    time_step_length = 60.0 / tempo / 4
+    time_step_length = SECONDS_PER_SUBBEAT   # 0.5s at 120 BPM (BEAT_DIV=1)
     if not isinstance(outputs, tuple):
         outputs = (outputs,)
     if not isinstance(ratio, tuple):
