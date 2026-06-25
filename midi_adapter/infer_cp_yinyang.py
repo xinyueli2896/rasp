@@ -28,7 +28,7 @@ from cp_transformer import RoFormerSymbolicTransformer, CPTokenizer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import (
     _preprocess_pm, pitch_sort_cp,
-    DURATION_TEMPLATES, DURATION_BOUNDARIES, SECONDS_PER_SUBBEAT, CONSTANT_TEMPO,
+    BEAT_DIV, DURATION_TEMPLATES, DURATION_BOUNDARIES, SECONDS_PER_SUBBEAT, CONSTANT_TEMPO,
 )
 
 try:
@@ -37,10 +37,20 @@ try:
         return _preprocess_midi_ext(midi_path, max_polyphony)[0]
 except ImportError:
     def _load_midi(midi_path: str, max_polyphony: int = 4):
-        """Load MIDI and quantize to beats using the file's actual tempo map."""
-        pm          = pretty_midi.PrettyMIDI(midi_path)
-        beat_times  = pm.get_beats()          # actual beat times (handles tempo changes)
-        n_subbeats  = len(beat_times)
+        """Load MIDI and quantize to 16th-note subbeats using the file's actual tempo map."""
+        pm         = pretty_midi.PrettyMIDI(midi_path)
+        beat_times = pm.get_beats()   # quarter-note positions (tempo-aware)
+        n_beats    = len(beat_times)
+
+        # Build 16th-note subbeat times by interpolating within each beat
+        subbeat_times = []
+        for i in range(n_beats - 1):
+            dt = (beat_times[i + 1] - beat_times[i]) / BEAT_DIV
+            for j in range(BEAT_DIV):
+                subbeat_times.append(beat_times[i] + j * dt)
+        subbeat_times.append(beat_times[-1])
+        subbeat_times = np.array(subbeat_times)
+        n_subbeats    = len(subbeat_times)
 
         rolls            = np.full((n_subbeats, max_polyphony, 4), 255, dtype=np.uint8)
         polyphony_counts = np.zeros(n_subbeats, dtype=np.uint8)
@@ -49,8 +59,8 @@ except ImportError:
             if inst.is_drum:
                 continue
             for note in inst.notes:
-                s = int(np.searchsorted(beat_times, note.start, side='right')) - 1
-                e = int(np.searchsorted(beat_times, note.end,   side='right')) - 1
+                s = int(np.searchsorted(subbeat_times, note.start, side='right')) - 1
+                e = int(np.searchsorted(subbeat_times, note.end,   side='right')) - 1
                 if s < 0 or s >= n_subbeats:
                     continue
                 if polyphony_counts[s] >= max_polyphony:
@@ -78,7 +88,7 @@ def decode_output(outputs, save_path=None, tempo=120.0, ratio=1.0, velocity=100,
                   with_velocity=False, extra_instruments=None, fixed_program=None):
     tokenizer = CPTokenizer(with_velocity=with_velocity)
     midi = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    time_step_length = SECONDS_PER_SUBBEAT   # 0.5s at 120 BPM (BEAT_DIV=1)
+    time_step_length = SECONDS_PER_SUBBEAT   # 0.125s at 120 BPM (BEAT_DIV=4, 16th-note)
     if not isinstance(outputs, tuple):
         outputs = (outputs,)
     if not isinstance(ratio, tuple):

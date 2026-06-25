@@ -87,11 +87,11 @@ from midi_adapter.chord_tokenizer import (
 # Constants  (must match cp_transformer.py / preprocess_large_midi_dataset.py)
 # ---------------------------------------------------------------------------
 
-BEAT_DIV           = 1                              # 1 subbeat = 1 beat (quarter note)
+BEAT_DIV           = 4                              # 4 subbeats = 1 beat (16th-note resolution)
 BEATS_PER_BAR      = 4                              # 4/4 time
-SUBBEATS_PER_BAR   = BEAT_DIV * BEATS_PER_BAR      # 4
+SUBBEATS_PER_BAR   = BEAT_DIV * BEATS_PER_BAR      # 16
 CONSTANT_TEMPO     = 120.0                          # BPM
-SECONDS_PER_SUBBEAT = 60.0 / CONSTANT_TEMPO / BEAT_DIV  # 0.5 s/subbeat (= 1 beat)
+SECONDS_PER_SUBBEAT = 60.0 / CONSTANT_TEMPO / BEAT_DIV  # 0.125 s/subbeat (= 1 16th note)
 
 DURATION_TEMPLATES = np.array([
     1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128,
@@ -457,7 +457,7 @@ def main():
     p = argparse.ArgumentParser(description='Generate synthetic bass MIDI dataset')
     p.add_argument('--n_songs',       type=int,   default=5000)
     p.add_argument('--n_bars',        type=int,   default=128,
-                   help='Bars per song (must be >= TRAIN_LENGTH/SUBBEATS_PER_BAR=96 for training)')
+                   help='Bars per song (must be >= TRAIN_LENGTH/SUBBEATS_PER_BAR=6 for training)')
     p.add_argument('--out_dir',       type=str,   required=True,
                    help='Directory for individual MIDI files')
     p.add_argument('--out_pt',        type=str,   required=True,

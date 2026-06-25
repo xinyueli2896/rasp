@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from midi_adapter.generate_synthetic_bass import (
     _preprocess_pm, pitch_sort_cp,
-    SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS,
+    BEAT_DIV, SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS,
     DURATION_BOUNDARIES,
 )
 
@@ -173,17 +173,29 @@ def _extract_window_cp(
     beats_per_bar: int = BEATS_PER_BAR,
 ) -> torch.Tensor | None:
     beat_times = pm.get_beats()
-    start_beat = start_bar * beats_per_bar
-    end_beat   = start_beat + n_bars * beats_per_bar
-    if end_beat > len(beat_times):
+    n_beats_total = len(beat_times)
+
+    # Build 16th-note subbeat times by linearly interpolating within each beat
+    subbeat_times = []
+    for i in range(n_beats_total - 1):
+        dt = (beat_times[i + 1] - beat_times[i]) / BEAT_DIV
+        for j in range(BEAT_DIV):
+            subbeat_times.append(beat_times[i] + j * dt)
+    subbeat_times.append(beat_times[-1])
+    subbeat_times = np.array(subbeat_times)
+
+    start_subbeat = start_bar * beats_per_bar * BEAT_DIV   # = start_bar * SUBBEATS_PER_BAR
+    n_subbeats    = n_bars * beats_per_bar * BEAT_DIV       # = n_bars   * SUBBEATS_PER_BAR
+    end_subbeat   = start_subbeat + n_subbeats
+
+    if end_subbeat > len(subbeat_times):
         return None
 
-    n_subbeats = n_bars * beats_per_bar
     rolls  = np.full((n_subbeats, max_polyphony, 4), 255, dtype=np.uint8)
     counts = np.zeros(n_subbeats, dtype=np.uint8)
 
-    t0 = beat_times[start_beat]
-    t1 = beat_times[end_beat] if end_beat < len(beat_times) else pm.get_end_time()
+    t0 = subbeat_times[start_subbeat]
+    t1 = subbeat_times[end_subbeat] if end_subbeat < len(subbeat_times) else pm.get_end_time()
 
     for inst in pm.instruments:
         if inst.is_drum:
@@ -191,12 +203,12 @@ def _extract_window_cp(
         for note in inst.notes:
             if note.start < t0 or note.start >= t1:
                 continue
-            abs_beat = int(np.searchsorted(beat_times, note.start, side='right')) - 1
-            local_b  = abs_beat - start_beat
+            abs_sub = int(np.searchsorted(subbeat_times, note.start, side='right')) - 1
+            local_b = abs_sub - start_subbeat
             if local_b < 0 or local_b >= n_subbeats or counts[local_b] >= max_polyphony:
                 continue
-            abs_e   = int(np.searchsorted(beat_times, note.end, side='right')) - 1
-            dur_idx = int(np.searchsorted(DURATION_BOUNDARIES, max(0, abs_e - abs_beat)))
+            abs_e   = int(np.searchsorted(subbeat_times, note.end, side='right')) - 1
+            dur_idx = int(np.searchsorted(DURATION_BOUNDARIES, max(0, abs_e - abs_sub)))
             rolls[local_b, counts[local_b]] = [inst.program, note.pitch, dur_idx, note.velocity]
             counts[local_b] += 1
 
@@ -255,11 +267,11 @@ def cmd_extract(args):
         if n_notes < args.n_bars * args.min_notes_per_bar:
             continue
 
-        # Beat-level chord tokens for this window
-        n_beats = args.n_bars * BEATS_PER_BAR
+        # Subbeat-level chord tokens for this window (one per 16th note)
+        n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
         beat_tokens = []
-        for beat in range(n_beats):
-            bar_in_window = beat // BEATS_PER_BAR
+        for sb in range(n_subbeats_window):
+            bar_in_window = sb // SUBBEATS_PER_BAR
             root = (key + OFFSETS[(bar_in_window + phase) % 4]) % 12
             beat_tokens.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
         all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
@@ -276,7 +288,7 @@ def cmd_extract(args):
         print('No windows passed the note-density filter. Try --min_notes_per_bar 1')
         return
 
-    n_subbeats = args.n_bars * BEATS_PER_BAR
+    n_subbeats = args.n_bars * SUBBEATS_PER_BAR
     torch.save(torch.cat(all_data, dim=0),                f'{args.out_pt}.pt')
     torch.save(torch.tensor([n_subbeats] * n_saved),      f'{args.out_pt}.length.pt')
     torch.save(torch.zeros(n_saved, 2, dtype=torch.int8), f'{args.out_pt}.pitch_shift_range.pt')

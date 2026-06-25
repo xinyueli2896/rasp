@@ -262,7 +262,7 @@ class CPChordRuleModel(nn.Module):
     d_model:         int   = N_ROOTS + N_POS   # 16
     TRACR_D_MODEL:   int   = N_ROOTS + N_POS   # 16
 
-    def __init__(self, beats_per_bar: int = 4):
+    def __init__(self, beats_per_bar: int = 16):
         super().__init__()
         self.beats_per_bar = beats_per_bar
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))

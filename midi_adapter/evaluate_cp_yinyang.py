@@ -87,10 +87,10 @@ def _extract_all_pcs(tok: torch.Tensor, tokenizer) -> set:
 
 
 def _expected_pc_bar_level(key: int, pos: int) -> int:
-    """Expected root pitch class at absolute beat pos under bar-level rule.
-    Chord changes once per bar: chord_root[bar] = (key + OFFSETS[(pos//BEATS_PER_BAR)%4]) % 12
+    """Expected root pitch class at absolute subbeat pos under bar-level rule.
+    Chord changes once per bar: chord_root[bar] = (key + OFFSETS[(pos//SUBBEATS_PER_BAR)%4]) % 12
     """
-    return (key + OFFSETS[(pos // BEATS_PER_BAR) % 4]) % 12
+    return (key + OFFSETS[(pos // SUBBEATS_PER_BAR) % 4]) % 12
 
 
 def _expected_chord_pcs(key: int, pos: int) -> set:
@@ -408,10 +408,10 @@ def get_args():
     p.add_argument('--model_size',    type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--adapter_rank',  type=int, default=256)
     p.add_argument('--n_skip',        type=int, default=4)
-    p.add_argument('--n_gen_beats',   type=int, default=16,
-                   help='Beats to generate per trial (default 16 = 4 bars; '
-                        'keep n_prompt_beats + n_gen_beats <= TRAIN_LENGTH=24)')
-    p.add_argument('--n_prompt_beats', type=int, default=2)
+    p.add_argument('--n_gen_beats',   type=int, default=64,
+                   help='Subbeats to generate per trial (default 64 = 4 bars at beat_div=4; '
+                        'keep n_prompt_beats + n_gen_beats <= TRAIN_LENGTH=96)')
+    p.add_argument('--n_prompt_beats', type=int, default=16)
     p.add_argument('--n_trials',      type=int, default=1)
     p.add_argument('--temperature',   type=float, default=0)
     p.add_argument('--verbose',        action='store_true')
