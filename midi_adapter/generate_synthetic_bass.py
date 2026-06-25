@@ -15,9 +15,25 @@ Example (key = D = 2):  D, G, A, D, D, G, A, D, ...
   - bar  = sequence position i
   - 12   = modulus N
 
-Base CP transformer is trained only on seen keys → learns the I-IV-V-I cycle.
-Adapter (chord-conditioned) must generalise that cycle to unseen keys —
-exactly as the RASP adapter must generalise to unseen starters.
+Two modes
+---------
+  monophonic (default):
+    Single bass instrument (program=33). One note per beat: the chord root
+    in octave 2 (C2=36..B2=47). Follows the I-IV-V-I rule exactly.
+    Simple and rule-transparent, but far from the CP transformer's polyphonic
+    training distribution.
+
+  polyphonic (--polyphonic):
+    Single piano instrument (program=0). Four voices per beat, placed in
+    octaves 2-5, all chord tones of the expected chord:
+        voice 0 (bass):    root     in oct 2  (C2=36..B2=47)
+        voice 1 (tenor):   interval 1 in oct 3  (C3=48..B3=59)
+        voice 2 (alto):    interval 2 in oct 4  (C4=60..B4=71)
+        voice 3 (soprano): interval 3 in oct 5  (C5=72..B5=83)
+    For triads (3 tones), voice 3 doubles voice 0's pitch class one octave up.
+    Notes are added ascending by pitch so voice 0 is always the bass note.
+    Use --polyphonic to match the CP transformer's actual polyphonic training
+    distribution for adapter training.
 
 Outputs
 -------
@@ -28,18 +44,23 @@ Outputs
   <out_pt>.beat_chords.pt             beat-level chord tokens (list of int16 tensors)
   <out_pt>.txt                        song index → MIDI filename mapping
 
-RASP-analogy workflow
----------------------
-  # Pretrain CP transformer on seen keys (white keys = starters {0,2,4,5,7,9,11})
+Recommended workflow
+--------------------
+  # Polyphonic adapter training (matches CP transformer distribution)
   python -m midi_adapter.generate_synthetic_bass \\
-      --n_songs 3000 --n_bars 32 \\
-      --out_dir data/bass_pretrain --out_pt data/bass_pretrain_cp4 \\
+      --n_songs 3000 --n_bars 128 --polyphonic \\
+      --out_dir data/bass_poly_pretrain --out_pt data/bass_poly_pretrain_cp4 \\
       --keys 0 2 4 5 7 9 11
 
-  # Full dataset (all 12 keys) for adapter fine-tuning
   python -m midi_adapter.generate_synthetic_bass \\
-      --n_songs 5000 --n_bars 32 \\
-      --out_dir data/bass_all --out_pt data/bass_all_cp4
+      --n_songs 5000 --n_bars 128 --polyphonic \\
+      --out_dir data/bass_poly_all --out_pt data/bass_poly_all_cp4
+
+  # Original monophonic (kept for reference/ablation)
+  python -m midi_adapter.generate_synthetic_bass \\
+      --n_songs 3000 --n_bars 128 \\
+      --out_dir data/bass_pretrain --out_pt data/bass_pretrain_cp4 \\
+      --keys 0 2 4 5 7 9 11
 """
 
 from __future__ import annotations
@@ -81,6 +102,9 @@ DURATION_BOUNDARIES = (DURATION_TEMPLATES[1:] + DURATION_TEMPLATES[:-1]) / 2.0
 # Bass range: one octave only (C2=36 … B2=47) so every pitch class maps to
 # exactly one MIDI note — no octave ambiguity during training or evaluation.
 BASS_MIN, BASS_MAX = 36, 47
+
+# Octave bases for voiced-chord voices (C of each octave)
+_VOICE_OCTAVE_BASES = [36, 48, 60, 72]   # C2, C3, C4, C5
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -125,6 +149,26 @@ def _make_note(pitch, start, duration_subbeats, velocity=70):
         start=float(start) * SECONDS_PER_SUBBEAT,
         end=float(start + duration_subbeats) * SECONDS_PER_SUBBEAT,
     )
+
+
+def _voiced_chord_pitches(root_semitone: int, quality: str) -> list[int]:
+    """MIDI pitches for a 4-voice chord spread across octaves 2-5.
+
+    Voice 0 (bass):    root               in C2 octave (36+pc)
+    Voice 1 (tenor):   intervals[1]       in C3 octave (48+pc)
+    Voice 2 (alto):    intervals[2]       in C4 octave (60+pc)
+    Voice 3 (soprano): intervals[3 or 0]  in C5 octave (72+pc)
+
+    For triads (3 tones), voice 3 doubles voice 0's pitch class an octave higher
+    so the chromagram matches the expected 3-tone chord.
+    Notes are already in ascending pitch order (bass first).
+    """
+    intervals = COMMON_CHORDS[quality]   # 3 or 4 intervals
+    pitches = []
+    for v, base in enumerate(_VOICE_OCTAVE_BASES):
+        interval = intervals[v % len(intervals)]
+        pitches.append(base + (root_semitone + interval) % 12)
+    return pitches   # [bass, tenor, alto, soprano]  ascending pitch order
 
 
 def _bar_notes(root_semitone: int, quality: str,
@@ -173,22 +217,32 @@ def generate_song(
     allowed_keys:            list[int]  | None = None,
     quality:                 str | None = None,   # None = random once per song
     bass_instrument_program: int        = 33,     # Electric Bass, finger
+    polyphonic:              bool       = False,
 ) -> tuple[pretty_midi.PrettyMIDI, list[list]]:
     """
     Generate one song following the exact RASP rule:
 
-        chord_root[bar] = (key + OFFSETS[bar % 4]) % 12
+        chord_root[beat] = (key + OFFSETS[beat % 4]) % 12
         OFFSETS = [0, 5, 7, 0]
 
-    Identical to: token[i] = (x + OFFSETS[i % 4]) % 12
+    monophonic (polyphonic=False):
+        Single bass instrument (program=bass_instrument_program).
+        One note per beat: the chord root in octave 2 (C2=36..B2=47).
 
-    Quality is fixed for the whole song. Bass pattern is random per bar.
+    polyphonic (polyphonic=True):
+        Single piano instrument (program=0). Four voices per beat:
+            voice 0 (bass):    chord root in oct 2 (36+pc)
+            voice 1 (tenor):   chord tone in oct 3 (48+pc)
+            voice 2 (alto):    chord tone in oct 4 (60+pc)
+            voice 3 (soprano): chord tone in oct 5 (72+pc)
+        All notes added ascending by pitch so voice 0 is the bass.
+        Use this mode for adapter training to match the CP transformer's
+        polyphonic training distribution.
 
     Returns
     -------
     pm        : PrettyMIDI object
-    xf_chords : [[subbeat_time_float, chord_str], ...] (compatible with
-                chord_tokenizer.chords_to_bar_tokens)
+    xf_chords : [[subbeat_time_float, chord_str], ...]
     """
     if allowed_keys is None:
         allowed_keys = list(range(12))
@@ -199,25 +253,37 @@ def generate_song(
 
     pm   = pretty_midi.PrettyMIDI(initial_tempo=CONSTANT_TEMPO)
     pm.time_signature_changes = [pretty_midi.TimeSignature(4, 4, 0.0)]
-    bass = pretty_midi.Instrument(program=bass_instrument_program, name='Bass')
+
+    if polyphonic:
+        inst = pretty_midi.Instrument(program=0, name='Piano')
+    else:
+        inst = pretty_midi.Instrument(program=bass_instrument_program, name='Bass')
 
     xf_chords: list[list] = []
-
-    beat_step = SUBBEATS_PER_BAR // BEATS_PER_BAR  # 4 subbeats per beat
+    beat_step = SUBBEATS_PER_BAR // BEATS_PER_BAR   # 1 subbeat per beat (BEAT_DIV=1)
 
     for b in range(n_bars):
         bar_start = b * SUBBEATS_PER_BAR
-        # I-IV-V-I within each bar — 4 chord entries per bar, one per beat
         for j, offset in enumerate(OFFSETS):
             beat_root  = (key + offset) % 12
             beat_start = bar_start + j * beat_step
             chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
             xf_chords.append([float(beat_start), chord_str])
-        # All bars play the same I-IV-V-I pattern rooted on key:
-        # notes are: key, key+5, key+7, key  (one quarter note each)
-        bass.notes.extend(_bar_notes(key, song_quality, bar_start, 'quarter'))
 
-    pm.instruments.append(bass)
+            if polyphonic:
+                # 4 voices: bass (oct2), tenor (oct3), alto (oct4), soprano (oct5)
+                # Added in ascending pitch order so _preprocess_pm assigns voice 0 = bass.
+                pitches = _voiced_chord_pitches(beat_root, song_quality)
+                vel_base = 70
+                for v_idx, pitch in enumerate(pitches):
+                    vel = max(40, min(100, vel_base - v_idx * 5 + random.randint(-5, 5)))
+                    inst.notes.append(_make_note(pitch, beat_start, beat_step, vel))
+            else:
+                inst.notes.append(
+                    _make_note(_bass_root(beat_root), beat_start, beat_step)
+                )
+
+    pm.instruments.append(inst)
     return pm, xf_chords
 
 
@@ -305,14 +371,19 @@ def generate_dataset(
     allowed_keys:  list[int] | None = None,
     seed:          int       = 42,
     pitch_sort:    bool      = False,
+    polyphonic:    bool      = False,
 ) -> None:
     """
-    Generate n_songs synthetic bass songs and save all output files.
+    Generate n_songs synthetic songs and save all output files.
 
     Parameters
     ----------
-    out_dir  : folder where individual .mid files are written
-    out_pt   : prefix for the dataset files (e.g. 'data/synthetic_bass_cp4')
+    out_dir    : folder where individual .mid files are written
+    out_pt     : prefix for the dataset files (e.g. 'data/synthetic_bass_cp4')
+    polyphonic : if True, generate 4-voice piano chords instead of monophonic bass;
+                 use this for adapter training to match the CP transformer distribution.
+    pitch_sort : sort voices by ascending pitch at each timestep (no-op in polyphonic
+                 mode since notes are already added ascending, but safe to enable both).
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -329,17 +400,21 @@ def generate_dataset(
         pm, xf_chords = generate_song(
             n_bars       = n_bars,
             allowed_keys = allowed_keys,
+            polyphonic   = polyphonic,
         )
 
         # Save MIDI file
-        rel_path = f'bass_{i:06d}.mid'
+        prefix = 'poly' if polyphonic else 'bass'
+        rel_path  = f'{prefix}_{i:06d}.mid'
         midi_path = os.path.join(out_dir, rel_path)
         pm.write(midi_path)
         txt_lines.append(f'{i}\t{rel_path}')
 
         # Preprocess to CP tensor (optionally sort voices by pitch ascending)
         data, shift = _preprocess_pm(pm, n_subbeats, max_polyphony)
-        if pitch_sort:
+        if pitch_sort or polyphonic:
+            # polyphonic notes are already added ascending, but pitch_sort is safe
+            # to apply as a correctness guarantee
             data = pitch_sort_cp(data)
         all_data.append(data)
         all_shift.append(shift)
@@ -383,8 +458,13 @@ def main():
     p.add_argument('--seed',          type=int,   default=42)
     p.add_argument('--pitch_sort',    action='store_true',
                    help='Sort voices at each timestep by ascending pitch so voice 0 '
-                        'always holds the lowest note (bass note). Required for '
-                        'Approach 1 (bass note regulation) with polyphonic CP data.')
+                        'always holds the lowest note. Applied automatically when '
+                        '--polyphonic is set.')
+    p.add_argument('--polyphonic',    action='store_true',
+                   help='Generate 4-voice piano chords instead of monophonic bass. '
+                        'All voices play chord tones across octaves 2-5 so the CP '
+                        'tensor matches the CP transformer\'s polyphonic training '
+                        'distribution. Strongly recommended for adapter training.')
     args = p.parse_args()
 
     print(f'Generating {args.n_songs} songs, {args.n_bars} bars each')
@@ -400,6 +480,7 @@ def main():
         allowed_keys  = args.keys,
         seed          = args.seed,
         pitch_sort    = args.pitch_sort,
+        polyphonic    = args.polyphonic,
     )
 
 
