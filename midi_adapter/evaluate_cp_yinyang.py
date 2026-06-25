@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import (
-    SUBBEATS_PER_BAR, OFFSETS, generate_song, _preprocess_pm,
+    SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS, generate_song, _preprocess_pm,
 )
 from midi_adapter.infer_cp_bass import _prompt_from_key, decode_output
 
@@ -86,9 +86,16 @@ def _extract_all_pcs(tok: torch.Tensor, tokenizer) -> set:
     return pcs
 
 
+def _expected_pc_bar_level(key: int, pos: int) -> int:
+    """Expected root pitch class at absolute beat pos under bar-level rule.
+    Chord changes once per bar: chord_root[bar] = (key + OFFSETS[(pos//BEATS_PER_BAR)%4]) % 12
+    """
+    return (key + OFFSETS[(pos // BEATS_PER_BAR) % 4]) % 12
+
+
 def _expected_chord_pcs(key: int, pos: int) -> set:
-    """Expected major-triad pitch-class set at absolute beat pos."""
-    root = _expected_pc(key, pos)
+    """Expected major-triad pitch-class set at absolute beat pos (bar-level rule)."""
+    root = _expected_pc_bar_level(key, pos)
     return {(root + i) % 12 for i in _MAJOR_INTERVALS}
 
 
@@ -142,13 +149,16 @@ def rule_following_acc(
     per_key: dict[int, float] = {}
     errors:  list[tuple[int, int | None]] = []
 
+    is_chord = (model.approach == 'chord')
     for key in keys:
         trial_accs = []
         for _ in range(n_trials):
             pcs = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
             n_correct = 0
             for pos, pc in enumerate(pcs):
-                exp = _expected_pc(key, pos + n_prompt_beats)
+                abs_pos = pos + n_prompt_beats
+                exp = (_expected_pc_bar_level(key, abs_pos)
+                       if is_chord else _expected_pc(key, abs_pos))
                 if pc == exp:
                     n_correct += 1
                 else:
@@ -172,8 +182,9 @@ def chord_coverage_acc(
     """Chord coverage accuracy: fraction of beats where ALL expected major-triad
     pitch classes are present among ALL generated voices.
 
-    Expected chord at beat t: {root, root+4, root+7} where root = (key+OFFSETS[t%4])%12.
-    A beat is covered if expected_pcs ⊆ generated_pcs (extra notes are allowed).
+    Expected chord at beat t (bar-level rule): {root, root+4, root+7} where
+    root = (key + OFFSETS[(t // BEATS_PER_BAR) % 4]) % 12.
+    A beat is covered if expected_pcs ⊆ generated_pcs (extra notes allowed).
     """
     per_key: dict[int, float] = {}
 
@@ -200,27 +211,29 @@ def chord_coverage_acc(
 def _print_qualitative(model, keys, cat_label, n_gen, device, temperature,
                        n_prompt_beats: int = 2, show_beats: int = 16) -> None:
     print(f'\n  [{cat_label}]')
+    is_chord = (model.approach == 'chord')
+    _exp = _expected_pc_bar_level if is_chord else _expected_pc
     for key in keys:
         pcs  = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
         show = min(show_beats, n_gen)
 
-        prompt_notes = [ROOT_NAMES[_expected_pc(key, i)] for i in range(n_prompt_beats)]
+        prompt_notes = [ROOT_NAMES[_exp(key, i)] for i in range(n_prompt_beats)]
         prompt_str   = ', '.join(prompt_notes)
 
         beat_row = '  '.join(f'{i+1:>4}' for i in range(show))
         exp_row  = '  '.join(
-            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats)]:>4}' for i in range(show)
+            f'{ROOT_NAMES[_exp(key, i + n_prompt_beats)]:>4}' for i in range(show)
         )
         got_row  = '  '.join(
             f'{ROOT_NAMES[pc] if pc is not None else "?":>4}' for pc in pcs[:show]
         )
         mark_row = '  '.join(
-            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats) else "✗":>4}'
+            f'{"✓" if pcs[i] == _exp(key, i + n_prompt_beats) else "✗":>4}'
             for i in range(show)
         )
         acc = sum(
             1 for i, pc in enumerate(pcs)
-            if pc == _expected_pc(key, i + n_prompt_beats)
+            if pc == _exp(key, i + n_prompt_beats)
         ) / len(pcs)
 
         print(f'    Key={ROOT_NAMES[key]:<3}  acc={acc:.3f}  (prompt=[{prompt_str}])')

@@ -237,21 +237,23 @@ class BassTracrRuleModel(nn.Module):
 
 class CPChordRuleModel(nn.Module):
     """
-    Rule model for chord-progression regulation.
+    Rule model for chord-progression regulation (bar-level I-IV-V-I).
 
-    For each timestep t, outputs the EXPECTED major-triad chromagram:
-        root  = (key + OFFSETS[t % 4]) % 12
+    One chord per bar: the I-IV-V-I cadence spans 4 bars, not 4 beats.
+
+        bar   = t // beats_per_bar
+        root  = (key + OFFSETS[bar % 4]) % 12
         chord = {root, root+4, root+7}  (major triad)
 
-    as a 12-dim binary one-hot-OR vector (1 where a chord tone lands, 0 elsewhere).
+    Outputs a 12-dim binary chromagram of the expected major triad at each beat.
 
-    Input : bass pitch class sequence  (B, T)   int64, idx[:, 0] = key
-    Output: chromagram targets          (B, T, 12) float binary
-            hidden                      (B, T, d_model=16) if return_hidden=True
+    Input : pitch-class sequence  (B, T)   int64, idx[:, 0] = key
+    Output: chromagram targets    (B, T, 12) float binary
+            hidden                (B, T, d_model=16) if return_hidden=True
 
     Hidden state format (d_model=16):
         dims  0-11 : 12-dim binary chromagram of expected major triad
-        dims 12-15 : one-hot of t % 4  (positional class)
+        dims 12-15 : one-hot of bar % 4  (bar-phase positional class)
 
     No trainable parameters.
     """
@@ -260,8 +262,9 @@ class CPChordRuleModel(nn.Module):
     d_model:         int   = N_ROOTS + N_POS   # 16
     TRACR_D_MODEL:   int   = N_ROOTS + N_POS   # 16
 
-    def __init__(self):
+    def __init__(self, beats_per_bar: int = 4):
         super().__init__()
+        self.beats_per_bar = beats_per_bar
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
         W_pos = torch.zeros(N_POS, self.d_model)
         for i in range(N_POS):
@@ -269,6 +272,10 @@ class CPChordRuleModel(nn.Module):
         self.register_buffer('W_pos', W_pos)
 
     # ------------------------------------------------------------------
+
+    def _bar_phase(self, t_idx: torch.Tensor) -> torch.Tensor:
+        """Bar-phase index: which slot in OFFSETS does beat t belong to."""
+        return (t_idx // self.beats_per_bar) % N_POS
 
     def _root_to_chromagram(self, root: torch.Tensor) -> torch.Tensor:
         """root: (B, T)  →  chromagram: (B, T, 12) binary float."""
@@ -290,15 +297,16 @@ class CPChordRuleModel(nn.Module):
         device = idx.device
         t_idx  = torch.arange(T, device=device)
 
-        key      = idx[:, 0]                                         # (B,)
-        o_cur    = self._offsets[t_idx % N_POS]                      # (T,)
-        cur_root = (key[:, None] + o_cur[None, :]) % N_ROOTS        # (B, T)
-        chroma   = self._root_to_chromagram(cur_root)                # (B, T, 12)
+        key      = idx[:, 0]                                          # (B,)
+        phase    = self._bar_phase(t_idx)                             # (T,)
+        o_cur    = self._offsets[phase]                               # (T,)
+        cur_root = (key[:, None] + o_cur[None, :]) % N_ROOTS         # (B, T)
+        chroma   = self._root_to_chromagram(cur_root)                 # (B, T, 12)
 
         if return_hidden:
             h = torch.zeros(B, T, self.d_model, device=device)
             h[:, :, :N_ROOTS] = chroma
-            pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()  # (T, 4)
+            pos_oh = F.one_hot(phase, num_classes=N_POS).float()      # (T, 4)
             h[:, :, N_ROOTS:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
             return chroma, h
         return chroma
@@ -314,18 +322,19 @@ class CPChordRuleModel(nn.Module):
         """Build rule_hidden analytically without any sequence input.
 
         Returns (B, T, d_model=16):
-            dims  0-11 : binary chromagram of major triad at (key+OFFSETS[t%4])%12
-            dims 12-15 : one-hot of t % 4
+            dims  0-11 : binary chromagram of major triad at bar-phase
+            dims 12-15 : one-hot of bar % 4
         """
-        B      = pc_0.shape[0]
-        t_idx  = torch.arange(T, device=device)
-        o_cur  = self._offsets.to(device)[t_idx % N_POS]            # (T,)
+        B        = pc_0.shape[0]
+        t_idx    = torch.arange(T, device=device)
+        phase    = self._bar_phase(t_idx)                             # (T,)
+        o_cur    = self._offsets.to(device)[phase]                    # (T,)
         cur_root = (pc_0[:, None].to(device) + o_cur[None, :]) % N_ROOTS  # (B, T)
-        chroma   = self._root_to_chromagram(cur_root)                # (B, T, 12)
+        chroma   = self._root_to_chromagram(cur_root)                 # (B, T, 12)
 
         h = torch.zeros(B, T, self.d_model, device=device)
         h[:, :, :N_ROOTS] = chroma
-        pos_oh = F.one_hot(t_idx % N_POS, num_classes=N_POS).float()
+        pos_oh = F.one_hot(phase, num_classes=N_POS).float()
         h[:, :, N_ROOTS:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
         return h
 

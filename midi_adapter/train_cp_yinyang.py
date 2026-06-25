@@ -148,15 +148,20 @@ class UnseenAccuracyCallback(L.Callback):
 
     For each batch: preprocess the first n_prompt_beats as a prompt, generate
     the next n_gen_beats autoregressively (greedy), then check whether the
-    pitch class of each generated beat matches (key + OFFSETS[t%4]) % 12.
+    pitch class of each generated beat matches the expected root.
+
+    beats_per_bar=1 : beat-level rule  expected_root[t] = (key + OFFSETS[t%4]) % 12
+    beats_per_bar=4 : bar-level  rule  expected_root[t] = (key + OFFSETS[(t//4)%4]) % 12
     """
 
     def __init__(self, dataloader: DataLoader, n_batches: int = 5,
-                 n_prompt_beats: int = 4, n_gen_beats: int = 16):
+                 n_prompt_beats: int = 4, n_gen_beats: int = 16,
+                 beats_per_bar: int = 1):
         self.dataloader     = dataloader
         self.n_batches      = n_batches
         self.n_prompt_beats = n_prompt_beats
         self.n_gen_beats    = n_gen_beats
+        self.beats_per_bar  = beats_per_bar
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -194,9 +199,10 @@ class UnseenAccuracyCallback(L.Callback):
                 # sampled[t] is (B, subseq_len) preprocessed token for beat t.
                 # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
                 for t in range(self.n_prompt_beats, total_beats):
-                    y_t         = sampled[t]                   # (B, subseq)
-                    pred_pc     = (y_t[:, 1] % 128) % 12      # (B,)
-                    expected_pc = (key + OFFSETS[t % 4]) % 12 # (B,)
+                    y_t         = sampled[t]                                               # (B, subseq)
+                    pred_pc     = (y_t[:, 1] % 128) % 12                                  # (B,)
+                    phase       = (t // self.beats_per_bar) % 4
+                    expected_pc = (key + OFFSETS[phase]) % 12                             # (B,)
                     correct    += (pred_pc == expected_pc).sum().item()
                     total      += len(pred_pc)
 
@@ -356,8 +362,10 @@ def main(args):
         unseen_ds.preload(_cache)
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)
-        unseen_acc_cb = UnseenAccuracyCallback(unseen_loader, n_batches=5,
-                                                n_prompt_beats=4, n_gen_beats=16)
+        unseen_acc_cb = UnseenAccuracyCallback(
+            unseen_loader, n_batches=5, n_prompt_beats=4, n_gen_beats=16,
+            beats_per_bar=4 if args.approach == 'chord' else 1,
+        )
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)

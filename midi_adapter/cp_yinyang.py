@@ -295,7 +295,7 @@ class CPYinyangTransformer(nn.Module):
 
         # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
         if approach == 'chord':
-            self.rule_model = CPChordRuleModel()
+            self.rule_model = CPChordRuleModel(beats_per_bar=4)
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
 

@@ -264,21 +264,29 @@ def generate_song(
 
     for b in range(n_bars):
         bar_start = b * SUBBEATS_PER_BAR
-        for j, offset in enumerate(OFFSETS):
-            beat_root  = (key + offset) % 12
-            beat_start = bar_start + j * beat_step
-            chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
-            xf_chords.append([float(beat_start), chord_str])
 
-            if polyphonic:
+        if polyphonic:
+            # Bar-level: one chord per bar.  I-IV-V-I cycle spans 4 bars.
+            # chord_root[bar] = (key + OFFSETS[bar % 4]) % 12
+            bar_root = (key + OFFSETS[b % 4]) % 12
+            for j in range(BEATS_PER_BAR):
+                beat_start = bar_start + j * beat_step
+                chord_str  = f'{ROOT_NAMES[bar_root]}:{song_quality}'
+                xf_chords.append([float(beat_start), chord_str])
                 # 4 voices: bass (oct2), tenor (oct3), alto (oct4), soprano (oct5)
-                # Added in ascending pitch order so _preprocess_pm assigns voice 0 = bass.
-                pitches = _voiced_chord_pitches(beat_root, song_quality)
-                vel_base = 70
+                # Added in ascending pitch order so voice 0 is always the bass.
+                pitches = _voiced_chord_pitches(bar_root, song_quality)
                 for v_idx, pitch in enumerate(pitches):
-                    vel = max(40, min(100, vel_base - v_idx * 5 + random.randint(-5, 5)))
+                    vel = max(40, min(100, 70 - v_idx * 5 + random.randint(-5, 5)))
                     inst.notes.append(_make_note(pitch, beat_start, beat_step, vel))
-            else:
+        else:
+            # Beat-level: I-IV-V-I pattern cycles within each bar.
+            # chord_root[beat] = (key + OFFSETS[beat % 4]) % 12
+            for j, offset in enumerate(OFFSETS):
+                beat_root  = (key + offset) % 12
+                beat_start = bar_start + j * beat_step
+                chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
+                xf_chords.append([float(beat_start), chord_str])
                 inst.notes.append(
                     _make_note(_bass_root(beat_root), beat_start, beat_step)
                 )
