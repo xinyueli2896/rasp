@@ -29,7 +29,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
-from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
+from midi_adapter.generate_synthetic_bass import (
+    SUBBEATS_PER_BAR, OFFSETS, generate_song, _preprocess_pm,
+)
 from midi_adapter.infer_cp_bass import _prompt_from_key, decode_output
 
 # Re-use shared helpers from evaluate_cp_bass
@@ -41,25 +43,85 @@ from midi_adapter.evaluate_cp_bass import (
     _print_summary_table, _print_per_key, _print_error_dist,
 )
 
+# Major triad intervals — must match CPChordRuleModel.CHORD_INTERVALS
+_MAJOR_INTERVALS = (0, 4, 7)
+
+
+# ---------------------------------------------------------------------------
+# Polyphonic prompt helper  (chord approach needs a multi-voice seed)
+# ---------------------------------------------------------------------------
+
+def _poly_prompt_from_key(
+    key: int, device: torch.device,
+    base: RoFormerSymbolicTransformer,
+    n_prompt_beats: int = 2,
+) -> torch.Tensor:
+    """Build a polyphonic 4-voice piano prompt in the given key."""
+    n_bars = max(1, -(-n_prompt_beats // SUBBEATS_PER_BAR))
+    pm, _ = generate_song(n_bars=n_bars, key=key, polyphonic=True, quality='maj')
+    data, _ = _preprocess_pm(pm, n_prompt_beats)
+    data = data.unsqueeze(0).to(device)
+    pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
+    return base.preprocess(data, pitch_shift)   # (1, n_prompt_beats, 8)
+
+
+# ---------------------------------------------------------------------------
+# Chord coverage helpers
+# ---------------------------------------------------------------------------
+
+def _extract_all_pcs(tok: torch.Tensor, tokenizer) -> set:
+    """Extract pitch-class set from ALL voices of one subbeat tensor (1, subseq_len)."""
+    S    = tok.shape[1]
+    pcs  = set()
+    pad  = tokenizer.pad_token
+    eos  = tokenizer.eos_token
+    for v in range(S // 2):
+        prog     = int(tok[0, 2 * v])
+        if prog == pad or prog == eos:
+            break
+        pitch_dur = int(tok[0, 2 * v + 1])
+        if pitch_dur == pad or pitch_dur == eos or pitch_dur < 128:
+            continue
+        pcs.add((pitch_dur % 128) % 12)
+    return pcs
+
+
+def _expected_chord_pcs(key: int, pos: int) -> set:
+    """Expected major-triad pitch-class set at absolute beat pos."""
+    root = _expected_pc(key, pos)
+    return {(root + i) % 12 for i in _MAJOR_INTERVALS}
+
 
 # ---------------------------------------------------------------------------
 # Core generation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _gen_beats(
+    model: CPYinyangTransformer,
+    key: int, n_gen: int,
+    device: torch.device, temperature: float,
+    n_prompt_beats: int = 2,
+) -> list:
+    """Generate n_gen beats; returns list of (1, subseq_len) tensors."""
+    if model.approach == 'chord':
+        prompt = _poly_prompt_from_key(key, device, model.base, n_prompt_beats)
+    else:
+        prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                                  base=model.base, n_prompt_beats=n_prompt_beats)
+    total   = n_prompt_beats + n_gen
+    sampled = model.global_sampling(prompt, max_seq_len=total, temperature=temperature)
+    return sampled[n_prompt_beats:]
+
+
+@torch.no_grad()
 def _gen_pcs(model: CPYinyangTransformer,
              key: int, n_gen: int,
              device: torch.device, temperature: float,
              n_prompt_beats: int = 2) -> list[int | None]:
-    """Generate n_gen beats with rule conditioning and return pitch classes."""
-    prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                              base=model.base, n_prompt_beats=n_prompt_beats)
-
-    total = n_prompt_beats + n_gen
-    sampled = model.global_sampling(
-        prompt, max_seq_len=total, temperature=temperature,
-    )
-    return [_extract_pc(t, model.base.tokenizer) for t in sampled[n_prompt_beats:]]
+    """Generate n_gen beats and return voice-0 pitch classes (bass note)."""
+    beats = _gen_beats(model, key, n_gen, device, temperature, n_prompt_beats)
+    return [_extract_pc(t, model.base.tokenizer) for t in beats]
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +138,7 @@ def rule_following_acc(
     temperature: float,
     n_prompt_beats: int = 2,
 ) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
+    """Bass-note accuracy: voice-0 pitch class == expected root."""
     per_key: dict[int, float] = {}
     errors:  list[tuple[int, int | None]] = []
 
@@ -94,6 +157,40 @@ def rule_following_acc(
         per_key[key] = float(np.mean(trial_accs))
 
     return per_key, errors
+
+
+@torch.no_grad()
+def chord_coverage_acc(
+    model: CPYinyangTransformer,
+    keys: list[int],
+    n_gen: int,
+    n_trials: int,
+    device: torch.device,
+    temperature: float,
+    n_prompt_beats: int = 2,
+) -> dict[int, float]:
+    """Chord coverage accuracy: fraction of beats where ALL expected major-triad
+    pitch classes are present among ALL generated voices.
+
+    Expected chord at beat t: {root, root+4, root+7} where root = (key+OFFSETS[t%4])%12.
+    A beat is covered if expected_pcs ⊆ generated_pcs (extra notes are allowed).
+    """
+    per_key: dict[int, float] = {}
+
+    for key in keys:
+        trial_accs = []
+        for _ in range(n_trials):
+            beats = _gen_beats(model, key, n_gen, device, temperature, n_prompt_beats)
+            n_covered = 0
+            for pos, beat in enumerate(beats):
+                gen_pcs  = _extract_all_pcs(beat, model.base.tokenizer)
+                exp_pcs  = _expected_chord_pcs(key, pos + n_prompt_beats)
+                if exp_pcs.issubset(gen_pcs):
+                    n_covered += 1
+            trial_accs.append(n_covered / len(beats))
+        per_key[key] = float(np.mean(trial_accs))
+
+    return per_key
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +239,11 @@ def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_d
     os.makedirs(out_dir, exist_ok=True)
     all_keys = list(range(12))
     for key in all_keys:
-        prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                                   base=model.base, n_prompt_beats=n_prompt_beats)
+        if model.approach == 'chord':
+            prompt = _poly_prompt_from_key(key, device, model.base, n_prompt_beats)
+        else:
+            prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
+                                      base=model.base, n_prompt_beats=n_prompt_beats)
         total   = n_prompt_beats + n_gen
         sampled = model.global_sampling(prompt, max_seq_len=total, temperature=temperature)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
@@ -230,9 +330,11 @@ def run_evaluation(args) -> None:
                        args.bidirectional, args.encoder_injected,
                        args.encoder_type, args.rule_mode, args.approach, device)
 
+    is_chord = (args.approach == 'chord')
+
+    # --- Bass-note accuracy (voice 0 == expected root) ---
     rows       = []
     all_errors = []
-
     for cat, keys, keys_str in CATEGORIES:
         per_key, errors = rule_following_acc(
             model, keys, args.n_gen_beats, args.n_trials,
@@ -243,10 +345,26 @@ def run_evaluation(args) -> None:
         rows.append((cat, per_key, keys_str,
                      float(np.mean(vals)), float(np.std(vals))))
 
+    print('\n── Bass-note accuracy (voice 0 == expected root) ──')
     _print_summary_table(rows, args.n_trials, n_prompt_beats=args.n_prompt_beats)
-
     if args.verbose:
         _print_per_key(rows)
+
+    # --- Chord coverage accuracy (all triad tones present across all voices) ---
+    if is_chord:
+        print('\n── Chord coverage accuracy (all {root,root+4,root+7} present) ──')
+        cov_rows = []
+        for cat, keys, keys_str in CATEGORIES:
+            per_key = chord_coverage_acc(
+                model, keys, args.n_gen_beats, args.n_trials,
+                device, args.temperature, args.n_prompt_beats,
+            )
+            vals = list(per_key.values())
+            cov_rows.append((cat, per_key, keys_str,
+                             float(np.mean(vals)), float(np.std(vals))))
+        _print_summary_table(cov_rows, args.n_trials, n_prompt_beats=args.n_prompt_beats)
+        if args.verbose:
+            _print_per_key(cov_rows)
 
     print()
     print(f'Qualitative generation examples  ({args.n_prompt_beats}-beat prompt, first 16 beats shown)')

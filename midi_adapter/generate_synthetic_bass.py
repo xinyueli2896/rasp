@@ -372,6 +372,7 @@ def generate_dataset(
     seed:          int       = 42,
     pitch_sort:    bool      = False,
     polyphonic:    bool      = False,
+    quality:       str | None = None,
 ) -> None:
     """
     Generate n_songs synthetic songs and save all output files.
@@ -401,6 +402,7 @@ def generate_dataset(
             n_bars       = n_bars,
             allowed_keys = allowed_keys,
             polyphonic   = polyphonic,
+            quality      = quality,
         )
 
         # Save MIDI file
@@ -465,6 +467,11 @@ def main():
                         'All voices play chord tones across octaves 2-5 so the CP '
                         'tensor matches the CP transformer\'s polyphonic training '
                         'distribution. Strongly recommended for adapter training.')
+    p.add_argument('--quality', type=str, default=None,
+                   choices=list(COMMON_CHORDS.keys()),
+                   help='Fix chord quality for all songs (default: random per song). '
+                        'Use "maj" for the chord approach to stay consistent with '
+                        'CPChordRuleModel which uses major triad intervals (0,4,7).')
     args = p.parse_args()
 
     print(f'Generating {args.n_songs} songs, {args.n_bars} bars each')
@@ -481,6 +488,7 @@ def main():
         seed          = args.seed,
         pitch_sort    = args.pitch_sort,
         polyphonic    = args.polyphonic,
+        quality       = args.quality,
     )
 
 
