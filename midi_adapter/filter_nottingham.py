@@ -275,13 +275,7 @@ def cmd_extract(args):
 
     torch.save(torch.cat(all_data, dim=0),                f'{args.out_pt}.pt')
     torch.save(torch.tensor([n_subbeats_window] * n_saved), f'{args.out_pt}.length.pt')
-    # Allow the dataloader to transpose by ±5 semitones; the I-IV-V-I rule
-    # transposes with the input (key is read from pitch-class slot 0), so the
-    # rule still holds and we get uniform coverage across all 12 keys.
-    psr = torch.zeros(n_saved, 2, dtype=torch.int8)
-    psr[:, 0] = -5
-    psr[:, 1] =  6
-    torch.save(psr,                                        f'{args.out_pt}.pitch_shift_range.pt')
+    torch.save(torch.zeros(n_saved, 2, dtype=torch.int8), f'{args.out_pt}.pitch_shift_range.pt')
     torch.save(all_chords,                                 f'{args.out_pt}.beat_chords.pt')
     with open(f'{args.out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
