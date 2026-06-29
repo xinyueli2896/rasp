@@ -39,6 +39,7 @@ from preprocess_large_midi_dataset import preprocess_midi   # uses xf_midi, beat
 from midi_adapter.generate_synthetic_bass import (
     pitch_sort_cp,
     BEAT_DIV, SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS,
+    DURATION_TEMPLATES,
 )
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -119,40 +120,52 @@ def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4,
 
 
 # ---------------------------------------------------------------------------
-# MIDI snippet writer — slice the original (variable-tempo) PrettyMIDI so the
-# saved example sounds at the file's natural tempo (not the constant-tempo
-# UglyMIDI version used for chord detection).
+# MIDI snippet writer — render directly from the quantized CP tensor at a
+# normal 120 BPM. This matches what the model actually trains on (notes snap
+# to 16th-note subbeats; one bar = 2 seconds = 16 subbeats * 0.125 s), instead
+# of the original variable-tempo timing that may have pickups / wobble.
 # ---------------------------------------------------------------------------
 
-def _save_midi_example(midi_path: str, start_bar: int, n_bars: int,
-                      out_path: str) -> bool:
-    """Slice bars [start_bar, start_bar + n_bars) from the original MIDI and
-    write to out_path. Returns True if a non-empty snippet was written."""
-    pm         = pretty_midi.PrettyMIDI(midi_path)
-    beat_times = pm.get_beats()
-    start_beat = start_bar * BEATS_PER_BAR
-    end_beat   = start_beat + n_bars * BEATS_PER_BAR
-    if end_beat > len(beat_times):
+def _save_midi_example(cp_data: np.ndarray, start_bar: int, n_bars: int,
+                      max_polyphony: int, out_path: str,
+                      tempo: float = 120.0) -> bool:
+    """Render bars [start_bar, start_bar + n_bars) of `cp_data` as a quantized
+    MIDI snippet at the given tempo. Returns True iff at least one note was
+    written."""
+    start_sb   = start_bar * SUBBEATS_PER_BAR
+    n_subbeats = n_bars * SUBBEATS_PER_BAR
+    if start_sb + n_subbeats > cp_data.shape[0]:
         return False
-    t0 = beat_times[start_beat]
-    t1 = beat_times[end_beat] if end_beat < len(beat_times) else pm.get_end_time()
+    seconds_per_subbeat = 60.0 / tempo / BEAT_DIV
 
-    out_pm = pretty_midi.PrettyMIDI(initial_tempo=120.0)
-    for inst in pm.instruments:
-        new_inst = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum)
-        for note in inst.notes:
-            if note.start < t0 or note.start >= t1:
+    out_pm    = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    inst_map: dict[int, pretty_midi.Instrument] = {}
+    any_note  = False
+
+    for local_sb in range(n_subbeats):
+        sb = start_sb + local_sb
+        start = local_sb * seconds_per_subbeat
+        for v in range(max_polyphony):
+            prog    = int(cp_data[sb, v * 4 + 0])
+            pitch   = int(cp_data[sb, v * 4 + 1])
+            dur_idx = int(cp_data[sb, v * 4 + 2])
+            vel     = int(cp_data[sb, v * 4 + 3])
+            if prog == 254 or prog == 255:   # EOS / pad: no further voices this subbeat
+                break
+            if pitch == 255 or dur_idx >= len(DURATION_TEMPLATES):
                 continue
-            new_inst.notes.append(pretty_midi.Note(
-                velocity = note.velocity,
-                pitch    = note.pitch,
-                start    = note.start - t0,
-                end      = min(note.end, t1) - t0,
-            ))
-        if new_inst.notes:
-            out_pm.instruments.append(new_inst)
+            end = (local_sb + int(DURATION_TEMPLATES[dur_idx])) * seconds_per_subbeat
+            is_drum = (prog == 127)
+            key = prog
+            if key not in inst_map:
+                inst_map[key] = pretty_midi.Instrument(
+                    program=0 if is_drum else prog, is_drum=is_drum)
+                out_pm.instruments.append(inst_map[key])
+            inst_map[key].notes.append(pretty_midi.Note(
+                velocity=vel if vel > 0 else 80, pitch=pitch, start=start, end=end))
+            any_note = True
 
-    if not out_pm.instruments:
+    if not any_note:
         return False
     out_pm.write(out_path)
     return True
@@ -221,7 +234,8 @@ def cmd_filter(args):
                     f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
                 )
                 try:
-                    if _save_midi_example(midi_path, w['start_bar'], args.n_bars, out):
+                    if _save_midi_example(cp_data, w['start_bar'], args.n_bars,
+                                          args.max_polyphony, out):
                         examples_per_key[w['key']] += 1
                 except Exception as e:
                     print(f'  example-save failed for {midi_path}: {e}')
