@@ -1,24 +1,28 @@
 """
 Two-step pipeline for extracting I-IV-V-I windows from a MIDI corpus.
 
-Uses `preprocess_midi` from preprocess_large_midi_dataset.py (which uses
-`xf_midi.XFMidi` with constant_tempo=60/beat_div) so the resulting CP tensor
-matches the LA-pretrained CP transformer exactly. Chord detection is done
-directly on the loaded CP tensor (no second pass over the raw MIDI).
+Uses a downbeat-aligned loader (`_load_midi_aligned`) that:
+  * starts bar 0 at the first musical downbeat (handles pickup beats)
+  * builds a per-MIDI subbeat grid by interpolating BEAT_DIV positions inside
+    each pm.get_beats() interval (handles tempo changes)
+  * quantizes every note onset/offset to that grid
 
-Step 1 — filter (loads MIDIs via xf_midi, finds I-IV-V-I windows):
+This replaces the earlier `preprocess_large_midi_dataset.preprocess_midi`
+path, which used UglyMIDI/xf_midi with constant_tempo rescaling but did NOT
+align to musical downbeats — pickups bled into "bar 0" and shifted every
+4-bar window's chord detection.
+
+Step 1 — filter (loads MIDIs, finds I-IV-V-I windows):
   python -m midi_adapter.filter_nottingham filter \\
       --input_dir data/nottingham/MIDI \\
       --manifest  data/nottingham_ivvi_manifest.json
 
-Step 2 — extract (slices the cached CP tensors per window):
+Step 2 — extract (slices cached CP tensors per window, optionally transposes
+to a target-key set):
   python -m midi_adapter.filter_nottingham extract \\
       --manifest  data/nottingham_ivvi_manifest.json \\
       --out_dir   data/nottingham_ivvi_midi \\
       --out_pt    data/nottingham_ivvi_cp4
-
-Requires `preprocess_large_midi_dataset.py` and `xf_midi.py` on PYTHONPATH
-(copy them from the midi_yinyang repo into the project root).
 """
 
 from __future__ import annotations
@@ -34,15 +38,82 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from preprocess_large_midi_dataset import preprocess_midi   # uses xf_midi, beat_div=4
-
 from midi_adapter.generate_synthetic_bass import (
     pitch_sort_cp,
     BEAT_DIV, SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS,
-    DURATION_TEMPLATES,
+    DURATION_TEMPLATES, DURATION_BOUNDARIES,
 )
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+
+# ---------------------------------------------------------------------------
+# Downbeat-aligned loader.
+#
+# Why not preprocess_large_midi_dataset.preprocess_midi?
+#   That uses UglyMIDI(constant_tempo=...) which rescales the time axis but
+#   does NOT align to the first musical downbeat. If a Nottingham tune has a
+#   pickup, "bar 0" in the resulting CP tensor straddles the pickup and the
+#   start of musical bar 1 — chord detection then mixes pickup notes into the
+#   I chord and the 4-bar windows are off by some number of subbeats.
+#
+# This loader:
+#   1. Uses pm.get_downbeats() to find the first musical downbeat
+#   2. Uses pm.get_beats() with linear interpolation inside each beat to build
+#      a per-MIDI subbeat grid that respects the file's actual tempo changes
+#   3. Quantizes every note onset/offset to that grid and writes a CP tensor
+# ---------------------------------------------------------------------------
+
+def _load_midi_aligned(midi_path: str, max_polyphony: int = 4) -> np.ndarray | None:
+    """Load a MIDI, align bar 0 to the first downbeat, quantize to 16th-note
+    subbeats (using the file's own tempo curve), and return a CP tensor."""
+    pm = pretty_midi.PrettyMIDI(midi_path)
+    beats     = pm.get_beats()
+    downbeats = pm.get_downbeats()
+    if len(beats) < 2 or len(downbeats) == 0:
+        return None
+
+    t_start_db = downbeats[0]
+    # First beat at or after the first downbeat (anchors bar 0 on the downbeat).
+    start_beat_idx = int(np.searchsorted(beats, t_start_db - 1e-9, side='left'))
+    if start_beat_idx >= len(beats) - 1:
+        return None
+
+    # Build subbeat times by interpolating BEAT_DIV positions inside each beat.
+    subbeat_times: list[float] = []
+    for i in range(start_beat_idx, len(beats) - 1):
+        dt = (beats[i + 1] - beats[i]) / BEAT_DIV
+        for j in range(BEAT_DIV):
+            subbeat_times.append(beats[i] + j * dt)
+    subbeat_times.append(float(beats[-1]))
+    subbeat_times_arr = np.asarray(subbeat_times)
+    n_subbeats = len(subbeat_times_arr)
+    if n_subbeats < SUBBEATS_PER_BAR:
+        return None
+
+    rolls  = np.full((n_subbeats, max_polyphony, 4), 255, dtype=np.uint8)
+    counts = np.zeros(n_subbeats, dtype=np.uint8)
+
+    t_end = subbeat_times_arr[-1]
+    for inst in pm.instruments:
+        prog = 127 if inst.is_drum else inst.program
+        for note in inst.notes:
+            if note.start < t_start_db or note.start >= t_end:
+                continue
+            s = int(np.searchsorted(subbeat_times_arr, note.start, side='right')) - 1
+            e = int(np.searchsorted(subbeat_times_arr, note.end,   side='right')) - 1
+            if s < 0 or s >= n_subbeats or counts[s] >= max_polyphony:
+                continue
+            dur_idx = int(np.searchsorted(DURATION_BOUNDARIES, max(0, e - s)))
+            rolls[s, counts[s]] = [prog, note.pitch, dur_idx, note.velocity]
+            counts[s] += 1
+
+    for i in range(n_subbeats):
+        if counts[i] < max_polyphony:
+            rolls[i, counts[i], 0] = 254   # EOS
+
+    data = torch.tensor(rolls.reshape(n_subbeats, max_polyphony * 4), dtype=torch.uint8)
+    return pitch_sort_cp(data).numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -195,25 +266,16 @@ def cmd_filter(args):
 
     for midi_path in files:
         try:
-            result = preprocess_midi(
-                midi_path,
-                max_polyphony = args.max_polyphony,
-                beat_div      = BEAT_DIV,
-                ins_ids       = 'all',
-                filter        = False,   # Nottingham is well-quantized; skip LA heuristic
-                dedup         = False,
-            )
+            cp_data = _load_midi_aligned(midi_path, max_polyphony=args.max_polyphony)
         except Exception as e:
             n_skipped += 1
             print(f'  SKIP {os.path.basename(midi_path)}: {e}')
             continue
 
-        if result is None:
+        if cp_data is None:
             n_skipped += 1
             continue
 
-        cp_tensor, _ = result
-        cp_data = cp_tensor.numpy()
         bar_roots = _extract_bar_roots_from_cp(cp_data)
         windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
                                        phase_zero_only=not args.all_phases)
@@ -326,22 +388,15 @@ def cmd_extract(args):
         midi_path = entry['midi_path']
         if midi_path not in cp_cache:
             try:
-                result = preprocess_midi(
-                    midi_path,
-                    max_polyphony = args.max_polyphony,
-                    beat_div      = BEAT_DIV,
-                    ins_ids       = 'all',
-                    filter        = False,
-                    dedup         = False,
-                )
+                cp_arr = _load_midi_aligned(midi_path, max_polyphony=args.max_polyphony)
             except Exception as e:
                 print(f'  SKIP {midi_path}: {e}')
                 cp_cache[midi_path] = None
                 continue
-            if result is None:
+            if cp_arr is None:
                 cp_cache[midi_path] = None
                 continue
-            cp_cache[midi_path] = result[0].numpy()
+            cp_cache[midi_path] = cp_arr
             cache_order.append(midi_path)
             # Bound cache size
             if len(cache_order) > 200:
