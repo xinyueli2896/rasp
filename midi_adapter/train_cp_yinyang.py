@@ -264,11 +264,15 @@ class CPYinyangLightning(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        # Adapter-finetune defaults (differ from upstream pretraining):
+        # - weight_decay=1e-4: light regularization on the small trainable set
+        # - pct_start=0.02: longer warmup helps when the only trainable modules
+        #   are randomly initialized adapters bolted onto a fixed base
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr)
+        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=self.max_lr,
-            total_steps=self.max_steps, pct_start=0.005,
+            total_steps=self.max_steps, pct_start=0.02,
         )
         return [optimizer], [scheduler]
 
@@ -406,8 +410,8 @@ def main(args):
     if unseen_acc_cb is not None:
         callbacks.append(unseen_acc_cb)
 
-    # Upstream clips at 1.0 only for size >= 2; smaller sizes train uncliped.
-    gradient_clip_val = 1.0 if args.model_size >= 2 else None
+    # Always clip at 1.0 for adapter finetuning — random-init adapters bolted
+    # onto a frozen base can spike, so the clip guards stability even at size 1.
     trainer = L.Trainer(
         devices            = -1 if use_gpu else 1,
         accelerator        = 'gpu' if use_gpu else 'cpu',
@@ -417,7 +421,7 @@ def main(args):
         val_check_interval = args.val_check_interval,
         limit_val_batches  = 25,
         check_val_every_n_epoch = None,
-        gradient_clip_val  = gradient_clip_val,
+        gradient_clip_val  = 1.0,
         logger             = loggers,
         num_sanity_val_steps = 2,
         strategy           = strategy,
