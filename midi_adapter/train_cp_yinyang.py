@@ -265,10 +265,10 @@ class CPYinyangLightning(L.LightningModule):
 
     def configure_optimizers(self):
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=self.max_lr,
-            total_steps=self.max_steps, pct_start=0.02,
+            total_steps=self.max_steps, pct_start=0.005,
         )
         return [optimizer], [scheduler]
 
@@ -406,6 +406,8 @@ def main(args):
     if unseen_acc_cb is not None:
         callbacks.append(unseen_acc_cb)
 
+    # Upstream clips at 1.0 only for size >= 2; smaller sizes train uncliped.
+    gradient_clip_val = 1.0 if args.model_size >= 2 else None
     trainer = L.Trainer(
         devices            = -1 if use_gpu else 1,
         accelerator        = 'gpu' if use_gpu else 'cpu',
@@ -415,7 +417,7 @@ def main(args):
         val_check_interval = args.val_check_interval,
         limit_val_batches  = 25,
         check_val_every_n_epoch = None,
-        gradient_clip_val  = 1.0,
+        gradient_clip_val  = gradient_clip_val,
         logger             = loggers,
         num_sanity_val_steps = 2,
         strategy           = strategy,

@@ -118,6 +118,46 @@ def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4,
 
 
 # ---------------------------------------------------------------------------
+# MIDI snippet writer — slice the original (variable-tempo) PrettyMIDI so the
+# saved example sounds at the file's natural tempo (not the constant-tempo
+# UglyMIDI version used for chord detection).
+# ---------------------------------------------------------------------------
+
+def _save_midi_example(midi_path: str, start_bar: int, n_bars: int,
+                      out_path: str) -> bool:
+    """Slice bars [start_bar, start_bar + n_bars) from the original MIDI and
+    write to out_path. Returns True if a non-empty snippet was written."""
+    pm         = pretty_midi.PrettyMIDI(midi_path)
+    beat_times = pm.get_beats()
+    start_beat = start_bar * BEATS_PER_BAR
+    end_beat   = start_beat + n_bars * BEATS_PER_BAR
+    if end_beat > len(beat_times):
+        return False
+    t0 = beat_times[start_beat]
+    t1 = beat_times[end_beat] if end_beat < len(beat_times) else pm.get_end_time()
+
+    out_pm = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+    for inst in pm.instruments:
+        new_inst = pretty_midi.Instrument(program=inst.program, is_drum=inst.is_drum)
+        for note in inst.notes:
+            if note.start < t0 or note.start >= t1:
+                continue
+            new_inst.notes.append(pretty_midi.Note(
+                velocity = note.velocity,
+                pitch    = note.pitch,
+                start    = note.start - t0,
+                end      = min(note.end, t1) - t0,
+            ))
+        if new_inst.notes:
+            out_pm.instruments.append(new_inst)
+
+    if not out_pm.instruments:
+        return False
+    out_pm.write(out_path)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Filter
 # ---------------------------------------------------------------------------
 
@@ -133,6 +173,11 @@ def cmd_filter(args):
     manifest  = []
     n_windows = 0
     n_skipped = 0
+
+    from collections import Counter
+    examples_per_key = Counter()
+    if args.save_examples_dir:
+        os.makedirs(args.save_examples_dir, exist_ok=True)
 
     for midi_path in files:
         try:
@@ -168,6 +213,17 @@ def cmd_filter(args):
                 'n_bars':     args.n_bars,
                 'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + args.n_bars],
             })
+            if args.save_examples_dir and examples_per_key[w['key']] < args.examples_per_key:
+                stem = os.path.splitext(os.path.basename(midi_path))[0]
+                out  = os.path.join(
+                    args.save_examples_dir,
+                    f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
+                )
+                try:
+                    if _save_midi_example(midi_path, w['start_bar'], args.n_bars, out):
+                        examples_per_key[w['key']] += 1
+                except Exception as e:
+                    print(f'  example-save failed for {midi_path}: {e}')
         n_windows += len(windows)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.manifest)), exist_ok=True)
@@ -177,6 +233,9 @@ def cmd_filter(args):
     print(f'\nFound {n_windows} windows across {len(files) - n_skipped} files '
           f'({n_skipped} skipped).')
     print(f'Manifest saved → {args.manifest}')
+    if args.save_examples_dir:
+        print(f'Saved {sum(examples_per_key.values())} example snippets '
+              f'→ {args.save_examples_dir}')
     print('\nKey distribution:')
     from collections import Counter
     key_counts = Counter(e['key_name'] for e in manifest)
@@ -358,6 +417,11 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
+    pf.add_argument('--save_examples_dir', type=str, default=None,
+                    help='If set, save MIDI snippets of qualifying windows here '
+                         '(uses original-tempo PrettyMIDI so playback sounds natural).')
+    pf.add_argument('--examples_per_key',  type=int, default=3,
+                    help='Cap on saved examples per detected key (default 3).')
 
     pe = sub.add_parser('extract', help='Extract CP tensors from a manifest')
     pe.add_argument('--manifest',       required=True)
