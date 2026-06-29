@@ -188,6 +188,41 @@ def cmd_filter(args):
 # Step 2: Extract — slice cached CP tensors by manifest entries
 # ---------------------------------------------------------------------------
 
+# Default training key set: all 12 pitch classes except F# (6) and G# (8),
+# which are reserved as unseen-eval keys.
+SEEN_KEYS_DEFAULT   = (0, 1, 2, 3, 4, 5, 7, 9, 10, 11)
+UNSEEN_KEYS_DEFAULT = (6, 8)
+
+
+def _signed_shift(target_key: int, base_key: int) -> int:
+    """Smallest-magnitude semitone shift mapping base_key → target_key.
+    Returns a value in [-5, +6]."""
+    s = (target_key - base_key) % 12
+    return s - 12 if s > 6 else s
+
+
+def _transpose_window(window: torch.Tensor, shift: int) -> torch.Tensor | None:
+    """Transpose a CP window by `shift` semitones (matches cp_transformer.preprocess:
+    pitch slot += pitch_shift * is_not_drum). Returns None if any non-drum note
+    would land outside MIDI range [0, 127]."""
+    if shift == 0:
+        return window.clone()
+    win     = window.clone()
+    progs   = win[:, 0::4]
+    pitches = win[:, 1::4]
+    # Valid note: program in 0..126 (excludes drum=127, EOS=254, pad=255)
+    # and pitch != 255 (pad).
+    valid   = (progs < 127) & (pitches != 255)
+    shifted = pitches.long() + shift
+    if ((shifted < 0) | (shifted > 127))[valid].any():
+        return None
+    pitches_new = shifted.to(pitches.dtype)
+    new = pitches.clone()
+    new[valid] = pitches_new[valid]
+    win[:, 1::4] = new
+    return win
+
+
 def cmd_extract(args):
     with open(args.manifest) as f:
         manifest = json.load(f)
@@ -248,29 +283,36 @@ def cmd_extract(args):
         if end_sb > cp_data.shape[0]:
             continue
 
-        window = torch.tensor(cp_data[start_sb:end_sb].copy(), dtype=torch.uint8)
-        window = pitch_sort_cp(window)
+        base_window = torch.tensor(cp_data[start_sb:end_sb].copy(), dtype=torch.uint8)
+        base_window = pitch_sort_cp(base_window)
 
-        n_notes = (window[:, 0::4] < 254).sum().item()
+        n_notes = (base_window[:, 0::4] < 254).sum().item()
         if n_notes < n_bars_window * args.min_notes_per_bar:
             continue
 
-        # Per-subbeat chord tokens following the I-IV-V-I rule
-        key   = entry['key']
-        phase = entry['phase']
-        beat_tokens = []
-        for sb in range(n_subbeats_window):
-            bar_in_window = sb // SUBBEATS_PER_BAR
-            root = (key + OFFSETS[(bar_in_window + phase) % 4]) % 12
-            beat_tokens.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
-        all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
+        base_key = entry['key']
+        phase    = entry['phase']
 
-        rel = f'nottingham_{n_saved:06d}_key{key}_phase{phase}.mid'
-        txt_lines.append(f'{n_saved}\t{rel}')
-        all_data.append(window)
-        n_saved += 1
+        for target_key in args.target_keys:
+            shift = _signed_shift(target_key, base_key)
+            win_t = _transpose_window(base_window, shift)
+            if win_t is None:
+                continue   # transposition would clip the MIDI range
+            win_t = pitch_sort_cp(win_t)
 
-        if n_saved % 200 == 0:
+            beat_tokens = []
+            for sb in range(n_subbeats_window):
+                bar_in_window = sb // SUBBEATS_PER_BAR
+                root = (target_key + OFFSETS[(bar_in_window + phase) % 4]) % 12
+                beat_tokens.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
+            all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
+
+            rel = f'nottingham_{n_saved:06d}_key{target_key}_phase{phase}.mid'
+            txt_lines.append(f'{n_saved}\t{rel}')
+            all_data.append(win_t)
+            n_saved += 1
+
+        if n_saved % 200 == 0 and n_saved > 0:
             print(f'  {n_saved} windows extracted ...')
 
     if n_saved == 0:
@@ -284,8 +326,16 @@ def cmd_extract(args):
     with open(f'{args.out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
 
-    print(f'\nSaved {n_saved} windows.')
+    print(f'\nSaved {n_saved} windows across target_keys={list(args.target_keys)}.')
     print(f'Dataset → {args.out_pt}.{{pt,length.pt,pitch_shift_range.pt,beat_chords.pt,txt}}')
+
+    from collections import Counter
+    key_counts = Counter(
+        int(line.split('key')[1].split('_')[0]) for line in txt_lines
+    )
+    print('Per-key window counts:')
+    for k in sorted(key_counts):
+        print(f'  {ROOT_NAMES[k]:<4} {key_counts[k]}')
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +366,12 @@ def main():
     pe.add_argument('--n_bars',         type=int, default=4)
     pe.add_argument('--max_polyphony',  type=int, default=4)
     pe.add_argument('--min_notes_per_bar', type=int, default=2)
+    pe.add_argument('--target_keys',    type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
+                    help='Pitch classes (0-11) to transpose every window into. Each '
+                         'original window is duplicated len(target_keys) times, one per '
+                         'target key (smallest signed shift). Default: all 12 keys '
+                         'except F# (6) and G# (8), reserved as unseen-eval keys. '
+                         'Pass "6 8" to build the unseen-eval dataset.')
 
     args = p.parse_args()
     if args.cmd == 'filter':
