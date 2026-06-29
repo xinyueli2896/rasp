@@ -33,7 +33,7 @@ from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
 
-TRAIN_LENGTH = 384
+TRAIN_LENGTH = 64
 MAX_STEPS    = 100_000
 
 
@@ -363,7 +363,7 @@ def main(args):
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)
         unseen_acc_cb = UnseenAccuracyCallback(
-            unseen_loader, n_batches=5, n_prompt_beats=64, n_gen_beats=320,
+            unseen_loader, n_batches=5, n_prompt_beats=16, n_gen_beats=48,
             beats_per_bar=16 if args.approach == 'chord' else 4,
         )
         print(f'Unseen eval data: {args.unseen_data}')
