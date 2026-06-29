@@ -42,15 +42,6 @@ from midi_adapter.generate_synthetic_bass import (
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# Consecutive root-diff signatures for all 4 cyclic rotations of I-IV-V-I
-_IVVI_ROTATIONS = [
-    (0, (5, 2, 5)),   # I  → IV → V  → I
-    (1, (2, 5, 0)),   # IV → V  → I  → I
-    (2, (5, 0, 5)),   # V  → I  → I  → IV
-    (3, (0, 5, 2)),   # I  → I  → IV → V
-]
-_PHASE_KEY_OFFSET = {0: 0, 1: 7, 2: 5, 3: 0}
-
 
 # ---------------------------------------------------------------------------
 # Chord detection from CP tensor
@@ -98,18 +89,28 @@ def _extract_bar_roots_from_cp(cp_data: np.ndarray) -> list[int]:
     return bar_roots
 
 
-def _find_ivvi_windows(bar_roots: list[int]) -> list[dict]:
-    """Return list of {start_bar, phase, key} dicts for all matching 4-bar windows."""
+def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4) -> list[dict]:
+    """Return list of {start_bar, phase, key} dicts for n_bars-bar windows whose
+    detected chord roots exactly match the I-IV-V-I rule:
+        bar_roots[i+j] == (key + OFFSETS[(j + phase) % 4]) % 12   for all j
+
+    n_bars must be a multiple of 4 (=> integer cycles of I-IV-V-I)."""
+    assert n_bars % 4 == 0, f'n_bars must be a multiple of 4, got {n_bars}'
     results = []
-    for i in range(len(bar_roots) - 3):
-        roots = bar_roots[i:i + 4]
+    for i in range(len(bar_roots) - n_bars + 1):
+        roots = bar_roots[i:i + n_bars]
         if any(r < 0 for r in roots):
             continue
-        diffs = tuple((roots[j + 1] - roots[j]) % 12 for j in range(3))
-        for phase, sig in _IVVI_ROTATIONS:
-            if diffs == sig:
-                key = (roots[0] - _PHASE_KEY_OFFSET[phase]) % 12
-                results.append({'start_bar': i, 'phase': phase, 'key': key})
+        matched = False
+        for phase in range(4):
+            for key in range(12):
+                if all(roots[j] == (key + OFFSETS[(j + phase) % 4]) % 12
+                       for j in range(n_bars)):
+                    results.append({'start_bar': i, 'phase': phase, 'key': key})
+                    matched = True
+                    break
+            if matched:
+                break
     return results
 
 
@@ -152,7 +153,7 @@ def cmd_filter(args):
         cp_tensor, _ = result
         cp_data = cp_tensor.numpy()
         bar_roots = _extract_bar_roots_from_cp(cp_data)
-        windows   = _find_ivvi_windows(bar_roots)
+        windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars)
         for w in windows:
             manifest.append({
                 'midi_path':  midi_path,
@@ -160,7 +161,8 @@ def cmd_filter(args):
                 'phase':      w['phase'],
                 'key':        w['key'],
                 'key_name':   ROOT_NAMES[w['key']],
-                'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + 4],
+                'n_bars':     args.n_bars,
+                'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + args.n_bars],
             })
         n_windows += len(windows)
 
@@ -200,7 +202,12 @@ def cmd_extract(args):
     cp_cache: dict[str, np.ndarray] = {}
     cache_order: list[str] = []
 
-    n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
+    # Use n_bars from the manifest entries if present (filter step stamps it).
+    # All entries in a manifest share the same n_bars, so just read the first.
+    n_bars_window = manifest[0].get('n_bars', args.n_bars) if manifest else args.n_bars
+    if n_bars_window != args.n_bars:
+        print(f'  manifest n_bars={n_bars_window} overrides --n_bars={args.n_bars}')
+    n_subbeats_window = n_bars_window * SUBBEATS_PER_BAR
 
     for entry in manifest:
         midi_path = entry['midi_path']
@@ -241,7 +248,7 @@ def cmd_extract(args):
         window = pitch_sort_cp(window)
 
         n_notes = (window[:, 0::4] < 254).sum().item()
-        if n_notes < args.n_bars * args.min_notes_per_bar:
+        if n_notes < n_bars_window * args.min_notes_per_bar:
             continue
 
         # Per-subbeat chord tokens following the I-IV-V-I rule
@@ -291,6 +298,9 @@ def main():
                     help='Directory of MIDI files (searched recursively)')
     pf.add_argument('--manifest',      required=True)
     pf.add_argument('--max_polyphony', type=int, default=4)
+    pf.add_argument('--n_bars',        type=int, default=4,
+                    help='Window length in bars; must be a multiple of 4 (= integer '
+                         'I-IV-V-I cycles). 4 → 64 subbeats, 16 → 256, 24 → 384.')
 
     pe = sub.add_parser('extract', help='Extract CP tensors from a manifest')
     pe.add_argument('--manifest',       required=True)

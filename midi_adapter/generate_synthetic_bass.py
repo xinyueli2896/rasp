@@ -457,7 +457,7 @@ def main():
     p = argparse.ArgumentParser(description='Generate synthetic bass MIDI dataset')
     p.add_argument('--n_songs',       type=int,   default=5000)
     p.add_argument('--n_bars',        type=int,   default=128,
-                   help='Bars per song (must be >= TRAIN_LENGTH/SUBBEATS_PER_BAR=6 for training)')
+                   help='Bars per song (must be >= TRAIN_LENGTH/SUBBEATS_PER_BAR=24 for training)')
     p.add_argument('--out_dir',       type=str,   required=True,
                    help='Directory for individual MIDI files')
     p.add_argument('--out_pt',        type=str,   required=True,
