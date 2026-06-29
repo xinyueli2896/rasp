@@ -1,23 +1,24 @@
 """
 Two-step pipeline for extracting I-IV-V-I windows from a MIDI corpus.
 
-Step 1 — filter (fast, no tensor computation):
-  Scan all MIDI files, extract bar-level chord roots via chromagram analysis,
-  find every 4-bar window matching I-IV-V-I (any key, any cyclic rotation),
-  save a JSON manifest of matching windows.
+Uses `preprocess_midi` from preprocess_large_midi_dataset.py (which uses
+`xf_midi.XFMidi` with constant_tempo=60/beat_div) so the resulting CP tensor
+matches the LA-pretrained CP transformer exactly. Chord detection is done
+directly on the loaded CP tensor (no second pass over the raw MIDI).
 
+Step 1 — filter (loads MIDIs via xf_midi, finds I-IV-V-I windows):
   python -m midi_adapter.filter_nottingham filter \\
       --input_dir data/nottingham/MIDI \\
       --manifest  data/nottingham_ivvi_manifest.json
 
-Step 2 — extract (slower, computes CP tensors):
-  Read the manifest, extract CP tensors for each window, save dataset files
-  in the same format as generate_synthetic_bass.py.
-
+Step 2 — extract (slices the cached CP tensors per window):
   python -m midi_adapter.filter_nottingham extract \\
       --manifest  data/nottingham_ivvi_manifest.json \\
       --out_dir   data/nottingham_ivvi_midi \\
       --out_pt    data/nottingham_ivvi_cp4
+
+Requires `preprocess_large_midi_dataset.py` and `xf_midi.py` on PYTHONPATH
+(copy them from the midi_yinyang repo into the project root).
 """
 
 from __future__ import annotations
@@ -32,23 +33,14 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from preprocess_large_midi_dataset import preprocess_midi   # uses xf_midi, beat_div=4
+
 from midi_adapter.generate_synthetic_bass import (
-    _preprocess_pm, pitch_sort_cp,
+    pitch_sort_cp,
     BEAT_DIV, SUBBEATS_PER_BAR, BEATS_PER_BAR, OFFSETS,
-    DURATION_BOUNDARIES,
 )
 
-try:
-    import pretty_midi
-except ImportError:
-    print('pretty_midi is required: pip install pretty_midi')
-    sys.exit(1)
-
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-# ---------------------------------------------------------------------------
-# I-IV-V-I pattern matching
-# ---------------------------------------------------------------------------
 
 # Consecutive root-diff signatures for all 4 cyclic rotations of I-IV-V-I
 _IVVI_ROTATIONS = [
@@ -57,9 +49,53 @@ _IVVI_ROTATIONS = [
     (2, (5, 0, 5)),   # V  → I  → I  → IV
     (3, (0, 5, 2)),   # I  → I  → IV → V
 ]
-
-# For each phase, the key (I-chord root) relative to the window's first bar root
 _PHASE_KEY_OFFSET = {0: 0, 1: 7, 2: 5, 3: 0}
+
+
+# ---------------------------------------------------------------------------
+# Chord detection from CP tensor
+# ---------------------------------------------------------------------------
+
+def _extract_bar_roots_from_cp(cp_data: np.ndarray) -> list[int]:
+    """Compute bar-level chord root via chromagram on a preprocessed CP tensor.
+
+    cp_data : (n_subbeats, n_voices * 4) uint8 — output of preprocess_midi.
+              Each voice slot is [program, pitch, dur_idx, velocity]; padding=255,
+              EOS program=254.
+    """
+    n_subbeats = cp_data.shape[0]
+    n_voices   = cp_data.shape[1] // 4
+    n_bars     = n_subbeats // SUBBEATS_PER_BAR
+
+    bar_chroma = np.zeros((n_bars, 12), dtype=np.float32)
+    progs  = cp_data[:, 0::4]
+    pitches = cp_data[:, 1::4]
+    for sb in range(n_subbeats):
+        bar = sb // SUBBEATS_PER_BAR
+        if bar >= n_bars:
+            break
+        for v in range(n_voices):
+            prog  = int(progs[sb, v])
+            pitch = int(pitches[sb, v])
+            if prog == 255 or prog == 254 or prog == 127:   # padding/EOS/drum
+                continue
+            if pitch == 255:
+                continue
+            bar_chroma[bar, pitch % 12] += 1.0
+
+    bar_roots = []
+    for b in range(n_bars):
+        if bar_chroma[b].sum() < 1e-3:
+            bar_roots.append(-1)
+            continue
+        chroma = bar_chroma[b] / bar_chroma[b].sum()
+        best_r, best_s = 0, -1.0
+        for r in range(12):
+            s = chroma[r] + chroma[(r + 4) % 12] + chroma[(r + 7) % 12]
+            if s > best_s:
+                best_s, best_r = s, r
+        bar_roots.append(best_r)
+    return bar_roots
 
 
 def _find_ivvi_windows(bar_roots: list[int]) -> list[dict]:
@@ -78,43 +114,8 @@ def _find_ivvi_windows(bar_roots: list[int]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Filter — chromagram-based chord extraction + window finding
+# Step 1: Filter
 # ---------------------------------------------------------------------------
-
-def _extract_bar_roots(midi_path: str, beats_per_bar: int = BEATS_PER_BAR) -> list[int]:
-    """Return bar-level chord root (0-11) via chromagram major-triad matching.
-    Returns -1 for bars with no notes."""
-    pm         = pretty_midi.PrettyMIDI(midi_path)
-    beat_times = pm.get_beats()
-    n_beats    = len(beat_times)
-    n_bars     = n_beats // beats_per_bar
-
-    beat_chroma = np.zeros((n_beats, 12), dtype=np.float32)
-    for inst in pm.instruments:
-        if inst.is_drum:
-            continue
-        for note in inst.notes:
-            s = int(np.searchsorted(beat_times, note.start, side='right')) - 1
-            e = int(np.searchsorted(beat_times, note.end,   side='right')) - 1
-            s = max(0, min(s, n_beats - 1))
-            for b in range(s, min(e + 1, n_beats)):
-                beat_chroma[b, note.pitch % 12] += 1.0
-
-    bar_roots = []
-    for b in range(n_bars):
-        chroma = beat_chroma[b * beats_per_bar:(b + 1) * beats_per_bar].sum(axis=0)
-        if chroma.sum() < 1e-3:
-            bar_roots.append(-1)
-        else:
-            chroma /= chroma.sum()
-            best_r, best_s = 0, -1.0
-            for r in range(12):
-                s = chroma[r] + chroma[(r + 4) % 12] + chroma[(r + 7) % 12]
-                if s > best_s:
-                    best_s, best_r = s, r
-            bar_roots.append(best_r)
-    return bar_roots
-
 
 def cmd_filter(args):
     exts  = {'.mid', '.midi', '.MID', '.MIDI'}
@@ -125,17 +126,33 @@ def cmd_filter(args):
     ])
     print(f'Scanning {len(files)} MIDI files in {args.input_dir} ...')
 
-    manifest = []
+    manifest  = []
     n_windows = 0
+    n_skipped = 0
 
     for midi_path in files:
         try:
-            bar_roots = _extract_bar_roots(midi_path)
+            result = preprocess_midi(
+                midi_path,
+                max_polyphony = args.max_polyphony,
+                beat_div      = BEAT_DIV,
+                ins_ids       = 'all',
+                filter        = False,   # Nottingham is well-quantized; skip LA heuristic
+                dedup         = False,
+            )
         except Exception as e:
+            n_skipped += 1
             print(f'  SKIP {os.path.basename(midi_path)}: {e}')
             continue
 
-        windows = _find_ivvi_windows(bar_roots)
+        if result is None:
+            n_skipped += 1
+            continue
+
+        cp_tensor, _ = result
+        cp_data = cp_tensor.numpy()
+        bar_roots = _extract_bar_roots_from_cp(cp_data)
+        windows   = _find_ivvi_windows(bar_roots)
         for w in windows:
             manifest.append({
                 'midi_path':  midi_path,
@@ -145,16 +162,16 @@ def cmd_filter(args):
                 'key_name':   ROOT_NAMES[w['key']],
                 'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + 4],
             })
-        if windows:
-            n_windows += len(windows)
+        n_windows += len(windows)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.manifest)), exist_ok=True)
     with open(args.manifest, 'w') as f:
         json.dump(manifest, f, indent=2)
 
-    print(f'\nFound {n_windows} windows across {len(files)} files.')
+    print(f'\nFound {n_windows} windows across {len(files) - n_skipped} files '
+          f'({n_skipped} skipped).')
     print(f'Manifest saved → {args.manifest}')
-    print(f'\nKey distribution:')
+    print('\nKey distribution:')
     from collections import Counter
     key_counts = Counter(e['key_name'] for e in manifest)
     for k, v in sorted(key_counts.items(), key=lambda x: -x[1]):
@@ -162,66 +179,8 @@ def cmd_filter(args):
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Extract — CP tensors from manifest
+# Step 2: Extract — slice cached CP tensors by manifest entries
 # ---------------------------------------------------------------------------
-
-def _extract_window_cp(
-    pm: pretty_midi.PrettyMIDI,
-    start_bar: int,
-    n_bars: int = 4,
-    max_polyphony: int = 4,
-    beats_per_bar: int = BEATS_PER_BAR,
-) -> torch.Tensor | None:
-    beat_times = pm.get_beats()
-    n_beats_total = len(beat_times)
-
-    # Build 16th-note subbeat times by linearly interpolating within each beat
-    subbeat_times = []
-    for i in range(n_beats_total - 1):
-        dt = (beat_times[i + 1] - beat_times[i]) / BEAT_DIV
-        for j in range(BEAT_DIV):
-            subbeat_times.append(beat_times[i] + j * dt)
-    subbeat_times.append(beat_times[-1])
-    subbeat_times = np.array(subbeat_times)
-
-    start_subbeat = start_bar * beats_per_bar * BEAT_DIV   # = start_bar * SUBBEATS_PER_BAR
-    n_subbeats    = n_bars * beats_per_bar * BEAT_DIV       # = n_bars   * SUBBEATS_PER_BAR
-    end_subbeat   = start_subbeat + n_subbeats
-
-    if end_subbeat > len(subbeat_times):
-        return None
-
-    rolls  = np.full((n_subbeats, max_polyphony, 4), 255, dtype=np.uint8)
-    counts = np.zeros(n_subbeats, dtype=np.uint8)
-
-    t0 = subbeat_times[start_subbeat]
-    t1 = subbeat_times[end_subbeat] if end_subbeat < len(subbeat_times) else pm.get_end_time()
-
-    for inst in pm.instruments:
-        if inst.is_drum:
-            continue
-        for note in inst.notes:
-            if note.start < t0 or note.start >= t1:
-                continue
-            abs_sub = int(np.searchsorted(subbeat_times, note.start, side='right')) - 1
-            local_b = abs_sub - start_subbeat
-            if local_b < 0 or local_b >= n_subbeats or counts[local_b] >= max_polyphony:
-                continue
-            abs_e   = int(np.searchsorted(subbeat_times, note.end, side='right')) - 1
-            dur_idx = int(np.searchsorted(DURATION_BOUNDARIES, max(0, abs_e - abs_sub)))
-            rolls[local_b, counts[local_b]] = [inst.program, note.pitch, dur_idx, note.velocity]
-            counts[local_b] += 1
-
-    for i in range(n_subbeats):
-        if counts[i] < max_polyphony:
-            rolls[i, counts[i], 0] = 254
-
-    if counts.sum() == 0:
-        return None
-
-    data = torch.tensor(rolls.reshape(n_subbeats, max_polyphony * 4), dtype=torch.uint8)
-    return pitch_sort_cp(data)
-
 
 def cmd_extract(args):
     with open(args.manifest) as f:
@@ -237,38 +196,57 @@ def cmd_extract(args):
     txt_lines:  list[str] = []
     n_saved = 0
 
-    # Cache open PrettyMIDI objects to avoid re-loading the same file repeatedly
-    pm_cache: dict[str, pretty_midi.PrettyMIDI] = {}
+    # Cache preprocessed CP tensors per file to avoid re-loading
+    cp_cache: dict[str, np.ndarray] = {}
+    cache_order: list[str] = []
+
+    n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
 
     for entry in manifest:
         midi_path = entry['midi_path']
-        if midi_path not in pm_cache:
+        if midi_path not in cp_cache:
             try:
-                pm_cache[midi_path] = pretty_midi.PrettyMIDI(midi_path)
+                result = preprocess_midi(
+                    midi_path,
+                    max_polyphony = args.max_polyphony,
+                    beat_div      = BEAT_DIV,
+                    ins_ids       = 'all',
+                    filter        = False,
+                    dedup         = False,
+                )
             except Exception as e:
                 print(f'  SKIP {midi_path}: {e}')
+                cp_cache[midi_path] = None
                 continue
-            # Evict cache if too large
-            if len(pm_cache) > 200:
-                oldest = next(iter(pm_cache))
-                del pm_cache[oldest]
+            if result is None:
+                cp_cache[midi_path] = None
+                continue
+            cp_cache[midi_path] = result[0].numpy()
+            cache_order.append(midi_path)
+            # Bound cache size
+            if len(cache_order) > 200:
+                old = cache_order.pop(0)
+                cp_cache.pop(old, None)
 
-        pm        = pm_cache[midi_path]
-        start_bar = entry['start_bar']
-        key       = entry['key']
-        phase     = entry['phase']
-
-        data = _extract_window_cp(pm, start_bar, n_bars=args.n_bars,
-                                  max_polyphony=args.max_polyphony)
-        if data is None:
+        cp_data = cp_cache[midi_path]
+        if cp_data is None:
             continue
 
-        n_notes = (data[:, 0::4] != 255).sum().item()
+        start_sb = entry['start_bar'] * SUBBEATS_PER_BAR
+        end_sb   = start_sb + n_subbeats_window
+        if end_sb > cp_data.shape[0]:
+            continue
+
+        window = torch.tensor(cp_data[start_sb:end_sb].copy(), dtype=torch.uint8)
+        window = pitch_sort_cp(window)
+
+        n_notes = (window[:, 0::4] < 254).sum().item()
         if n_notes < args.n_bars * args.min_notes_per_bar:
             continue
 
-        # Subbeat-level chord tokens for this window (one per 16th note)
-        n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
+        # Per-subbeat chord tokens following the I-IV-V-I rule
+        key   = entry['key']
+        phase = entry['phase']
         beat_tokens = []
         for sb in range(n_subbeats_window):
             bar_in_window = sb // SUBBEATS_PER_BAR
@@ -278,7 +256,7 @@ def cmd_extract(args):
 
         rel = f'nottingham_{n_saved:06d}_key{key}_phase{phase}.mid'
         txt_lines.append(f'{n_saved}\t{rel}')
-        all_data.append(data)
+        all_data.append(window)
         n_saved += 1
 
         if n_saved % 200 == 0:
@@ -288,9 +266,8 @@ def cmd_extract(args):
         print('No windows passed the note-density filter. Try --min_notes_per_bar 1')
         return
 
-    n_subbeats = args.n_bars * SUBBEATS_PER_BAR
     torch.save(torch.cat(all_data, dim=0),                f'{args.out_pt}.pt')
-    torch.save(torch.tensor([n_subbeats] * n_saved),      f'{args.out_pt}.length.pt')
+    torch.save(torch.tensor([n_subbeats_window] * n_saved), f'{args.out_pt}.length.pt')
     torch.save(torch.zeros(n_saved, 2, dtype=torch.int8), f'{args.out_pt}.pitch_shift_range.pt')
     torch.save(all_chords,                                 f'{args.out_pt}.beat_chords.pt')
     with open(f'{args.out_pt}.txt', 'w') as f:
@@ -305,23 +282,20 @@ def cmd_extract(args):
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description='Filter MIDI corpus for I-IV-V-I windows')
+    p = argparse.ArgumentParser(description='Filter MIDI corpus for I-IV-V-I windows '
+                                            '(using preprocess_large_midi_dataset.preprocess_midi)')
     sub = p.add_subparsers(dest='cmd', required=True)
 
-    # --- filter ---
     pf = sub.add_parser('filter', help='Scan MIDI files and save matching-window manifest')
-    pf.add_argument('--input_dir', required=True,
+    pf.add_argument('--input_dir',     required=True,
                     help='Directory of MIDI files (searched recursively)')
-    pf.add_argument('--manifest',  required=True,
-                    help='Output JSON manifest path')
+    pf.add_argument('--manifest',      required=True)
+    pf.add_argument('--max_polyphony', type=int, default=4)
 
-    # --- extract ---
     pe = sub.add_parser('extract', help='Extract CP tensors from a manifest')
     pe.add_argument('--manifest',       required=True)
-    pe.add_argument('--out_dir',        required=True,
-                    help='Directory for MIDI snippets (for inspection)')
-    pe.add_argument('--out_pt',         required=True,
-                    help='Output prefix for .pt dataset files')
+    pe.add_argument('--out_dir',        required=True)
+    pe.add_argument('--out_pt',         required=True)
     pe.add_argument('--n_bars',         type=int, default=4)
     pe.add_argument('--max_polyphony',  type=int, default=4)
     pe.add_argument('--min_notes_per_bar', type=int, default=2)
