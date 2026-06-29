@@ -46,6 +46,9 @@ from midi_adapter.generate_synthetic_bass import (
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
+# Window length is locked to 4 bars: exactly one I-IV-V-I cycle.
+N_BARS_WINDOW = 4
+
 
 # ---------------------------------------------------------------------------
 # Downbeat-aligned loader.
@@ -66,8 +69,20 @@ ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 def _load_midi_aligned(midi_path: str, max_polyphony: int = 4) -> np.ndarray | None:
     """Load a MIDI, align bar 0 to the first downbeat, quantize to 16th-note
-    subbeats (using the file's own tempo curve), and return a CP tensor."""
+    subbeats (using the file's own tempo curve), and return a CP tensor.
+
+    Returns None if the file is not in pure 4/4 — Nottingham contains many 3/4
+    waltzes and 6/8 jigs that would otherwise be misinterpreted as 4/4 by the
+    BEATS_PER_BAR=4 segmenter."""
     pm = pretty_midi.PrettyMIDI(midi_path)
+
+    # Reject anything that isn't pure 4/4. An empty time_signature_changes list
+    # defaults to 4/4 in MIDI semantics, so we accept that.
+    ts_changes = pm.time_signature_changes
+    for ts in ts_changes:
+        if ts.numerator != 4 or ts.denominator != 4:
+            return None
+
     beats     = pm.get_beats()
     downbeats = pm.get_downbeats()
     if len(beats) < 2 or len(downbeats) == 0:
@@ -277,7 +292,7 @@ def cmd_filter(args):
             continue
 
         bar_roots = _extract_bar_roots_from_cp(cp_data)
-        windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
+        windows   = _find_ivvi_windows(bar_roots, n_bars=N_BARS_WINDOW,
                                        phase_zero_only=not args.all_phases)
         for w in windows:
             manifest.append({
@@ -286,8 +301,8 @@ def cmd_filter(args):
                 'phase':      w['phase'],
                 'key':        w['key'],
                 'key_name':   ROOT_NAMES[w['key']],
-                'n_bars':     args.n_bars,
-                'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + args.n_bars],
+                'n_bars':     N_BARS_WINDOW,
+                'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + N_BARS_WINDOW],
             })
             if args.save_examples_dir and examples_per_key[w['key']] < args.examples_per_key:
                 stem = os.path.splitext(os.path.basename(midi_path))[0]
@@ -296,7 +311,7 @@ def cmd_filter(args):
                     f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
                 )
                 try:
-                    if _save_midi_example(cp_data, w['start_bar'], args.n_bars,
+                    if _save_midi_example(cp_data, w['start_bar'], N_BARS_WINDOW,
                                           args.max_polyphony, out):
                         examples_per_key[w['key']] += 1
                 except Exception as e:
@@ -377,12 +392,8 @@ def cmd_extract(args):
     cp_cache: dict[str, np.ndarray] = {}
     cache_order: list[str] = []
 
-    # Use n_bars from the manifest entries if present (filter step stamps it).
-    # All entries in a manifest share the same n_bars, so just read the first.
-    n_bars_window = manifest[0].get('n_bars', args.n_bars) if manifest else args.n_bars
-    if n_bars_window != args.n_bars:
-        print(f'  manifest n_bars={n_bars_window} overrides --n_bars={args.n_bars}')
-    n_subbeats_window = n_bars_window * SUBBEATS_PER_BAR
+    n_bars_window     = N_BARS_WINDOW
+    n_subbeats_window = N_BARS_WINDOW * SUBBEATS_PER_BAR
 
     for entry in manifest:
         midi_path = entry['midi_path']
@@ -481,9 +492,6 @@ def main():
                     help='Directory of MIDI files (searched recursively)')
     pf.add_argument('--manifest',      required=True)
     pf.add_argument('--max_polyphony', type=int, default=4)
-    pf.add_argument('--n_bars',        type=int, default=4,
-                    help='Window length in bars; must be a multiple of 4 (= integer '
-                         'I-IV-V-I cycles). 4 → 64 subbeats, 16 → 256, 24 → 384.')
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
@@ -497,7 +505,6 @@ def main():
     pe.add_argument('--manifest',       required=True)
     pe.add_argument('--out_dir',        required=True)
     pe.add_argument('--out_pt',         required=True)
-    pe.add_argument('--n_bars',         type=int, default=4)
     pe.add_argument('--max_polyphony',  type=int, default=4)
     pe.add_argument('--min_notes_per_bar', type=int, default=2)
     pe.add_argument('--target_keys',    type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
