@@ -89,20 +89,23 @@ def _extract_bar_roots_from_cp(cp_data: np.ndarray) -> list[int]:
     return bar_roots
 
 
-def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4) -> list[dict]:
+def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4,
+                       phase_zero_only: bool = True) -> list[dict]:
     """Return list of {start_bar, phase, key} dicts for n_bars-bar windows whose
     detected chord roots exactly match the I-IV-V-I rule:
         bar_roots[i+j] == (key + OFFSETS[(j + phase) % 4]) % 12   for all j
 
-    n_bars must be a multiple of 4 (=> integer cycles of I-IV-V-I)."""
+    n_bars must be a multiple of 4 (=> integer cycles of I-IV-V-I).
+    phase_zero_only=True restricts to windows that start on I (phase=0)."""
     assert n_bars % 4 == 0, f'n_bars must be a multiple of 4, got {n_bars}'
+    phases = (0,) if phase_zero_only else (0, 1, 2, 3)
     results = []
     for i in range(len(bar_roots) - n_bars + 1):
         roots = bar_roots[i:i + n_bars]
         if any(r < 0 for r in roots):
             continue
         matched = False
-        for phase in range(4):
+        for phase in phases:
             for key in range(12):
                 if all(roots[j] == (key + OFFSETS[(j + phase) % 4]) % 12
                        for j in range(n_bars)):
@@ -153,7 +156,8 @@ def cmd_filter(args):
         cp_tensor, _ = result
         cp_data = cp_tensor.numpy()
         bar_roots = _extract_bar_roots_from_cp(cp_data)
-        windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars)
+        windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
+                                       phase_zero_only=not args.all_phases)
         for w in windows:
             manifest.append({
                 'midi_path':  midi_path,
@@ -301,6 +305,9 @@ def main():
     pf.add_argument('--n_bars',        type=int, default=4,
                     help='Window length in bars; must be a multiple of 4 (= integer '
                          'I-IV-V-I cycles). 4 → 64 subbeats, 16 → 256, 24 → 384.')
+    pf.add_argument('--all_phases',    action='store_true',
+                    help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
+                         'Default keeps only phase 0 (windows start on I).')
 
     pe = sub.add_parser('extract', help='Extract CP tensors from a manifest')
     pe.add_argument('--manifest',       required=True)
