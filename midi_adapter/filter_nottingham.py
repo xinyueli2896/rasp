@@ -304,6 +304,23 @@ def _count_polyphonic_subbeats(cp_data: np.ndarray, start_sb: int,
     return int((per_sb_counts >= 2).sum())
 
 
+def _every_bar_has_polyphony(cp_data: np.ndarray, start_sb: int, n_bars: int,
+                              max_polyphony: int = 4,
+                              min_poly_per_bar: int = 1) -> bool:
+    """Returns True iff every bar in the window has at least min_poly_per_bar
+    subbeats with ≥2 simultaneous non-drum notes. This guarantees each bar can
+    be split into melody (top voice) and chord (rest) — and naturally rules
+    out pickup-style bars that would only contain 1–2 monophonic melody notes.
+    """
+    for b in range(n_bars):
+        bar_start = start_sb + b * SUBBEATS_PER_BAR
+        n_poly = _count_polyphonic_subbeats(
+            cp_data, bar_start, SUBBEATS_PER_BAR, max_polyphony)
+        if n_poly < min_poly_per_bar:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Lead-sheet snippet writer — skyline split.
 #
@@ -418,10 +435,10 @@ def cmd_filter(args):
         n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
         for w in windows:
             start_sb = w['start_bar'] * SUBBEATS_PER_BAR
-            n_poly   = _count_polyphonic_subbeats(
-                cp_data, start_sb, n_subbeats_window, args.max_polyphony)
-            if n_poly < args.min_polyphonic_subbeats:
-                continue   # no chord content — can't form a melody+chord lead sheet
+            if not _every_bar_has_polyphony(
+                    cp_data, start_sb, args.n_bars, args.max_polyphony,
+                    min_poly_per_bar=args.min_poly_per_bar):
+                continue   # at least one bar lacks chord content — rejects pickup-style bars too
 
             manifest.append({
                 'midi_path':  midi_path,
@@ -434,7 +451,6 @@ def cmd_filter(args):
                     w['start_bar'] * args.chords_per_bar:
                     (w['start_bar'] + args.n_bars) * args.chords_per_bar],
                 'chords_per_bar': args.chords_per_bar,
-                'n_polyphonic_subbeats': n_poly,
             })
             n_windows += 1
             if args.save_examples_dir and examples_per_key[w['key']] < args.examples_per_key:
@@ -704,11 +720,12 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
-    pf.add_argument('--min_polyphonic_subbeats', type=int, default=8,
-                    help='Reject windows with fewer than this many subbeats that '
-                         'have ≥2 simultaneous notes — guarantees the matched '
-                         'window has enough chord content to split into melody '
-                         '+ chord tracks for Structured-Arrangement input.')
+    pf.add_argument('--min_poly_per_bar', type=int, default=1,
+                    help='Every bar in the window must have at least this many '
+                         'subbeats with ≥2 simultaneous notes. Default 1 ensures '
+                         'every bar has both a melody top voice and a chord '
+                         'underneath. Side effect: rules out pickup-style bars '
+                         '(which usually only have 1–2 monophonic melody notes).')
     pf.add_argument('--save_examples_dir', type=str, default=None,
                     help='If set, save 2-track lead-sheet snippets (track 0 = '
                          'skyline melody, track 1 = chord) of qualifying windows '
