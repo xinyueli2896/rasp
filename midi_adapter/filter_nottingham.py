@@ -138,46 +138,87 @@ def _load_midi_aligned(midi_path: str, max_polyphony: int = 4) -> np.ndarray | N
 # Chord detection from CP tensor
 # ---------------------------------------------------------------------------
 
-def _extract_bar_roots_from_cp(cp_data: np.ndarray) -> list[int]:
+def _chromagram_to_root(chroma: np.ndarray) -> int:
+    """Return the best major-triad root for a 12-bin chromagram, or -1 if empty."""
+    if chroma.sum() < 1e-3:
+        return -1
+    c = chroma / chroma.sum()
+    best_r, best_s = 0, -1.0
+    for r in range(12):
+        s = c[r] + c[(r + 4) % 12] + c[(r + 7) % 12]
+        if s > best_s:
+            best_s, best_r = s, r
+    return best_r
+
+
+def _extract_bar_roots_from_cp(cp_data: np.ndarray,
+                                strict_one_chord_per_bar: bool = True) -> list[int]:
     """Compute bar-level chord root via chromagram on a preprocessed CP tensor.
 
-    cp_data : (n_subbeats, n_voices * 4) uint8 — output of preprocess_midi.
-              Each voice slot is [program, pitch, dur_idx, velocity]; padding=255,
-              EOS program=254.
+    cp_data : (n_subbeats, n_voices * 4) uint8. Each voice slot is
+              [program, pitch, dur_idx, velocity]; padding=255, EOS program=254.
+
+    strict_one_chord_per_bar (default True):
+        Detect chords at HALF-BAR resolution (2 chords per bar). A bar is
+        accepted only when both halves agree on the same root — i.e. there
+        is genuinely one chord throughout the bar. Bars containing two
+        different chords (e.g. "C ... G7" mid-bar) report root = -1, which
+        kills any window that would include them.
+
+    strict_one_chord_per_bar=False:
+        Old behavior — sum the chromagram over the full bar and take argmax.
+        Bars with multiple chords get blended into one (probably wrong) root.
     """
     n_subbeats = cp_data.shape[0]
     n_voices   = cp_data.shape[1] // 4
     n_bars     = n_subbeats // SUBBEATS_PER_BAR
 
-    bar_chroma = np.zeros((n_bars, 12), dtype=np.float32)
-    progs  = cp_data[:, 0::4]
+    progs   = cp_data[:, 0::4]
     pitches = cp_data[:, 1::4]
-    for sb in range(n_subbeats):
+
+    if strict_one_chord_per_bar:
+        HALF       = SUBBEATS_PER_BAR // 2   # 8 subbeats per half-bar
+        n_halves   = n_bars * 2
+        half_chroma = np.zeros((n_halves, 12), dtype=np.float32)
+        for sb in range(n_bars * SUBBEATS_PER_BAR):
+            h = sb // HALF
+            for v in range(n_voices):
+                prog  = int(progs[sb, v])
+                pitch = int(pitches[sb, v])
+                if prog == 255 or prog == 254 or prog == 127:
+                    continue
+                if pitch == 255:
+                    continue
+                half_chroma[h, pitch % 12] += 1.0
+
+        bar_roots = []
+        for b in range(n_bars):
+            r1 = _chromagram_to_root(half_chroma[2 * b])
+            r2 = _chromagram_to_root(half_chroma[2 * b + 1])
+            # Require both halves to agree, OR one half empty and the other valid
+            if r1 == r2 and r1 >= 0:
+                bar_roots.append(r1)
+            elif r1 == -1 and r2 >= 0:
+                bar_roots.append(r2)
+            elif r2 == -1 and r1 >= 0:
+                bar_roots.append(r1)
+            else:
+                bar_roots.append(-1)   # two different chords in this bar
+        return bar_roots
+
+    # Loose mode — full-bar chromagram
+    bar_chroma = np.zeros((n_bars, 12), dtype=np.float32)
+    for sb in range(n_bars * SUBBEATS_PER_BAR):
         bar = sb // SUBBEATS_PER_BAR
-        if bar >= n_bars:
-            break
         for v in range(n_voices):
             prog  = int(progs[sb, v])
             pitch = int(pitches[sb, v])
-            if prog == 255 or prog == 254 or prog == 127:   # padding/EOS/drum
+            if prog == 255 or prog == 254 or prog == 127:
                 continue
             if pitch == 255:
                 continue
             bar_chroma[bar, pitch % 12] += 1.0
-
-    bar_roots = []
-    for b in range(n_bars):
-        if bar_chroma[b].sum() < 1e-3:
-            bar_roots.append(-1)
-            continue
-        chroma = bar_chroma[b] / bar_chroma[b].sum()
-        best_r, best_s = 0, -1.0
-        for r in range(12):
-            s = chroma[r] + chroma[(r + 4) % 12] + chroma[(r + 7) % 12]
-            if s > best_s:
-                best_s, best_r = s, r
-        bar_roots.append(best_r)
-    return bar_roots
+    return [_chromagram_to_root(bar_chroma[b]) for b in range(n_bars)]
 
 
 def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4,
@@ -377,7 +418,8 @@ def cmd_filter(args):
             n_skipped += 1
             continue
 
-        bar_roots = _extract_bar_roots_from_cp(cp_data)
+        bar_roots = _extract_bar_roots_from_cp(
+            cp_data, strict_one_chord_per_bar=not args.allow_multi_chord_bars)
         windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
                                        phase_zero_only=not args.all_phases)
         n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
@@ -657,6 +699,11 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
+    pf.add_argument('--allow_multi_chord_bars', action='store_true',
+                    help='Loose mode: detect one chord per bar from the full-bar '
+                         'chromagram (bars containing two chords get blended into '
+                         'one detected root). Default is strict: detect at half-bar '
+                         'resolution and reject bars whose two halves disagree.')
     pf.add_argument('--min_polyphonic_subbeats', type=int, default=8,
                     help='Reject windows with fewer than this many subbeats that '
                          'have ≥2 simultaneous notes — guarantees the matched '
