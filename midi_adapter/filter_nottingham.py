@@ -406,8 +406,8 @@ def cmd_filter(args):
                     f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
                 )
                 try:
-                    if _save_midi_example(cp_data, w['start_bar'], args.n_bars,
-                                          args.max_polyphony, out):
+                    if _save_leadsheet_snippet(cp_data, w['start_bar'], args.n_bars,
+                                               out, max_polyphony=args.max_polyphony):
                         examples_per_key[w['key']] += 1
                 except Exception as e:
                     print(f'  example-save failed for {midi_path}: {e}')
@@ -663,8 +663,9 @@ def main():
                          'window has enough chord content to split into melody '
                          '+ chord tracks for Structured-Arrangement input.')
     pf.add_argument('--save_examples_dir', type=str, default=None,
-                    help='If set, save MIDI snippets of qualifying windows here '
-                         '(uses original-tempo PrettyMIDI so playback sounds natural).')
+                    help='If set, save 2-track lead-sheet snippets (track 0 = '
+                         'skyline melody, track 1 = chord) of qualifying windows '
+                         'here so you can verify the melody/chord split.')
     pf.add_argument('--examples_per_key',  type=int, default=3,
                     help='Cap on saved examples per detected key (default 3).')
 
