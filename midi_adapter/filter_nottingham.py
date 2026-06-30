@@ -261,79 +261,84 @@ def _save_midi_example(cp_data: np.ndarray, start_bar: int, n_bars: int,
 
 
 # ---------------------------------------------------------------------------
-# Lead-sheet snippet writer — keeps track separation so the snippet can be
-# fed directly to Structured-Arrangement (track 0 = melody, others = chord/
-# accompaniment). Re-quantizes notes onto the downbeat-aligned 16th-note
-# grid and renders at 120 BPM so timing is clean.
+# Polyphony check — Structured-Arrangement needs both melody and chord. A
+# window with no polyphony (all subbeats have ≤1 note) can't be split into
+# melody+chord and is rejected by the filter.
 # ---------------------------------------------------------------------------
 
-def _save_leadsheet_snippet(midi_path: str, start_bar: int, n_bars: int,
-                            out_path: str, tempo: float = 120.0) -> bool:
-    """Save bars [start_bar, start_bar + n_bars) as a multi-track MIDI with
-    each original instrument kept as a separate `pretty_midi.Instrument` (so
-    track 0 stays melody, track 1 stays chord, etc.)."""
-    pm = pretty_midi.PrettyMIDI(midi_path)
+def _count_polyphonic_subbeats(cp_data: np.ndarray, start_sb: int,
+                                n_subbeats: int, max_polyphony: int = 4) -> int:
+    """Count subbeats with ≥2 simultaneous non-drum, non-pad notes."""
+    progs   = cp_data[start_sb:start_sb + n_subbeats, 0::4]
+    pitches = cp_data[start_sb:start_sb + n_subbeats, 1::4]
+    # A slot holds a usable note iff program < 127 (not drum/EOS/pad) and pitch != 255
+    real = (progs < 127) & (pitches != 255)
+    per_sb_counts = real.sum(axis=1)   # shape (n_subbeats,)
+    return int((per_sb_counts >= 2).sum())
 
-    for ts in pm.time_signature_changes:
-        if ts.numerator != 4 or ts.denominator != 4:
-            return False
 
-    beats     = pm.get_beats()
-    downbeats = pm.get_downbeats()
-    if len(beats) < 2 or len(downbeats) == 0:
-        return False
+# ---------------------------------------------------------------------------
+# Lead-sheet snippet writer — skyline split.
+#
+# At each subbeat: the highest-pitched note is the melody (track 0), every
+# other simultaneous note is chord/accompaniment (track 1). This handles
+# both cases the user flagged:
+#   * Nottingham files that already separate melody from chord by track —
+#     top voice usually IS the melody, so skyline reproduces the split
+#   * Nottingham files where melody + chord are mixed in one track —
+#     skyline still finds the melody on top
+#
+# Notes are read straight from the aligned CP tensor we already built, so
+# timing is exactly the 16th-note grid the model trains on (120 BPM playback).
+# ---------------------------------------------------------------------------
 
-    start_beat_idx = int(np.searchsorted(beats, downbeats[0] - 1e-9, side='left'))
-    if start_beat_idx >= len(beats) - 1:
-        return False
-
-    subbeat_times: list[float] = []
-    for i in range(start_beat_idx, len(beats) - 1):
-        dt = (beats[i + 1] - beats[i]) / BEAT_DIV
-        for j in range(BEAT_DIV):
-            subbeat_times.append(beats[i] + j * dt)
-    subbeat_times.append(float(beats[-1]))
-    subbeat_times_arr = np.asarray(subbeat_times)
-
+def _save_leadsheet_snippet(cp_data: np.ndarray, start_bar: int, n_bars: int,
+                            out_path: str, max_polyphony: int = 4,
+                            tempo: float = 120.0) -> bool:
     start_sb   = start_bar * SUBBEATS_PER_BAR
     n_subbeats = n_bars * SUBBEATS_PER_BAR
-    end_sb     = start_sb + n_subbeats
-    if end_sb > len(subbeat_times_arr):
+    if start_sb + n_subbeats > cp_data.shape[0]:
         return False
-
-    t_win_start = subbeat_times_arr[start_sb]
-    t_win_end   = subbeat_times_arr[end_sb] if end_sb < len(subbeat_times_arr) \
-                  else subbeat_times_arr[-1]
+    sec_per_sb = 60.0 / tempo / BEAT_DIV
 
     out_pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    sec_per_sb = 60.0 / tempo / BEAT_DIV
-    any_note   = False
+    melody = pretty_midi.Instrument(program=0, name='Melody')
+    chord  = pretty_midi.Instrument(program=0, name='Chord')
 
-    for inst in pm.instruments:
-        new_inst = pretty_midi.Instrument(
-            program=inst.program, is_drum=inst.is_drum, name=inst.name)
-        for note in inst.notes:
-            if note.start < t_win_start or note.start >= t_win_end:
+    for local_sb in range(n_subbeats):
+        sb = start_sb + local_sb
+        notes_here: list[tuple[int, int, int]] = []   # (pitch, dur_idx, vel)
+        for v in range(max_polyphony):
+            prog    = int(cp_data[sb, v * 4 + 0])
+            pitch   = int(cp_data[sb, v * 4 + 1])
+            dur_idx = int(cp_data[sb, v * 4 + 2])
+            vel     = int(cp_data[sb, v * 4 + 3])
+            if prog == 254 or prog == 255:
+                break
+            if prog == 127 or pitch == 255:
                 continue
-            s_abs = int(np.searchsorted(subbeat_times_arr, note.start, side='right')) - 1
-            e_abs = int(np.searchsorted(subbeat_times_arr, note.end,   side='right')) - 1
-            s_loc = s_abs - start_sb
-            e_loc = e_abs - start_sb
-            if s_loc < 0 or s_loc >= n_subbeats:
+            if dur_idx >= len(DURATION_TEMPLATES):
                 continue
-            e_loc = max(s_loc + 1, min(e_loc, n_subbeats))
-            new_inst.notes.append(pretty_midi.Note(
-                velocity = note.velocity,
-                pitch    = note.pitch,
-                start    = s_loc * sec_per_sb,
-                end      = e_loc * sec_per_sb,
-            ))
-        if new_inst.notes:
-            out_pm.instruments.append(new_inst)
-            any_note = True
+            notes_here.append((pitch, dur_idx, vel))
+        if not notes_here:
+            continue
+        notes_here.sort(key=lambda x: x[0])   # ascending pitch — top is melody
+        start_time = local_sb * sec_per_sb
+        m_pitch, m_dur, m_vel = notes_here[-1]
+        m_end = (local_sb + int(DURATION_TEMPLATES[m_dur])) * sec_per_sb
+        melody.notes.append(pretty_midi.Note(
+            velocity=m_vel if m_vel > 0 else 80,
+            pitch=m_pitch, start=start_time, end=m_end))
+        for c_pitch, c_dur, c_vel in notes_here[:-1]:
+            c_end = (local_sb + int(DURATION_TEMPLATES[c_dur])) * sec_per_sb
+            chord.notes.append(pretty_midi.Note(
+                velocity=c_vel if c_vel > 0 else 70,
+                pitch=c_pitch, start=start_time, end=c_end))
 
-    if not any_note:
-        return False
+    if not melody.notes or not chord.notes:
+        return False   # Structured-Arrangement needs BOTH tracks
+    out_pm.instruments.append(melody)
+    out_pm.instruments.append(chord)
     out_pm.write(out_path)
     return True
 
@@ -375,7 +380,14 @@ def cmd_filter(args):
         bar_roots = _extract_bar_roots_from_cp(cp_data)
         windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
                                        phase_zero_only=not args.all_phases)
+        n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
         for w in windows:
+            start_sb = w['start_bar'] * SUBBEATS_PER_BAR
+            n_poly   = _count_polyphonic_subbeats(
+                cp_data, start_sb, n_subbeats_window, args.max_polyphony)
+            if n_poly < args.min_polyphonic_subbeats:
+                continue   # no chord content — can't form a melody+chord lead sheet
+
             manifest.append({
                 'midi_path':  midi_path,
                 'start_bar':  w['start_bar'],
@@ -384,7 +396,9 @@ def cmd_filter(args):
                 'key_name':   ROOT_NAMES[w['key']],
                 'n_bars':     args.n_bars,
                 'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + args.n_bars],
+                'n_polyphonic_subbeats': n_poly,
             })
+            n_windows += 1
             if args.save_examples_dir and examples_per_key[w['key']] < args.examples_per_key:
                 stem = os.path.splitext(os.path.basename(midi_path))[0]
                 out  = os.path.join(
@@ -397,7 +411,6 @@ def cmd_filter(args):
                         examples_per_key[w['key']] += 1
                 except Exception as e:
                     print(f'  example-save failed for {midi_path}: {e}')
-        n_windows += len(windows)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.manifest)), exist_ok=True)
     with open(args.manifest, 'w') as f:
@@ -574,6 +587,9 @@ def cmd_leadsheets(args):
     per_key = Counter()
     n_saved = 0
 
+    cp_cache: dict[str, np.ndarray] = {}
+    cache_order: list[str] = []
+
     for entry in manifest:
         if args.limit and n_saved >= args.limit:
             break
@@ -585,13 +601,31 @@ def cmd_leadsheets(args):
         start_bar = entry['start_bar']
         phase     = entry['phase']
         n_bars    = entry.get('n_bars', N_BARS_WINDOW)
-        stem      = os.path.splitext(os.path.basename(midi_path))[0]
-        out       = os.path.join(
+
+        if midi_path not in cp_cache:
+            try:
+                cp_cache[midi_path] = _load_midi_aligned(
+                    midi_path, max_polyphony=args.max_polyphony)
+            except Exception as e:
+                print(f'  SKIP {midi_path}: {e}')
+                cp_cache[midi_path] = None
+                continue
+            cache_order.append(midi_path)
+            if len(cache_order) > 200:
+                old = cache_order.pop(0)
+                cp_cache.pop(old, None)
+        cp_data = cp_cache[midi_path]
+        if cp_data is None:
+            continue
+
+        stem = os.path.splitext(os.path.basename(midi_path))[0]
+        out  = os.path.join(
             args.out_dir,
             f'{n_saved:06d}_key{ROOT_NAMES[key]}_phase{phase}_bar{start_bar:04d}_{stem}.mid',
         )
         try:
-            if _save_leadsheet_snippet(midi_path, start_bar, n_bars, out):
+            if _save_leadsheet_snippet(cp_data, start_bar, n_bars, out,
+                                       max_polyphony=args.max_polyphony):
                 per_key[key] += 1
                 n_saved += 1
         except Exception as e:
@@ -623,6 +657,11 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
+    pf.add_argument('--min_polyphonic_subbeats', type=int, default=8,
+                    help='Reject windows with fewer than this many subbeats that '
+                         'have ≥2 simultaneous notes — guarantees the matched '
+                         'window has enough chord content to split into melody '
+                         '+ chord tracks for Structured-Arrangement input.')
     pf.add_argument('--save_examples_dir', type=str, default=None,
                     help='If set, save MIDI snippets of qualifying windows here '
                          '(uses original-tempo PrettyMIDI so playback sounds natural).')
@@ -646,11 +685,12 @@ def main():
                         help='Save matched 4-bar windows as multi-track MIDI lead '
                              'sheets (track 0 = melody, track 1 = chord, …) ready '
                              'for Structured-Arrangement Stage 1/2 input.')
-    pl.add_argument('--manifest',   required=True)
-    pl.add_argument('--out_dir',    required=True)
-    pl.add_argument('--limit',      type=int, default=0,
+    pl.add_argument('--manifest',      required=True)
+    pl.add_argument('--out_dir',       required=True)
+    pl.add_argument('--max_polyphony', type=int, default=4)
+    pl.add_argument('--limit',         type=int, default=0,
                     help='Cap total snippets saved (0 = no cap).')
-    pl.add_argument('--per_key',    type=int, default=0,
+    pl.add_argument('--per_key',       type=int, default=0,
                     help='Cap snippets per detected key (0 = no cap).')
 
     args = p.parse_args()
