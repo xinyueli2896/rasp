@@ -258,6 +258,7 @@ class CPYinyangTransformer(nn.Module):
         encoder_type:     str  = 'embedding',
         rule_mode:        str  = 'current',
         approach:         str  = 'bass',
+        chords_per_bar:   int  = 2,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -295,9 +296,15 @@ class CPYinyangTransformer(nn.Module):
 
         # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
         if approach == 'chord':
-            self.rule_model = CPChordRuleModel(beats_per_bar=4)
+            # beats_per_bar here = subbeats per chord (at beat_div=4):
+            #   chords_per_bar=1 → 16 subbeats per chord (one chord per bar)
+            #   chords_per_bar=2 → 8  subbeats per chord (two chords per bar) [default]
+            subbeats_per_chord = 16 // chords_per_bar
+            self.rule_model = CPChordRuleModel(beats_per_bar=subbeats_per_chord)
+            self.chords_per_bar = chords_per_bar
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
+            self.chords_per_bar = chords_per_bar
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(

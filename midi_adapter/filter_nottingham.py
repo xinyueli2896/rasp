@@ -46,11 +46,15 @@ from midi_adapter.generate_synthetic_bass import (
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# Default window length in bars; must be a multiple of 4 (= integer number of
-# I-IV-V-I cycles). 8 bars (= 2 cycles, 128 subbeats) is a good balance —
-# enough musical material for Structured-Arrangement to orchestrate, still
-# tight enough to find plenty of matches in folk corpora.
+# Default window length in bars. At chords_per_bar=2, an 8-bar window has 16
+# chord positions = 4 full I-IV-V-I cycles — plenty of rule signal for the
+# adapter while still finding lots of matches in folk corpora.
 N_BARS_WINDOW = 8
+
+# Default chord rate. 2 chords per bar (= half-bar harmonic rhythm) is more
+# musically natural for 4/4 folk/pop than 1 chord per bar, and matches what
+# the chord-detection step already produces at half-bar granularity.
+CHORDS_PER_BAR_DEFAULT = 2
 
 
 # ---------------------------------------------------------------------------
@@ -151,65 +155,28 @@ def _chromagram_to_root(chroma: np.ndarray) -> int:
     return best_r
 
 
-def _extract_bar_roots_from_cp(cp_data: np.ndarray,
-                                strict_one_chord_per_bar: bool = True) -> list[int]:
-    """Compute bar-level chord root via chromagram on a preprocessed CP tensor.
+def _extract_chord_roots_from_cp(cp_data: np.ndarray,
+                                  chords_per_bar: int = 2) -> list[int]:
+    """Detect chord root per (1/chords_per_bar) bar via chromagram matching.
 
-    cp_data : (n_subbeats, n_voices * 4) uint8. Each voice slot is
-              [program, pitch, dur_idx, velocity]; padding=255, EOS program=254.
+    chords_per_bar=1 → one root per bar  (16 subbeats per chord at beat_div=4)
+    chords_per_bar=2 → one root per HALF-bar (8 subbeats per chord) [default]
 
-    strict_one_chord_per_bar (default True):
-        Detect chords at HALF-BAR resolution (2 chords per bar). A bar is
-        accepted only when both halves agree on the same root — i.e. there
-        is genuinely one chord throughout the bar. Bars containing two
-        different chords (e.g. "C ... G7" mid-bar) report root = -1, which
-        kills any window that would include them.
-
-    strict_one_chord_per_bar=False:
-        Old behavior — sum the chromagram over the full bar and take argmax.
-        Bars with multiple chords get blended into one (probably wrong) root.
+    Returns a list of length n_bars * chords_per_bar. Empty slices return -1.
     """
+    assert SUBBEATS_PER_BAR % chords_per_bar == 0, \
+        f'SUBBEATS_PER_BAR={SUBBEATS_PER_BAR} not divisible by chords_per_bar={chords_per_bar}'
+    sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
+
     n_subbeats = cp_data.shape[0]
     n_voices   = cp_data.shape[1] // 4
-    n_bars     = n_subbeats // SUBBEATS_PER_BAR
+    n_chords   = n_subbeats // sub_per_chord
 
+    chroma = np.zeros((n_chords, 12), dtype=np.float32)
     progs   = cp_data[:, 0::4]
     pitches = cp_data[:, 1::4]
-
-    if strict_one_chord_per_bar:
-        HALF       = SUBBEATS_PER_BAR // 2   # 8 subbeats per half-bar
-        n_halves   = n_bars * 2
-        half_chroma = np.zeros((n_halves, 12), dtype=np.float32)
-        for sb in range(n_bars * SUBBEATS_PER_BAR):
-            h = sb // HALF
-            for v in range(n_voices):
-                prog  = int(progs[sb, v])
-                pitch = int(pitches[sb, v])
-                if prog == 255 or prog == 254 or prog == 127:
-                    continue
-                if pitch == 255:
-                    continue
-                half_chroma[h, pitch % 12] += 1.0
-
-        bar_roots = []
-        for b in range(n_bars):
-            r1 = _chromagram_to_root(half_chroma[2 * b])
-            r2 = _chromagram_to_root(half_chroma[2 * b + 1])
-            # Require both halves to agree, OR one half empty and the other valid
-            if r1 == r2 and r1 >= 0:
-                bar_roots.append(r1)
-            elif r1 == -1 and r2 >= 0:
-                bar_roots.append(r2)
-            elif r2 == -1 and r1 >= 0:
-                bar_roots.append(r1)
-            else:
-                bar_roots.append(-1)   # two different chords in this bar
-        return bar_roots
-
-    # Loose mode — full-bar chromagram
-    bar_chroma = np.zeros((n_bars, 12), dtype=np.float32)
-    for sb in range(n_bars * SUBBEATS_PER_BAR):
-        bar = sb // SUBBEATS_PER_BAR
+    for sb in range(n_chords * sub_per_chord):
+        c = sb // sub_per_chord
         for v in range(n_voices):
             prog  = int(progs[sb, v])
             pitch = int(pitches[sb, v])
@@ -217,31 +184,50 @@ def _extract_bar_roots_from_cp(cp_data: np.ndarray,
                 continue
             if pitch == 255:
                 continue
-            bar_chroma[bar, pitch % 12] += 1.0
-    return [_chromagram_to_root(bar_chroma[b]) for b in range(n_bars)]
+            chroma[c, pitch % 12] += 1.0
+
+    return [_chromagram_to_root(chroma[c]) for c in range(n_chords)]
 
 
-def _find_ivvi_windows(bar_roots: list[int], n_bars: int = 4,
+# Back-compat shim — old name kept for any callers.
+def _extract_bar_roots_from_cp(cp_data: np.ndarray, chords_per_bar: int = 2) -> list[int]:
+    return _extract_chord_roots_from_cp(cp_data, chords_per_bar=chords_per_bar)
+
+
+def _find_ivvi_windows(chord_roots: list[int], n_bars: int = 4,
+                       chords_per_bar: int = 2,
                        phase_zero_only: bool = True) -> list[dict]:
-    """Return list of {start_bar, phase, key} dicts for n_bars-bar windows whose
-    detected chord roots exactly match the I-IV-V-I rule:
-        bar_roots[i+j] == (key + OFFSETS[(j + phase) % 4]) % 12   for all j
+    """Return list of {start_bar, phase, key} dicts whose detected chord-root
+    sequence matches the I-IV-V-I rule at chords_per_bar harmonic rhythm:
 
-    n_bars must be a multiple of 4 (=> integer cycles of I-IV-V-I).
-    phase_zero_only=True restricts to windows that start on I (phase=0)."""
-    assert n_bars % 4 == 0, f'n_bars must be a multiple of 4, got {n_bars}'
+        chord_roots[i + j] == (key + OFFSETS[(j + phase) % 4]) % 12  for all j
+
+    A window covers `n_bars * chords_per_bar` chord positions, which must be a
+    multiple of 4 (= integer number of I-IV-V-I cycles). i steps in chord
+    positions; start_bar is reported as i // chords_per_bar (whole bars only)
+    so we never cut mid-bar.
+    """
+    n_chords_window = n_bars * chords_per_bar
+    assert n_chords_window % 4 == 0, \
+        f'n_bars * chords_per_bar = {n_chords_window} must be a multiple of 4'
     phases = (0,) if phase_zero_only else (0, 1, 2, 3)
     results = []
-    for i in range(len(bar_roots) - n_bars + 1):
-        roots = bar_roots[i:i + n_bars]
+    # Only start on bar boundaries (multiples of chords_per_bar) so windows
+    # always align to musical bar starts.
+    for i in range(0, len(chord_roots) - n_chords_window + 1, chords_per_bar):
+        roots = chord_roots[i:i + n_chords_window]
         if any(r < 0 for r in roots):
             continue
         matched = False
         for phase in phases:
             for key in range(12):
                 if all(roots[j] == (key + OFFSETS[(j + phase) % 4]) % 12
-                       for j in range(n_bars)):
-                    results.append({'start_bar': i, 'phase': phase, 'key': key})
+                       for j in range(n_chords_window)):
+                    results.append({
+                        'start_bar': i // chords_per_bar,
+                        'phase':     phase,
+                        'key':       key,
+                    })
                     matched = True
                     break
             if matched:
@@ -418,10 +404,12 @@ def cmd_filter(args):
             n_skipped += 1
             continue
 
-        bar_roots = _extract_bar_roots_from_cp(
-            cp_data, strict_one_chord_per_bar=not args.allow_multi_chord_bars)
-        windows   = _find_ivvi_windows(bar_roots, n_bars=args.n_bars,
-                                       phase_zero_only=not args.all_phases)
+        chord_roots = _extract_chord_roots_from_cp(
+            cp_data, chords_per_bar=args.chords_per_bar)
+        windows = _find_ivvi_windows(
+            chord_roots, n_bars=args.n_bars,
+            chords_per_bar=args.chords_per_bar,
+            phase_zero_only=not args.all_phases)
         n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
         for w in windows:
             start_sb = w['start_bar'] * SUBBEATS_PER_BAR
@@ -437,7 +425,10 @@ def cmd_filter(args):
                 'key':        w['key'],
                 'key_name':   ROOT_NAMES[w['key']],
                 'n_bars':     args.n_bars,
-                'bar_roots':  bar_roots[w['start_bar']:w['start_bar'] + args.n_bars],
+                'chord_roots': chord_roots[
+                    w['start_bar'] * args.chords_per_bar:
+                    (w['start_bar'] + args.n_bars) * args.chords_per_bar],
+                'chords_per_bar': args.chords_per_bar,
                 'n_polyphonic_subbeats': n_poly,
             })
             n_windows += 1
@@ -530,7 +521,10 @@ def cmd_extract(args):
 
     n_bars_window     = manifest[0].get('n_bars', N_BARS_WINDOW) if manifest else N_BARS_WINDOW
     n_subbeats_window = n_bars_window * SUBBEATS_PER_BAR
-    print(f'Window length: {n_bars_window} bars ({n_subbeats_window} subbeats)')
+    entry_chords_per_bar = manifest[0].get('chords_per_bar', CHORDS_PER_BAR_DEFAULT) \
+                           if manifest else CHORDS_PER_BAR_DEFAULT
+    print(f'Window length: {n_bars_window} bars ({n_subbeats_window} subbeats),  '
+          f'chords_per_bar={entry_chords_per_bar}')
 
     for entry in manifest:
         midi_path = entry['midi_path']
@@ -578,9 +572,10 @@ def cmd_extract(args):
             win_t = pitch_sort_cp(win_t)
 
             beat_tokens = []
+            sub_per_chord = SUBBEATS_PER_BAR // entry_chords_per_bar
             for sb in range(n_subbeats_window):
-                bar_in_window = sb // SUBBEATS_PER_BAR
-                root = (target_key + OFFSETS[(bar_in_window + phase) % 4]) % 12
+                chord_in_window = sb // sub_per_chord
+                root = (target_key + OFFSETS[(chord_in_window + phase) % 4]) % 12
                 beat_tokens.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
             all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
 
@@ -694,16 +689,16 @@ def main():
     pf.add_argument('--manifest',      required=True)
     pf.add_argument('--max_polyphony', type=int, default=4)
     pf.add_argument('--n_bars',        type=int, default=N_BARS_WINDOW,
-                    help='Window length in bars; must be a multiple of 4. '
-                         'Default 8 (= 2 I-IV-V-I cycles, 128 subbeats).')
+                    help='Window length in bars; n_bars * chords_per_bar must be a '
+                         'multiple of 4. Default 8 (2 I-IV-V-I cycles at chords_per_bar=2).')
+    pf.add_argument('--chords_per_bar', type=int, default=CHORDS_PER_BAR_DEFAULT,
+                    choices=[1, 2, 4],
+                    help='Harmonic rhythm in chords per bar. 2 (default) = 8 subbeats '
+                         'per chord, gives a 2-bar I-IV-V-I cadence; 1 = 16 subbeats '
+                         'per chord, gives a 4-bar cadence.')
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
-    pf.add_argument('--allow_multi_chord_bars', action='store_true',
-                    help='Loose mode: detect one chord per bar from the full-bar '
-                         'chromagram (bars containing two chords get blended into '
-                         'one detected root). Default is strict: detect at half-bar '
-                         'resolution and reject bars whose two halves disagree.')
     pf.add_argument('--min_polyphonic_subbeats', type=int, default=8,
                     help='Reject windows with fewer than this many subbeats that '
                          'have ≥2 simultaneous notes — guarantees the matched '

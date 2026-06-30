@@ -86,11 +86,14 @@ def _extract_all_pcs(tok: torch.Tensor, tokenizer) -> set:
     return pcs
 
 
-def _expected_pc_bar_level(key: int, pos: int) -> int:
-    """Expected root pitch class at absolute subbeat pos under bar-level rule.
-    Chord changes once per bar: chord_root[bar] = (key + OFFSETS[(pos//SUBBEATS_PER_BAR)%4]) % 12
+def _expected_pc_bar_level(key: int, pos: int, chords_per_bar: int = 2) -> int:
+    """Expected root pitch class at absolute subbeat pos.
+    Chord changes every (SUBBEATS_PER_BAR // chords_per_bar) subbeats:
+      chords_per_bar=1 → one chord per bar (16 subbeats per chord)
+      chords_per_bar=2 → two chords per bar (8 subbeats per chord) [default]
     """
-    return (key + OFFSETS[(pos // SUBBEATS_PER_BAR) % 4]) % 12
+    subs_per_chord = SUBBEATS_PER_BAR // chords_per_bar
+    return (key + OFFSETS[(pos // subs_per_chord) % 4]) % 12
 
 
 def _expected_chord_pcs(key: int, pos: int) -> set:

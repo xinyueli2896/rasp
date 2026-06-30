@@ -262,7 +262,11 @@ class CPChordRuleModel(nn.Module):
     d_model:         int   = N_ROOTS + N_POS   # 16
     TRACR_D_MODEL:   int   = N_ROOTS + N_POS   # 16
 
-    def __init__(self, beats_per_bar: int = 16):
+    def __init__(self, beats_per_bar: int = 8):
+        """beats_per_bar = subbeats per chord. At beat_div=4:
+              16 → one chord per bar (slow cadence, one I-IV-V-I per 4 bars)
+              8  → two chords per bar (fast cadence, one I-IV-V-I per 2 bars) [default]
+        """
         super().__init__()
         self.beats_per_bar = beats_per_bar
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))

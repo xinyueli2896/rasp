@@ -317,6 +317,7 @@ def main(args):
         encoder_type      = args.encoder_type,
         rule_mode         = args.rule_mode,
         approach          = args.approach,
+        chords_per_bar    = args.chords_per_bar,
     )
 
     if args.unfreeze_base:
@@ -366,9 +367,14 @@ def main(args):
         unseen_ds.preload(_cache)
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)
+        # beats_per_bar here = subbeats per chord position (rule changes every K subbeats)
+        if args.approach == 'chord':
+            subs_per_chord = 16 // args.chords_per_bar   # 8 at chords_per_bar=2
+        else:
+            subs_per_chord = 4   # bass approach: one root per beat
         unseen_acc_cb = UnseenAccuracyCallback(
             unseen_loader, n_batches=5, n_prompt_beats=32, n_gen_beats=96,
-            beats_per_bar=16 if args.approach == 'chord' else 4,
+            beats_per_bar=subs_per_chord,
         )
         print(f'Unseen eval data: {args.unseen_data}')
 
@@ -491,6 +497,10 @@ def get_args():
                         'chord: regulate the chord progression (all-voice chromagram) with '
                         'CPChordRuleModel. Use --encoder_injected to inject a learned '
                         'ChordEncoder for chord approach training.')
+    p.add_argument('--chords_per_bar', type=int, default=2, choices=[1, 2, 4],
+                   help='Harmonic rhythm. 2 (default) = chord changes every half-bar (8 '
+                        'subbeats at beat_div=4); 1 = chord per bar. Must match the value '
+                        'used to filter the training data.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
