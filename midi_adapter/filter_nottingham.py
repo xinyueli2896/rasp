@@ -390,6 +390,11 @@ def cmd_filter(args):
     from collections import Counter
     examples_per_key = Counter()
     if args.save_examples_dir:
+        # Wipe any examples saved by a previous run so the directory only
+        # contains snippets matching the current filter settings.
+        import shutil
+        if os.path.isdir(args.save_examples_dir):
+            shutil.rmtree(args.save_examples_dir)
         os.makedirs(args.save_examples_dir, exist_ok=True)
 
     for midi_path in files:
