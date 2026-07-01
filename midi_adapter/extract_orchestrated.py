@@ -225,9 +225,24 @@ def main():
             except Exception as e:
                 print(f'  SKIP {midi_path}: load failed — {e}')
                 continue
-            if cp_arr is None or cp_arr.shape[0] < n_subbeats_window:
-                print(f'  SKIP {midi_path}: too short ({0 if cp_arr is None else cp_arr.shape[0]} subbeats)')
+            if cp_arr is None or cp_arr.shape[0] == 0:
+                print(f'  SKIP {midi_path}: empty CP tensor')
                 continue
+
+            # AccoMontage's output has one fewer beat boundary than we need
+            # (get_beats returns positions [0..last_beat] not [0..last_beat+1]),
+            # so we're typically 1-4 subbeats short at the tail. Pad the
+            # missing subbeats with EOS instead of dropping the whole window.
+            # Anything shorter than half a bar is a real truncation → skip.
+            n_missing = n_subbeats_window - cp_arr.shape[0]
+            if n_missing > SUBBEATS_PER_BAR // 2:
+                print(f'  SKIP {midi_path}: too short ({cp_arr.shape[0]} < '
+                      f'{n_subbeats_window - SUBBEATS_PER_BAR // 2})')
+                continue
+            if n_missing > 0:
+                pad = np.full((n_missing, cp_arr.shape[1]), 255, dtype=np.uint8)
+                pad[:, 0] = 254   # EOS at voice 0's program slot per subbeat
+                cp_arr = np.concatenate([cp_arr, pad], axis=0)
 
             window = torch.tensor(cp_arr[:n_subbeats_window].copy(), dtype=torch.uint8)
             window = pitch_sort_cp(window)
