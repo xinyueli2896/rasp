@@ -345,17 +345,25 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
     sec_per_sb = 60.0 / tempo / BEAT_DIV
     any_note   = False
 
+    # Include any note that OVERLAPS the window (not just those starting inside
+    # it). This catches (a) chord notes that begin in the previous bar and are
+    # held into the window's first bar, and (b) notes whose start is a float
+    # microsecond before t_win_start due to quantization drift.
+    eps = 1e-4
     for inst in pm.instruments:
         new_inst = pretty_midi.Instrument(
             program=inst.program, is_drum=inst.is_drum, name=inst.name)
         for note in inst.notes:
-            if note.start < t_win_start or note.start >= t_win_end:
+            if note.end <= t_win_start + eps or note.start >= t_win_end - eps:
                 continue
-            s_abs = int(np.searchsorted(subbeat_times_arr, note.start, side='right')) - 1
-            e_abs = int(np.searchsorted(subbeat_times_arr, note.end,   side='right')) - 1
-            s_loc = s_abs - start_sb
+            # Clamp the note to the window and snap onto the subbeat grid.
+            clip_start = max(note.start, t_win_start)
+            clip_end   = min(note.end,   t_win_end)
+            s_abs = int(np.searchsorted(subbeat_times_arr, clip_start + eps, side='right')) - 1
+            e_abs = int(np.searchsorted(subbeat_times_arr, clip_end   + eps, side='right')) - 1
+            s_loc = max(0, s_abs - start_sb)
             e_loc = max(s_loc + 1, min(e_abs - start_sb, n_bars * SUBBEATS_PER_BAR))
-            if s_loc < 0 or s_loc >= n_bars * SUBBEATS_PER_BAR:
+            if s_loc >= n_bars * SUBBEATS_PER_BAR:
                 continue
             new_inst.notes.append(pretty_midi.Note(
                 velocity = note.velocity,
