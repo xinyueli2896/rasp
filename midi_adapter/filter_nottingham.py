@@ -308,7 +308,18 @@ def _save_midi_example(cp_data: np.ndarray, start_bar: int, n_bars: int,
 def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
                                    out_path: str,
                                    align_to_downbeat: bool = True,
+                                   quantize: bool = True,
                                    tempo: float = 120.0) -> bool:
+    """Slice bars [start_bar, start_bar + n_bars) from the source MIDI.
+
+    align_to_downbeat: anchor bar 0 to pm.get_downbeats()[0] (default True).
+    quantize:
+        True  → snap every note's start/end to the subbeat grid built by
+                interpolating pm.get_beats(); render at fixed 120 BPM.
+        False → pure cut: original note times are preserved (only shifted by
+                -t_win_start) and the source's tempo is kept so the snippet
+                sounds identical to the original in that time range.
+    """
     pm = pretty_midi.PrettyMIDI(midi_path)
     beats = pm.get_beats()
     if len(beats) < 2:
@@ -324,7 +335,49 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
     if start_beat_idx >= len(beats) - 1:
         return False
 
-    # Build the aligned subbeat grid (same as _load_midi_aligned).
+    # Compute the window boundaries in original-tempo seconds.
+    start_beat = start_bar * BEATS_PER_BAR
+    end_beat   = start_beat + n_bars * BEATS_PER_BAR
+    idx_start  = start_beat_idx + start_beat
+    idx_end    = start_beat_idx + end_beat
+    if idx_end > len(beats) - 1:
+        return False
+    t_win_start = float(beats[idx_start])
+    if idx_end < len(beats):
+        t_win_end = float(beats[idx_end])
+    else:
+        # Extrapolate one beat past the last beat using its local tempo.
+        t_win_end = float(beats[-1] + (beats[-1] - beats[-2]))
+
+    eps = 1e-4
+
+    if not quantize:
+        # Pure cut: preserve original note timings + tempo, no grid snapping.
+        tempos, _ = pm.get_tempo_changes()
+        src_tempo = float(tempos[0]) if len(tempos) else 120.0
+        out_pm    = pretty_midi.PrettyMIDI(initial_tempo=src_tempo)
+        any_note  = False
+        for inst in pm.instruments:
+            new_inst = pretty_midi.Instrument(
+                program=inst.program, is_drum=inst.is_drum, name=inst.name)
+            for note in inst.notes:
+                if note.end <= t_win_start + eps or note.start >= t_win_end - eps:
+                    continue
+                new_inst.notes.append(pretty_midi.Note(
+                    velocity = note.velocity,
+                    pitch    = note.pitch,
+                    start    = max(0.0, note.start - t_win_start),
+                    end      = max(1e-4, min(note.end, t_win_end) - t_win_start),
+                ))
+            if new_inst.notes:
+                out_pm.instruments.append(new_inst)
+                any_note = True
+        if not any_note:
+            return False
+        out_pm.write(out_path)
+        return True
+
+    # Quantized path: snap onto the interpolated 16th-note grid, render at 120.
     subbeat_times: list[float] = []
     for i in range(start_beat_idx, len(beats) - 1):
         dt = (beats[i + 1] - beats[i]) / BEAT_DIV
@@ -337,26 +390,17 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
     end_sb   = start_sb + n_bars * SUBBEATS_PER_BAR
     if end_sb > len(subbeat_times_arr):
         return False
-    t_win_start = subbeat_times_arr[start_sb]
-    t_win_end   = subbeat_times_arr[end_sb] if end_sb < len(subbeat_times_arr) \
-                  else subbeat_times_arr[-1]
 
     out_pm     = pretty_midi.PrettyMIDI(initial_tempo=tempo)
     sec_per_sb = 60.0 / tempo / BEAT_DIV
     any_note   = False
 
-    # Include any note that OVERLAPS the window (not just those starting inside
-    # it). This catches (a) chord notes that begin in the previous bar and are
-    # held into the window's first bar, and (b) notes whose start is a float
-    # microsecond before t_win_start due to quantization drift.
-    eps = 1e-4
     for inst in pm.instruments:
         new_inst = pretty_midi.Instrument(
             program=inst.program, is_drum=inst.is_drum, name=inst.name)
         for note in inst.notes:
             if note.end <= t_win_start + eps or note.start >= t_win_end - eps:
                 continue
-            # Clamp the note to the window and snap onto the subbeat grid.
             clip_start = max(note.start, t_win_start)
             clip_end   = min(note.end,   t_win_end)
             s_abs = int(np.searchsorted(subbeat_times_arr, clip_start + eps, side='right')) - 1
@@ -686,7 +730,8 @@ def cmd_leadsheets(args):
         try:
             if _save_original_tracks_snippet(
                     midi_path, start_bar, n_bars, out,
-                    align_to_downbeat=not args.no_align):
+                    align_to_downbeat=not args.no_align,
+                    quantize          = not args.no_quantize):
                 per_key[key] += 1
                 n_saved += 1
         except Exception as e:
@@ -770,6 +815,11 @@ def main():
     pl.add_argument('--no_align',      action='store_true',
                     help='Skip downbeat alignment / 4/4 check (use for POP909 etc.). '
                          'Must match the --no_align used in the filter step.')
+    pl.add_argument('--no_quantize',   action='store_true',
+                    help='Pure time-based cut: keep original note timings AND the '
+                         'source tempo. When set the snippet plays back exactly like '
+                         'the corresponding time range of the source file, no '
+                         'snapping to a 16th-note grid.')
     pl.add_argument('--limit',         type=int, default=0,
                     help='Cap total snippets saved (0 = no cap).')
     pl.add_argument('--per_key',       type=int, default=0,
