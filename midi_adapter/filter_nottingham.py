@@ -74,32 +74,43 @@ CHORDS_PER_BAR_DEFAULT = 2
 #   3. Quantizes every note onset/offset to that grid and writes a CP tensor
 # ---------------------------------------------------------------------------
 
-def _load_midi_aligned(midi_path: str, max_polyphony: int = 4) -> np.ndarray | None:
-    """Load a MIDI, align bar 0 to the first downbeat, quantize to 16th-note
-    subbeats (using the file's own tempo curve), and return a CP tensor.
+def _load_midi_aligned(midi_path: str, max_polyphony: int = 4,
+                        align_to_downbeat: bool = True) -> np.ndarray | None:
+    """Load a MIDI, quantize to 16th-note subbeats (using the file's own tempo
+    curve), and return a CP tensor.
 
-    Returns None if the file is not in pure 4/4 — Nottingham contains many 3/4
-    waltzes and 6/8 jigs that would otherwise be misinterpreted as 4/4 by the
-    BEATS_PER_BAR=4 segmenter."""
+    align_to_downbeat=True (default, for Nottingham/folk):
+        Bar 0 starts at pm.get_downbeats()[0], so any pickup / anacrusis is
+        skipped. Files not in pure 4/4 are rejected.
+
+    align_to_downbeat=False (for datasets already well-adjusted, e.g. POP909):
+        Bar 0 starts at pm.get_beats()[0]. No downbeat search, no time-sig
+        rejection — trust the file's timing.
+    """
     pm = pretty_midi.PrettyMIDI(midi_path)
 
-    # Reject anything that isn't pure 4/4. An empty time_signature_changes list
-    # defaults to 4/4 in MIDI semantics, so we accept that.
-    ts_changes = pm.time_signature_changes
-    for ts in ts_changes:
-        if ts.numerator != 4 or ts.denominator != 4:
-            return None
+    if align_to_downbeat:
+        # Reject anything that isn't pure 4/4. An empty time_signature_changes
+        # list defaults to 4/4 in MIDI semantics, so we accept that.
+        for ts in pm.time_signature_changes:
+            if ts.numerator != 4 or ts.denominator != 4:
+                return None
 
-    beats     = pm.get_beats()
-    downbeats = pm.get_downbeats()
-    if len(beats) < 2 or len(downbeats) == 0:
+    beats = pm.get_beats()
+    if len(beats) < 2:
         return None
 
-    t_start_db = downbeats[0]
-    # First beat at or after the first downbeat (anchors bar 0 on the downbeat).
-    start_beat_idx = int(np.searchsorted(beats, t_start_db - 1e-9, side='left'))
+    if align_to_downbeat:
+        downbeats = pm.get_downbeats()
+        if len(downbeats) == 0:
+            return None
+        t_start_db = downbeats[0]
+        start_beat_idx = int(np.searchsorted(beats, t_start_db - 1e-9, side='left'))
+    else:
+        start_beat_idx = 0
     if start_beat_idx >= len(beats) - 1:
         return None
+    t_start_db = beats[start_beat_idx]
 
     # Build subbeat times by interpolating BEAT_DIV positions inside each beat.
     subbeat_times: list[float] = []
@@ -399,7 +410,11 @@ def cmd_filter(args):
 
     for midi_path in files:
         try:
-            cp_data = _load_midi_aligned(midi_path, max_polyphony=args.max_polyphony)
+            cp_data = _load_midi_aligned(
+                midi_path,
+                max_polyphony     = args.max_polyphony,
+                align_to_downbeat = not args.no_align,
+            )
         except Exception as e:
             n_skipped += 1
             print(f'  SKIP {os.path.basename(midi_path)}: {e}')
@@ -535,7 +550,11 @@ def cmd_extract(args):
         midi_path = entry['midi_path']
         if midi_path not in cp_cache:
             try:
-                cp_arr = _load_midi_aligned(midi_path, max_polyphony=args.max_polyphony)
+                cp_arr = _load_midi_aligned(
+                    midi_path,
+                    max_polyphony     = args.max_polyphony,
+                    align_to_downbeat = not args.no_align,
+                )
             except Exception as e:
                 print(f'  SKIP {midi_path}: {e}')
                 cp_cache[midi_path] = None
@@ -647,7 +666,10 @@ def cmd_leadsheets(args):
         if midi_path not in cp_cache:
             try:
                 cp_cache[midi_path] = _load_midi_aligned(
-                    midi_path, max_polyphony=args.max_polyphony)
+                    midi_path,
+                    max_polyphony     = args.max_polyphony,
+                    align_to_downbeat = not args.no_align,
+                )
             except Exception as e:
                 print(f'  SKIP {midi_path}: {e}')
                 cp_cache[midi_path] = None
@@ -704,6 +726,11 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
+    pf.add_argument('--no_align',      action='store_true',
+                    help='Skip downbeat alignment and the 4/4 time-signature check. '
+                         'Bar 0 starts at pm.get_beats()[0]. Use for datasets that '
+                         'are already well-adjusted (e.g. POP909) where every song '
+                         'starts on the downbeat and quantization is clean.')
     pf.add_argument('--min_polyphonic_subbeats', type=int, default=8,
                     help='Reject windows with fewer than this many subbeats that '
                          'have ≥2 simultaneous notes — guarantees the matched '
@@ -722,6 +749,9 @@ def main():
     pe.add_argument('--out_pt',         required=True)
     pe.add_argument('--max_polyphony',  type=int, default=4)
     pe.add_argument('--min_notes_per_bar', type=int, default=2)
+    pe.add_argument('--no_align',       action='store_true',
+                    help='Skip downbeat alignment / 4/4 check (use for POP909 etc.). '
+                         'Must match the --no_align used in the filter step.')
     pe.add_argument('--target_keys',    type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
                     help='Pitch classes (0-11) to transpose every window into. Each '
                          'original window is duplicated len(target_keys) times, one per '
@@ -736,6 +766,9 @@ def main():
     pl.add_argument('--manifest',      required=True)
     pl.add_argument('--out_dir',       required=True)
     pl.add_argument('--max_polyphony', type=int, default=4)
+    pl.add_argument('--no_align',      action='store_true',
+                    help='Skip downbeat alignment / 4/4 check (use for POP909 etc.). '
+                         'Must match the --no_align used in the filter step.')
     pl.add_argument('--limit',         type=int, default=0,
                     help='Cap total snippets saved (0 = no cap).')
     pl.add_argument('--per_key',       type=int, default=0,
