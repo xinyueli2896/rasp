@@ -299,6 +299,81 @@ def _save_midi_example(cp_data: np.ndarray, start_bar: int, n_bars: int,
 
 
 # ---------------------------------------------------------------------------
+# Snippet writer — preserves the source MIDI's track structure. Every
+# instrument keeps its program, name, drum flag; only the notes get sliced to
+# bars [start_bar, start_bar + n_bars) and quantized onto the same downbeat-
+# aligned 16th-note grid used by _load_midi_aligned. Rendered at 120 BPM.
+# ---------------------------------------------------------------------------
+
+def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
+                                   out_path: str,
+                                   align_to_downbeat: bool = True,
+                                   tempo: float = 120.0) -> bool:
+    pm = pretty_midi.PrettyMIDI(midi_path)
+    beats = pm.get_beats()
+    if len(beats) < 2:
+        return False
+
+    if align_to_downbeat:
+        downbeats = pm.get_downbeats()
+        if len(downbeats) == 0:
+            return False
+        start_beat_idx = int(np.searchsorted(beats, downbeats[0] - 1e-9, side='left'))
+    else:
+        start_beat_idx = 0
+    if start_beat_idx >= len(beats) - 1:
+        return False
+
+    # Build the aligned subbeat grid (same as _load_midi_aligned).
+    subbeat_times: list[float] = []
+    for i in range(start_beat_idx, len(beats) - 1):
+        dt = (beats[i + 1] - beats[i]) / BEAT_DIV
+        for j in range(BEAT_DIV):
+            subbeat_times.append(beats[i] + j * dt)
+    subbeat_times.append(float(beats[-1]))
+    subbeat_times_arr = np.asarray(subbeat_times)
+
+    start_sb = start_bar * SUBBEATS_PER_BAR
+    end_sb   = start_sb + n_bars * SUBBEATS_PER_BAR
+    if end_sb > len(subbeat_times_arr):
+        return False
+    t_win_start = subbeat_times_arr[start_sb]
+    t_win_end   = subbeat_times_arr[end_sb] if end_sb < len(subbeat_times_arr) \
+                  else subbeat_times_arr[-1]
+
+    out_pm     = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    sec_per_sb = 60.0 / tempo / BEAT_DIV
+    any_note   = False
+
+    for inst in pm.instruments:
+        new_inst = pretty_midi.Instrument(
+            program=inst.program, is_drum=inst.is_drum, name=inst.name)
+        for note in inst.notes:
+            if note.start < t_win_start or note.start >= t_win_end:
+                continue
+            s_abs = int(np.searchsorted(subbeat_times_arr, note.start, side='right')) - 1
+            e_abs = int(np.searchsorted(subbeat_times_arr, note.end,   side='right')) - 1
+            s_loc = s_abs - start_sb
+            e_loc = max(s_loc + 1, min(e_abs - start_sb, n_bars * SUBBEATS_PER_BAR))
+            if s_loc < 0 or s_loc >= n_bars * SUBBEATS_PER_BAR:
+                continue
+            new_inst.notes.append(pretty_midi.Note(
+                velocity = note.velocity,
+                pitch    = note.pitch,
+                start    = s_loc * sec_per_sb,
+                end      = e_loc * sec_per_sb,
+            ))
+        if new_inst.notes:
+            out_pm.instruments.append(new_inst)
+            any_note = True
+
+    if not any_note:
+        return False
+    out_pm.write(out_path)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Polyphony check — Structured-Arrangement needs both melody and chord. A
 # window with no polyphony (all subbeats have ≤1 note) can't be split into
 # melody+chord and is rejected by the filter.
@@ -459,8 +534,9 @@ def cmd_filter(args):
                     f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
                 )
                 try:
-                    if _save_leadsheet_snippet(cp_data, w['start_bar'], args.n_bars,
-                                               out, max_polyphony=args.max_polyphony):
+                    if _save_original_tracks_snippet(
+                            midi_path, w['start_bar'], args.n_bars, out,
+                            align_to_downbeat=not args.no_align):
                         examples_per_key[w['key']] += 1
                 except Exception as e:
                     print(f'  example-save failed for {midi_path}: {e}')
@@ -737,9 +813,13 @@ def main():
                          'window has enough chord content to split into melody '
                          '+ chord tracks for Structured-Arrangement input.')
     pf.add_argument('--save_examples_dir', type=str, default=None,
-                    help='If set, save 2-track lead-sheet snippets (track 0 = '
-                         'skyline melody, track 1 = chord) of qualifying windows '
-                         'here so you can verify the melody/chord split.')
+                    help='If set, save snippets of qualifying windows here. Track '
+                         'structure is preserved exactly (every source instrument '
+                         'stays on its own track with original program/name). Notes '
+                         'are quantized onto the same 16th-note grid as the CP tensor '
+                         'and rendered at 120 BPM. Wiped at the start of each run. '
+                         '(For skyline melody/chord snippets, use the `leadsheets` '
+                         'subcommand.)')
     pf.add_argument('--examples_per_key',  type=int, default=3,
                     help='Cap on saved examples per detected key (default 3).')
 
