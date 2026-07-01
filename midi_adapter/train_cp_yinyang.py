@@ -33,8 +33,8 @@ from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
 
-TRAIN_LENGTH = 128
-MAX_STEPS    = 100_000
+DEFAULT_TRAIN_LENGTH = 64   # 4 bars × 16 subbeats at beat_div=4
+MAX_STEPS            = 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -335,12 +335,12 @@ def main(args):
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
 
-    train_ds = BassFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+    train_ds = BassFramedDataset(args.train_data, args.train_length, args.batch_size,
                                   split=args.train_split, sample_step=SUBBEATS_PER_BAR)
     train_ds.preload(_cache)
 
     if args.pretrain_data and os.path.exists(args.pretrain_data):
-        pretrain_ds = BassFramedDataset(args.pretrain_data, TRAIN_LENGTH, args.batch_size,
+        pretrain_ds = BassFramedDataset(args.pretrain_data, args.train_length, args.batch_size,
                                         split=args.train_split, sample_step=SUBBEATS_PER_BAR)
         pretrain_ds.preload(_cache)
         effective_train_ds = InterleavedDataset(pretrain_ds, train_ds)
@@ -348,7 +348,7 @@ def main(args):
     else:
         effective_train_ds = train_ds
 
-    val_ds = BassFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+    val_ds = BassFramedDataset(args.val_data, args.train_length, args.batch_size,
                                 split=args.val_split, sample_step=SUBBEATS_PER_BAR,
                                 repeat=True)
     val_ds.preload(_cache)
@@ -361,7 +361,7 @@ def main(args):
     val_loaders   = [val_loader]
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
-        unseen_ds = BassFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
+        unseen_ds = BassFramedDataset(args.unseen_data, args.train_length, args.batch_size,
                                        split='val', sample_step=SUBBEATS_PER_BAR,
                                        repeat=True)
         unseen_ds.preload(_cache)
@@ -373,7 +373,9 @@ def main(args):
         else:
             subs_per_chord = 4   # bass approach: one root per beat
         unseen_acc_cb = UnseenAccuracyCallback(
-            unseen_loader, n_batches=5, n_prompt_beats=32, n_gen_beats=96,
+            unseen_loader, n_batches=5,
+            n_prompt_beats=args.train_length // 4,
+            n_gen_beats   =args.train_length - args.train_length // 4,
             beats_per_bar=subs_per_chord,
         )
         print(f'Unseen eval data: {args.unseen_data}')
@@ -467,6 +469,9 @@ def get_args():
     p.add_argument('--model_size',         type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',         type=int, default=8)
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
+    p.add_argument('--train_length',       type=int, default=DEFAULT_TRAIN_LENGTH,
+                   help='Subbeats per training window. Must be ≤ the shortest song '
+                        'in the dataset. Default 64 (= 4 bars at beat_div=4).')
     p.add_argument('--val_check_interval', type=int, default=500)
     p.add_argument('--adapter_rank',       type=int, default=256)
     p.add_argument('--n_skip',             type=int, default=4)
