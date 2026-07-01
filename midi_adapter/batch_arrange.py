@@ -36,9 +36,16 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sys
 
 import numpy as np
 import pretty_midi as pyd
+
+# When invoked by full path (`python /path/to/batch_arrange.py`), Python only
+# adds the SCRIPT's directory to sys.path — not the cwd. Since the user is
+# expected to run this from INSIDE the Structured-Arrangement-Code repo, we
+# add cwd so `arrangement_utils` (and its subpackages) are importable.
+sys.path.insert(0, os.getcwd())
 
 # These imports require the Structured-Arrangement-Code repo on PYTHONPATH.
 from arrangement_utils import (   # type: ignore[import-not-found]
