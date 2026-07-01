@@ -1,0 +1,187 @@
+"""
+Convert batch_orchestrate output into a CP tensor training dataset.
+
+Walks the AccoMontage output directory (one subfolder per snippet, each
+containing `arrangement_band-NN.mid` files) and:
+
+  1. Reads each band arrangement as a multi-instrument MIDI
+  2. Aligns / quantizes it to 16th-note subbeats (AccoMontage renders at
+     120 BPM constant, so we skip downbeat alignment — the first beat is
+     already the bar start)
+  3. Truncates to n_bars * SUBBEATS_PER_BAR subbeats (extra bars AccoMontage
+     may append at the end are dropped)
+  4. Transposes each window into every target_key using the smallest signed
+     semitone shift (default = 10 seen keys, excluding F# and G# reserved
+     for unseen-key evaluation)
+  5. Emits the same 5 dataset files the trainer already knows how to load:
+       {out_pt}.pt                     concatenated CP tensor
+       {out_pt}.length.pt              per-window length
+       {out_pt}.pitch_shift_range.pt   [0, 0] each (no runtime augmentation)
+       {out_pt}.beat_chords.pt         subbeat-level chord tokens
+       {out_pt}.txt                    index -> source filename mapping
+
+Original key is parsed from the subfolder name (which is stamped by
+`filter_nottingham leadsheets` in the pattern `..._key{X}_phase{P}_...`).
+
+Usage
+-----
+Training-data (10 seen keys, excluding F#/G#):
+    python -m midi_adapter.extract_orchestrated \\
+        --in_dir  /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt  /path/to/data/pop909_orch_seen
+
+Unseen-eval data (only F# and G#):
+    python -m midi_adapter.extract_orchestrated \\
+        --in_dir  /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt  /path/to/data/pop909_orch_unseen \\
+        --target_keys 6 8
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import sys
+
+import numpy as np
+import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from midi_adapter.filter_nottingham import (
+    _load_midi_aligned,
+    _signed_shift,
+    _transpose_window,
+    SEEN_KEYS_DEFAULT,
+    ROOT_NAMES,
+)
+from midi_adapter.generate_synthetic_bass import (
+    pitch_sort_cp,
+    SUBBEATS_PER_BAR, OFFSETS,
+)
+from midi_adapter.chord_tokenizer import chord_str_to_token
+
+
+_KEY_STR_TO_PC = {name: i for i, name in enumerate(ROOT_NAMES)}
+
+# Match `_keyG_`, `_keyC#_`, etc. — the pattern used by leadsheets output.
+_KEY_RE = re.compile(r'_key([A-G]#?)_')
+
+
+def _key_from_folder(folder_name: str) -> int | None:
+    m = _KEY_RE.search(folder_name)
+    if not m:
+        return None
+    return _KEY_STR_TO_PC.get(m.group(1))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--in_dir',    required=True,
+                   help='Root of batch_orchestrate output '
+                        '(one subfolder per song, containing arrangement_band-*.mid)')
+    p.add_argument('--out_pt',    required=True,
+                   help='Output prefix (e.g. /path/to/data/pop909_orch_seen)')
+    p.add_argument('--n_bars',        type=int, default=4)
+    p.add_argument('--max_polyphony', type=int, default=16,
+                   help='Voice slots per subbeat in the saved CP tensor. Default '
+                        '16 matches the base LA-pretrained CP transformer.')
+    p.add_argument('--chords_per_bar', type=int, default=2, choices=[1, 2, 4])
+    p.add_argument('--phase',         type=int, default=0,
+                   help='I-IV-V-I phase for the chord-token stream (all filter '
+                        'matches are saved at phase=0 by default).')
+    p.add_argument('--target_keys', type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
+                   help='Keys (pitch classes 0-11) to transpose each window into. '
+                        'Default = 10 seen keys (excluding F#/G#).')
+    p.add_argument('--band_pattern', type=str, default='arrangement_band-*.mid',
+                   help='Glob pattern for the orchestrated MIDIs to pick up '
+                        'inside each song folder.')
+    args = p.parse_args()
+
+    subfolders = sorted(
+        os.path.join(args.in_dir, d) for d in os.listdir(args.in_dir)
+        if os.path.isdir(os.path.join(args.in_dir, d))
+    )
+    print(f'Scanning {len(subfolders)} song folders under {args.in_dir}')
+
+    n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
+    sub_per_chord     = SUBBEATS_PER_BAR // args.chords_per_bar
+
+    # Pre-build the chord-token stream for each target key (phase is fixed).
+    chord_tokens_by_key: dict[int, torch.Tensor] = {}
+    for target_key in args.target_keys:
+        toks = []
+        for sb in range(n_subbeats_window):
+            chord_in_window = sb // sub_per_chord
+            root = (target_key + OFFSETS[(chord_in_window + args.phase) % 4]) % 12
+            toks.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
+        chord_tokens_by_key[target_key] = torch.tensor(toks, dtype=torch.int16)
+
+    all_data:   list[torch.Tensor] = []
+    all_chords: list[torch.Tensor] = []
+    txt_lines:  list[str] = []
+    per_key_counts: dict[int, int] = {k: 0 for k in args.target_keys}
+    n_saved   = 0
+    n_scanned = 0
+
+    for folder in subfolders:
+        base_key = _key_from_folder(os.path.basename(folder))
+        if base_key is None:
+            print(f'  SKIP {folder}: cannot parse key from folder name')
+            continue
+
+        for midi_path in sorted(glob.glob(os.path.join(folder, args.band_pattern))):
+            n_scanned += 1
+            try:
+                cp_arr = _load_midi_aligned(
+                    midi_path,
+                    max_polyphony     = args.max_polyphony,
+                    align_to_downbeat = False,
+                )
+            except Exception as e:
+                print(f'  SKIP {midi_path}: load failed — {e}')
+                continue
+            if cp_arr is None or cp_arr.shape[0] < n_subbeats_window:
+                print(f'  SKIP {midi_path}: too short ({0 if cp_arr is None else cp_arr.shape[0]} subbeats)')
+                continue
+
+            window = torch.tensor(cp_arr[:n_subbeats_window].copy(), dtype=torch.uint8)
+            window = pitch_sort_cp(window)
+
+            for target_key in args.target_keys:
+                shift = _signed_shift(target_key, base_key)
+                win_t = _transpose_window(window, shift)
+                if win_t is None:
+                    continue   # clip would push notes outside MIDI [0, 127]
+                win_t = pitch_sort_cp(win_t)
+
+                all_data.append(win_t)
+                all_chords.append(chord_tokens_by_key[target_key])
+                rel = f'{os.path.relpath(midi_path, args.in_dir)}#key{ROOT_NAMES[target_key]}'
+                txt_lines.append(f'{n_saved}\t{rel}')
+                per_key_counts[target_key] += 1
+                n_saved += 1
+
+    if n_saved == 0:
+        print('No windows produced. Check --n_bars and folder naming.')
+        return
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out_pt)) or '.', exist_ok=True)
+    torch.save(torch.cat(all_data, dim=0),                    f'{args.out_pt}.pt')
+    torch.save(torch.tensor([n_subbeats_window] * n_saved),   f'{args.out_pt}.length.pt')
+    torch.save(torch.zeros(n_saved, 2, dtype=torch.int8),     f'{args.out_pt}.pitch_shift_range.pt')
+    torch.save(all_chords,                                     f'{args.out_pt}.beat_chords.pt')
+    with open(f'{args.out_pt}.txt', 'w') as f:
+        f.write('\n'.join(txt_lines) + '\n')
+
+    print(f'\nScanned {n_scanned} band MIDIs, saved {n_saved} windows.')
+    print(f'Dataset → {args.out_pt}.{{pt,length.pt,pitch_shift_range.pt,beat_chords.pt,txt}}')
+    print('Per-key window counts:')
+    for k in sorted(per_key_counts):
+        print(f'  {ROOT_NAMES[k]:<4} {per_key_counts[k]}')
+
+
+if __name__ == '__main__':
+    main()
