@@ -353,8 +353,9 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
 
     if not quantize:
         # Pure cut: preserve original note timings + tempo, no grid snapping.
-        tempos, _ = pm.get_tempo_changes()
-        src_tempo = float(tempos[0]) if len(tempos) else 120.0
+        # pm.get_tempo_changes() returns (times, tempi) — take the tempo values.
+        _, tempi = pm.get_tempo_changes()
+        src_tempo = float(tempi[0]) if len(tempi) and tempi[0] > 0 else 120.0
         out_pm    = pretty_midi.PrettyMIDI(initial_tempo=src_tempo)
         any_note  = False
         for inst in pm.instruments:
