@@ -90,8 +90,16 @@ def main():
         files = files[:args.limit]
     print(f'Found {len(files)} lead-sheet snippets in {args.in_dir}')
 
-    # Single phrase covering the whole window (their format: <letter><bar_count>).
-    segmentation = f'A{args.n_bars}'
+    # AccoMontage's dp_search only assigns its `topk` variable inside the
+    # multi-phrase loop, so a single-phrase segmentation (e.g. 'A4') crashes
+    # with UnboundLocalError. Force at least 2 phrases by splitting n_bars in
+    # half (n_bars=4 → 'A2A2', n_bars=8 → 'A4A4', etc.). Phrase lengths must
+    # be at least 2 because their acc_pool starts at length 2.
+    if args.n_bars % 2 != 0 or args.n_bars < 4:
+        raise SystemExit(f'n_bars must be even and ≥ 4 (got {args.n_bars}) — '
+                         f'AccoMontage needs ≥2 phrases each ≥2 bars.')
+    half         = args.n_bars // 2
+    segmentation = f'A{half}A{half}'
 
     n_ok = 0
     for i, fname in enumerate(files):
