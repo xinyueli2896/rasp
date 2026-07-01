@@ -8,9 +8,18 @@ just want to fan them out into instrumental band arrangements.
 
 Track detection (case-insensitive on `inst.name`):
   * Melody   — track 0 OR name containing "melody" / "mel" / "lead"
-               → used as the melody overlay in the final MIDI; NOT sent to Stage 2
-  * Everything else (piano, bridge, chord, unnamed, ...)
+               → overlaid as track 0 of the final MIDI; NOT sent to Stage 2
+  * Chord    — name containing "chord" / "chd" / "harmony"
+               → merged into acc_piano AND appended verbatim as extra tracks
+                 at the end of the final MIDI so the original chord voicing
+                 is preserved alongside the orchestrated band
+  * Everything else (piano, bridge, unnamed, ...)
                → merged into acc_piano and fed to the orchestrator
+
+Final track layout per song:
+  0            melody          (from the snippet)
+  1..N         orchestrated    (Stage 2 output)
+  N+1..end     original chord(s) (from the snippet, preserved verbatim)
 
 Setup
 -----
@@ -44,6 +53,7 @@ from arrangement_utils import load_premise, prompt_sampling, orchestration   # t
 
 
 MELODY_KEYWORDS = ('melody', 'mel', 'lead')
+CHORD_KEYWORDS  = ('chord', 'chd', 'harmony')
 SUBBEATS_PER_BAR = 16   # 4 beats × 4 subbeats per beat (ACC=4 in their code)
 SEG_BARS         = 2    # AccoMontage's orchestrator operates on 2-bar segments
 
@@ -51,6 +61,11 @@ SEG_BARS         = 2    # AccoMontage's orchestrator operates on 2-bar segments
 def _is_melody_track(inst: pyd.Instrument, track_id: int) -> bool:
     name = (inst.name or '').lower().strip()
     return track_id == 0 or any(kw in name for kw in MELODY_KEYWORDS)
+
+
+def _is_chord_track(inst: pyd.Instrument) -> bool:
+    name = (inst.name or '').lower().strip()
+    return any(kw in name for kw in CHORD_KEYWORDS)
 
 
 def _pm_to_acc_piano(pm: pyd.PrettyMIDI, n_bars: int) -> np.ndarray:
@@ -97,12 +112,19 @@ def _pm_to_acc_piano(pm: pyd.PrettyMIDI, n_bars: int) -> np.ndarray:
     return merged[:n_segments * T_per_seg].reshape(n_segments, T_per_seg, 128)
 
 
-def _extract_melody_notes(pm: pyd.PrettyMIDI, n_bars: int) -> list[pyd.Note]:
-    """Return the melody track's notes, clipped to the first n_bars*SUBBEATS_PER_BAR
-    subbeats. Uses the same subbeat grid as _pm_to_acc_piano so overlay lines up."""
+def _extract_overlay_tracks(pm: pyd.PrettyMIDI, n_bars: int
+                             ) -> tuple[list[pyd.Note], list[pyd.Instrument]]:
+    """Pull out tracks we want to overlay verbatim on the orchestrated output:
+       - The melody (first matching track only).
+       - Every chord track (preserved individually so multiple chord voicings
+         in the source stay separate on the output).
+
+    Notes are clipped to the first n_bars*SUBBEATS_PER_BAR subbeats using the
+    same beat grid as _pm_to_acc_piano so the overlay lines up with Stage 2's
+    output."""
     beats = pm.get_beats()
     if len(beats) < 2:
-        return []
+        return [], []
     beats = np.append(beats, beats[-1] + (beats[-1] - beats[-2]))
     ACC   = SUBBEATS_PER_BAR // 4
     total_subbeats = n_bars * SUBBEATS_PER_BAR
@@ -111,12 +133,25 @@ def _extract_melody_notes(pm: pyd.PrettyMIDI, n_bars: int) -> list[pyd.Note]:
     quaver = quantize(np.arange(total_subbeats + 1))
     t_end = float(quaver[-1])
 
+    def _clip(inst: pyd.Instrument) -> list[pyd.Note]:
+        return [pyd.Note(velocity=n.velocity, pitch=n.pitch,
+                         start=n.start, end=min(n.end, t_end))
+                for n in inst.notes if n.start < t_end]
+
+    mel_notes: list[pyd.Note] = []
+    chord_insts: list[pyd.Instrument] = []
     for i, inst in enumerate(pm.instruments):
-        if _is_melody_track(inst, i):
-            return [pyd.Note(velocity=n.velocity, pitch=n.pitch,
-                             start=n.start, end=min(n.end, t_end))
-                    for n in inst.notes if n.start < t_end]
-    return []
+        if not mel_notes and _is_melody_track(inst, i):
+            mel_notes = _clip(inst)
+        elif _is_chord_track(inst):
+            clipped = _clip(inst)
+            if clipped:
+                new_inst = pyd.Instrument(program=inst.program,
+                                          is_drum=inst.is_drum,
+                                          name=inst.name or 'Chord')
+                new_inst.notes = clipped
+                chord_insts.append(new_inst)
+    return mel_notes, chord_insts
 
 
 def main():
@@ -164,9 +199,9 @@ def main():
         shutil.copy(src, os.path.join(song_dir, 'lead sheet.mid'))
 
         try:
-            pm         = pyd.PrettyMIDI(src)
-            acc_piano  = _pm_to_acc_piano(pm, n_bars=args.n_bars)
-            mel_notes  = _extract_melody_notes(pm, n_bars=args.n_bars)
+            pm                       = pyd.PrettyMIDI(src)
+            acc_piano                = _pm_to_acc_piano(pm, n_bars=args.n_bars)
+            mel_notes, chord_insts   = _extract_overlay_tracks(pm, n_bars=args.n_bars)
         except Exception as e:
             print(f'  SKIP {fname}: acc_piano build failed — {e}')
             continue
@@ -187,7 +222,9 @@ def main():
             mel_track = pyd.Instrument(program=82, is_drum=False, name='melody')
             mel_track.notes = mel_notes
             for idx, piece in enumerate(midi_collection):
-                piece.instruments = [mel_track] + piece.instruments
+                # Layout: track 0 = original melody; tracks 1..N = orchestrated
+                # band; tracks N+1... = original chord track(s) from the snippet.
+                piece.instruments = [mel_track] + piece.instruments + chord_insts
                 piece.write(os.path.join(song_dir, f'arrangement_band-{idx:02d}.mid'))
         except Exception as e:
             print(f'  SKIP {fname}: Stage 2 failed — {e}')
