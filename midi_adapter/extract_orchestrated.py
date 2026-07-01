@@ -23,18 +23,38 @@ containing `arrangement_band-NN.mid` files) and:
 Original key is parsed from the subfolder name (which is stamped by
 `filter_nottingham leadsheets` in the pattern `..._key{X}_phase{P}_...`).
 
-Usage
------
-Training-data (10 seen keys, excluding F#/G#):
-    python -m midi_adapter.extract_orchestrated \\
-        --in_dir  /path/to/pop909_ivvi_orchestrated_s2only \\
-        --out_pt  /path/to/data/pop909_orch_seen
+Song-level vs key-level eval — both axes are independent:
+  * --target_keys        which pitch classes to transpose into
+                         (default 10 seen keys, use `6 8` for unseen keys)
+  * --val_song_frac      hold out entire source songs for out-of-song eval
+                         (same seed → same partition; run with --split train,
+                         then --split val to get aligned datasets)
 
-Unseen-eval data (only F# and G#):
+Usage — training + 2×2 eval grid
+-------------------------------
+Training (train songs × 10 seen keys):
     python -m midi_adapter.extract_orchestrated \\
-        --in_dir  /path/to/pop909_ivvi_orchestrated_s2only \\
-        --out_pt  /path/to/data/pop909_orch_unseen \\
-        --target_keys 6 8
+        --in_dir /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt /path/to/data/pop909_orch_train \\
+        --val_song_frac 0.1 --split train
+
+Eval, seen songs × unseen keys (key generalization):
+    python -m midi_adapter.extract_orchestrated \\
+        --in_dir /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt /path/to/data/pop909_orch_train_unseenkeys \\
+        --val_song_frac 0.1 --split train --target_keys 6 8
+
+Eval, unseen songs × seen keys (song generalization):
+    python -m midi_adapter.extract_orchestrated \\
+        --in_dir /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt /path/to/data/pop909_orch_val_seenkeys \\
+        --val_song_frac 0.1 --split val
+
+Eval, unseen songs × unseen keys (both):
+    python -m midi_adapter.extract_orchestrated \\
+        --in_dir /path/to/pop909_ivvi_orchestrated_s2only \\
+        --out_pt /path/to/data/pop909_orch_val_unseenkeys \\
+        --val_song_frac 0.1 --split val --target_keys 6 8
 """
 
 from __future__ import annotations
@@ -68,6 +88,9 @@ _KEY_STR_TO_PC = {name: i for i, name in enumerate(ROOT_NAMES)}
 
 # Match `_keyG_`, `_keyC#_`, etc. — the pattern used by leadsheets output.
 _KEY_RE = re.compile(r'_key([A-G]#?)_')
+# The source song ID is the trailing stem after all annotation prefixes, e.g.
+#   000123_keyG_phase0_bar0044_049  →  '049'
+_SONG_ID_RE = re.compile(r'_([^_]+)$')
 
 
 def _key_from_folder(folder_name: str) -> int | None:
@@ -75,6 +98,26 @@ def _key_from_folder(folder_name: str) -> int | None:
     if not m:
         return None
     return _KEY_STR_TO_PC.get(m.group(1))
+
+
+def _song_id_from_folder(folder_name: str) -> str | None:
+    """Extract the original source MIDI stem from a leadsheet-style folder name."""
+    m = _SONG_ID_RE.search(folder_name)
+    return m.group(1) if m else None
+
+
+def _partition_songs(song_ids: list[str], val_frac: float, seed: int
+                     ) -> tuple[set[str], set[str]]:
+    """Deterministic song-level split. Same (song_ids, val_frac, seed) always
+    yields the same partition, so the training and val runs align."""
+    rng = np.random.default_rng(seed)
+    unique = sorted(set(song_ids))
+    idx = np.arange(len(unique))
+    rng.shuffle(idx)
+    n_val = int(round(len(unique) * val_frac))
+    val_set   = {unique[i] for i in idx[:n_val]}
+    train_set = {unique[i] for i in idx[n_val:]}
+    return train_set, val_set
 
 
 def main():
@@ -98,6 +141,18 @@ def main():
     p.add_argument('--band_pattern', type=str, default='arrangement_band-*.mid',
                    help='Glob pattern for the orchestrated MIDIs to pick up '
                         'inside each song folder.')
+    # Song-level split — hold out entire source songs so eval sees music the
+    # model has never trained on.
+    p.add_argument('--val_song_frac', type=float, default=0.0,
+                   help='Fraction of source songs to hold out as val. Same '
+                        '(--val_song_frac, --split_seed) pair always produces '
+                        'the same partition, so run this script twice — once '
+                        'with --split train, once with --split val — to get '
+                        'aligned train and val datasets.')
+    p.add_argument('--split_seed', type=int, default=42)
+    p.add_argument('--split',      type=str, default='all',
+                   choices=['train', 'val', 'all'],
+                   help='Which songs to include when --val_song_frac > 0.')
     args = p.parse_args()
 
     subfolders = sorted(
@@ -105,6 +160,28 @@ def main():
         if os.path.isdir(os.path.join(args.in_dir, d))
     )
     print(f'Scanning {len(subfolders)} song folders under {args.in_dir}')
+
+    # Partition by song ID before we start extracting.
+    if args.val_song_frac > 0:
+        song_ids = [
+            sid for sid in (_song_id_from_folder(os.path.basename(f)) for f in subfolders)
+            if sid is not None
+        ]
+        train_songs, val_songs = _partition_songs(song_ids, args.val_song_frac, args.split_seed)
+        if args.split == 'train':
+            allowed_songs: set[str] | None = train_songs
+        elif args.split == 'val':
+            allowed_songs = val_songs
+        else:
+            allowed_songs = None
+        print(f'Song split (seed={args.split_seed}, val_frac={args.val_song_frac}): '
+              f'{len(train_songs)} train / {len(val_songs)} val songs')
+        if allowed_songs is not None:
+            print(f'  keeping only "{args.split}" songs ({len(allowed_songs)} songs)')
+    else:
+        allowed_songs = None
+        if args.split != 'all':
+            raise SystemExit('--split requires --val_song_frac > 0')
 
     n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
     sub_per_chord     = SUBBEATS_PER_BAR // args.chords_per_bar
@@ -127,10 +204,15 @@ def main():
     n_scanned = 0
 
     for folder in subfolders:
-        base_key = _key_from_folder(os.path.basename(folder))
+        folder_name = os.path.basename(folder)
+        base_key = _key_from_folder(folder_name)
         if base_key is None:
             print(f'  SKIP {folder}: cannot parse key from folder name')
             continue
+        if allowed_songs is not None:
+            sid = _song_id_from_folder(folder_name)
+            if sid is None or sid not in allowed_songs:
+                continue
 
         for midi_path in sorted(glob.glob(os.path.join(folder, args.band_pattern))):
             n_scanned += 1
