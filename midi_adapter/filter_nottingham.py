@@ -391,72 +391,6 @@ def _count_polyphonic_subbeats(cp_data: np.ndarray, start_sb: int,
 
 
 # ---------------------------------------------------------------------------
-# Lead-sheet snippet writer — skyline split.
-#
-# At each subbeat: the highest-pitched note is the melody (track 0), every
-# other simultaneous note is chord/accompaniment (track 1). This handles
-# both cases the user flagged:
-#   * Nottingham files that already separate melody from chord by track —
-#     top voice usually IS the melody, so skyline reproduces the split
-#   * Nottingham files where melody + chord are mixed in one track —
-#     skyline still finds the melody on top
-#
-# Notes are read straight from the aligned CP tensor we already built, so
-# timing is exactly the 16th-note grid the model trains on (120 BPM playback).
-# ---------------------------------------------------------------------------
-
-def _save_leadsheet_snippet(cp_data: np.ndarray, start_bar: int, n_bars: int,
-                            out_path: str, max_polyphony: int = 4,
-                            tempo: float = 120.0) -> bool:
-    start_sb   = start_bar * SUBBEATS_PER_BAR
-    n_subbeats = n_bars * SUBBEATS_PER_BAR
-    if start_sb + n_subbeats > cp_data.shape[0]:
-        return False
-    sec_per_sb = 60.0 / tempo / BEAT_DIV
-
-    out_pm = pretty_midi.PrettyMIDI(initial_tempo=tempo)
-    melody = pretty_midi.Instrument(program=0, name='Melody')
-    chord  = pretty_midi.Instrument(program=0, name='Chord')
-
-    for local_sb in range(n_subbeats):
-        sb = start_sb + local_sb
-        notes_here: list[tuple[int, int, int]] = []   # (pitch, dur_idx, vel)
-        for v in range(max_polyphony):
-            prog    = int(cp_data[sb, v * 4 + 0])
-            pitch   = int(cp_data[sb, v * 4 + 1])
-            dur_idx = int(cp_data[sb, v * 4 + 2])
-            vel     = int(cp_data[sb, v * 4 + 3])
-            if prog == 254 or prog == 255:
-                break
-            if prog == 127 or pitch == 255:
-                continue
-            if dur_idx >= len(DURATION_TEMPLATES):
-                continue
-            notes_here.append((pitch, dur_idx, vel))
-        if not notes_here:
-            continue
-        notes_here.sort(key=lambda x: x[0])   # ascending pitch — top is melody
-        start_time = local_sb * sec_per_sb
-        m_pitch, m_dur, m_vel = notes_here[-1]
-        m_end = (local_sb + int(DURATION_TEMPLATES[m_dur])) * sec_per_sb
-        melody.notes.append(pretty_midi.Note(
-            velocity=m_vel if m_vel > 0 else 80,
-            pitch=m_pitch, start=start_time, end=m_end))
-        for c_pitch, c_dur, c_vel in notes_here[:-1]:
-            c_end = (local_sb + int(DURATION_TEMPLATES[c_dur])) * sec_per_sb
-            chord.notes.append(pretty_midi.Note(
-                velocity=c_vel if c_vel > 0 else 70,
-                pitch=c_pitch, start=start_time, end=c_end))
-
-    if not melody.notes or not chord.notes:
-        return False   # Structured-Arrangement needs BOTH tracks
-    out_pm.instruments.append(melody)
-    out_pm.instruments.append(chord)
-    out_pm.write(out_path)
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Step 1: Filter
 # ---------------------------------------------------------------------------
 
@@ -724,9 +658,6 @@ def cmd_leadsheets(args):
     per_key = Counter()
     n_saved = 0
 
-    cp_cache: dict[str, np.ndarray] = {}
-    cache_order: list[str] = []
-
     for entry in manifest:
         if args.limit and n_saved >= args.limit:
             break
@@ -739,33 +670,15 @@ def cmd_leadsheets(args):
         phase     = entry['phase']
         n_bars    = entry.get('n_bars', N_BARS_WINDOW)
 
-        if midi_path not in cp_cache:
-            try:
-                cp_cache[midi_path] = _load_midi_aligned(
-                    midi_path,
-                    max_polyphony     = args.max_polyphony,
-                    align_to_downbeat = not args.no_align,
-                )
-            except Exception as e:
-                print(f'  SKIP {midi_path}: {e}')
-                cp_cache[midi_path] = None
-                continue
-            cache_order.append(midi_path)
-            if len(cache_order) > 200:
-                old = cache_order.pop(0)
-                cp_cache.pop(old, None)
-        cp_data = cp_cache[midi_path]
-        if cp_data is None:
-            continue
-
         stem = os.path.splitext(os.path.basename(midi_path))[0]
         out  = os.path.join(
             args.out_dir,
             f'{n_saved:06d}_key{ROOT_NAMES[key]}_phase{phase}_bar{start_bar:04d}_{stem}.mid',
         )
         try:
-            if _save_leadsheet_snippet(cp_data, start_bar, n_bars, out,
-                                       max_polyphony=args.max_polyphony):
+            if _save_original_tracks_snippet(
+                    midi_path, start_bar, n_bars, out,
+                    align_to_downbeat=not args.no_align):
                 per_key[key] += 1
                 n_saved += 1
         except Exception as e:
@@ -840,12 +753,12 @@ def main():
                          'Pass "6 8" to build the unseen-eval dataset.')
 
     pl = sub.add_parser('leadsheets',
-                        help='Save matched 4-bar windows as multi-track MIDI lead '
-                             'sheets (track 0 = melody, track 1 = chord, …) ready '
-                             'for Structured-Arrangement Stage 1/2 input.')
+                        help='Save matched windows as multi-track MIDI files with '
+                             'the source MIDI\'s track structure preserved exactly, '
+                             'ready for Structured-Arrangement / AccoMontage input '
+                             '(they accept arbitrary multi-track input).')
     pl.add_argument('--manifest',      required=True)
     pl.add_argument('--out_dir',       required=True)
-    pl.add_argument('--max_polyphony', type=int, default=4)
     pl.add_argument('--no_align',      action='store_true',
                     help='Skip downbeat alignment / 4/4 check (use for POP909 etc.). '
                          'Must match the --no_align used in the filter step.')
