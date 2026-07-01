@@ -709,6 +709,9 @@ def cmd_leadsheets(args):
     from collections import Counter
     per_key = Counter()
     n_saved = 0
+    # Track files that fail to load so we don't retry them (and don't spam
+    # the same error N times for the N windows referencing that file).
+    bad_files: set[str] = set()
 
     for entry in manifest:
         if args.limit and n_saved >= args.limit:
@@ -718,6 +721,8 @@ def cmd_leadsheets(args):
             continue
 
         midi_path = entry['midi_path']
+        if midi_path in bad_files:
+            continue
         start_bar = entry['start_bar']
         phase     = entry['phase']
         n_bars    = entry.get('n_bars', N_BARS_WINDOW)
@@ -735,8 +740,11 @@ def cmd_leadsheets(args):
                 per_key[key] += 1
                 n_saved += 1
         except Exception as e:
+            bad_files.add(midi_path)
             print(f'  SKIP {midi_path}: {e}')
 
+    if bad_files:
+        print(f'\nSkipped {len(bad_files)} file(s) that failed to load.')
     print(f'\nSaved {n_saved} lead-sheet snippets → {args.out_dir}')
     print('Per-key counts:')
     for k in sorted(per_key):
