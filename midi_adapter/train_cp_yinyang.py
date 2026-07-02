@@ -214,6 +214,11 @@ class UnseenAccuracyCallback(L.Callback):
                     break
                 tensors = [t.to(device) for t in batch]
                 x, pitch_shift = tensors[0], tensors[1]
+                # Third tensor (if present) is the paired condition. Route by shape:
+                # 2-D → chord_seq (B, N_chords); 1-D → key_override (B,).
+                chord_seq = None
+                if len(tensors) >= 3 and tensors[2].dim() == 2:
+                    chord_seq = (tensors[2] + pitch_shift.unsqueeze(-1)) % 12
 
                 prompt = model.base.preprocess(
                     x[:, :self.n_prompt_beats, :], pitch_shift
@@ -222,6 +227,7 @@ class UnseenAccuracyCallback(L.Callback):
                 # Autoregressive generation — greedy (temperature=0)
                 sampled = model.global_sampling(
                     prompt, max_seq_len=total_beats, temperature=0,
+                    chord_seq=chord_seq,
                 )
 
                 # Extract key from prompt's first beat: slot 1 % 128 % 12
