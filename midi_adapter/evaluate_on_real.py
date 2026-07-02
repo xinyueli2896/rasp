@@ -111,7 +111,9 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
 
         pitch_shift = torch.zeros(end - start, dtype=torch.long, device=device)
         x_proc = model.base.preprocess(batch, pitch_shift)
-        prompt = x_proc[:, :n_prompt_beats]
+        # global_sampling → local_encode → x.view(-1, ...), which needs a
+        # contiguous tensor. The slice below is a non-contiguous view.
+        prompt = x_proc[:, :n_prompt_beats].contiguous()
 
         sampled = model.global_sampling(prompt, max_seq_len=total_beats,
                                          temperature=temperature)
