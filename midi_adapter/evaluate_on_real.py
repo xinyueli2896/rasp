@@ -244,13 +244,26 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                 expected_pcs = {(expected_root + i) % 12 for i in _MAJOR_INTERVALS}
                 if expected_pcs.issubset(pcs):
                     cov_ok += 1
+
+            # PRIMARY metric — same chromagram chord-root detection as the
+            # filter: detect one root per half-bar of the generation and count
+            # matches against the expected I-IV-V-I sequence.
+            gen_roots = _detect_root_per_halfbar(
+                sampled, local_i, total_beats, sub_per_chord, tokenizer)
+            n_hb_gen  = 0
+            n_hb_ok   = 0
+            for h in range(prompt_halfbars, len(gen_roots)):
+                exp = (key + OFFSETS[h % 4]) % 12
+                n_hb_gen += 1
+                if gen_roots[h] == exp:
+                    n_hb_ok += 1
+            halfbar_acc = n_hb_ok / max(n_hb_gen, 1)
+
             per_key.setdefault(key, []).append(
-                (bass_ok / n_gen_beats, cov_ok / n_gen_beats))
+                (halfbar_acc, bass_ok / n_gen_beats, cov_ok / n_gen_beats))
 
             if n_demos_per_key > 0 and demos_shown.get(key, 0) < n_demos_per_key:
                 demos_shown[key] = demos_shown.get(key, 0) + 1
-                gen_roots = _detect_root_per_halfbar(
-                    sampled, local_i, total_beats, sub_per_chord, tokenizer)
                 _print_demo(key, demos_shown[key], gen_roots,
                              prompt_halfbars, chords_per_bar)
 
@@ -269,28 +282,32 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
 
     stats: dict[int, dict[str, float]] = {}
     for k, results in per_key.items():
-        bass = np.array([r[0] for r in results])
-        cov  = np.array([r[1] for r in results])
+        hb   = np.array([r[0] for r in results])
+        bass = np.array([r[1] for r in results])
+        cov  = np.array([r[2] for r in results])
         stats[k] = {
-            'bass_acc':  float(bass.mean()),
-            'chord_cov': float(cov.mean()),
-            'n':         len(results),
+            'halfbar_acc': float(hb.mean()),
+            'bass_acc':    float(bass.mean()),
+            'chord_cov':   float(cov.mean()),
+            'n':           len(results),
         }
     return stats
 
 
 def _print_stats_table(title: str, stats: dict[int, dict[str, float]]) -> None:
     print(f'\n── {title} ──')
-    print(f'  {"key":<4}  {"n":>4}  {"bass_acc":>10}  {"chord_cov":>10}')
-    means = {'bass': [], 'cov': []}
+    print(f'  {"key":<4}  {"n":>4}  {"halfbar_acc":>12}  {"bass_acc":>10}  {"chord_cov":>10}')
+    means = {'hb': [], 'bass': [], 'cov': []}
     for k in sorted(stats):
         s = stats[k]
-        print(f'  {ROOT_NAMES[k]:<4}  {s["n"]:>4}  {s["bass_acc"]:>10.3f}  {s["chord_cov"]:>10.3f}')
+        print(f'  {ROOT_NAMES[k]:<4}  {s["n"]:>4}  {s["halfbar_acc"]:>12.3f}  '
+              f'{s["bass_acc"]:>10.3f}  {s["chord_cov"]:>10.3f}')
+        means['hb'].append(s['halfbar_acc'])
         means['bass'].append(s['bass_acc'])
         means['cov'].append(s['chord_cov'])
-    if means['bass']:
-        print(f'  {"MEAN":<4}  {"":>4}  {np.mean(means["bass"]):>10.3f}  '
-              f'{np.mean(means["cov"]):>10.3f}')
+    if means['hb']:
+        print(f'  {"MEAN":<4}  {"":>4}  {np.mean(means["hb"]):>12.3f}  '
+              f'{np.mean(means["bass"]):>10.3f}  {np.mean(means["cov"]):>10.3f}')
 
 
 def main():
