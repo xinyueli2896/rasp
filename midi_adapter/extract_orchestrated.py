@@ -74,6 +74,7 @@ from midi_adapter.filter_nottingham import (
     _load_midi_aligned,
     _signed_shift,
     _transpose_window,
+    _extract_chord_roots_from_cp,
     SEEN_KEYS_DEFAULT,
     ROOT_NAMES,
 )
@@ -138,6 +139,12 @@ def main():
     p.add_argument('--target_keys', type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
                    help='Keys (pitch classes 0-11) to transpose each window into. '
                         'Default = 10 seen keys (excluding F#/G#).')
+    p.add_argument('--rule_min_frac',  type=float, default=0.75,
+                   help='Reject orchestrated arrangements where fewer than this '
+                        'fraction of half-bar chord slots match the intended '
+                        'I-IV-V-I sequence in the source key. 0 = accept all; '
+                        'default 0.75 keeps arrangements that got at least 6/8 '
+                        'chord positions right.')
     p.add_argument('--band_pattern', type=str, default='arrangement_band-*.mid',
                    help='Glob pattern for the orchestrated MIDIs to pick up '
                         'inside each song folder.')
@@ -210,7 +217,8 @@ def main():
     txt_lines:  list[str] = []
     per_key_counts: dict[int, int] = {k: 0 for k in args.target_keys}
     n_saved   = 0
-    n_scanned = 0
+    n_scanned      = 0
+    n_rule_skipped = 0
 
     for folder in subfolders:
         folder_name = os.path.basename(folder)
@@ -256,6 +264,26 @@ def main():
             window = torch.tensor(cp_arr[:n_subbeats_window].copy(), dtype=torch.uint8)
             window = pitch_sort_cp(window)
 
+            # Rule-following check: detect the orchestrated MIDI's actual chord
+            # progression per half-bar and require ≥ rule_min_frac of the chord
+            # slots to match (base_key + OFFSETS[c % 4]) mod 12. Rejects
+            # arrangements where the orchestrator drifted from the intended
+            # I-IV-V-I. Detection runs on the (un-transposed) source-key
+            # window so we only do it once per MIDI.
+            if args.rule_min_frac > 0.0:
+                detected = _extract_chord_roots_from_cp(
+                    window.numpy(), chords_per_bar=args.chords_per_bar)
+                expected = [(base_key + OFFSETS[c % 4]) % 12
+                            for c in range(len(detected))]
+                valid    = [(d, e) for d, e in zip(detected, expected) if d >= 0]
+                if not valid:
+                    n_rule_skipped += 1
+                    continue
+                match_frac = sum(1 for d, e in valid if d == e) / len(valid)
+                if match_frac < args.rule_min_frac:
+                    n_rule_skipped += 1
+                    continue
+
             for target_key in args.target_keys:
                 shift = _signed_shift(target_key, base_key)
                 win_t = _transpose_window(window, shift)
@@ -286,7 +314,8 @@ def main():
     with open(f'{args.out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
 
-    print(f'\nScanned {n_scanned} band MIDIs, saved {n_saved} windows.')
+    print(f'\nScanned {n_scanned} band MIDIs, rule-skipped {n_rule_skipped}, '
+          f'saved {n_saved} windows.')
     print(f'Dataset → {args.out_pt}.{{pt,length.pt,pitch_shift_range.pt,beat_chords.pt,txt}}')
     print('Per-key window counts:')
     for k in sorted(per_key_counts):
