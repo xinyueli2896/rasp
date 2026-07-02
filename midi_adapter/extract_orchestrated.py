@@ -186,8 +186,11 @@ def main():
     n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
     sub_per_chord     = SUBBEATS_PER_BAR // args.chords_per_bar
 
-    # Pre-build the chord-token stream for each target key (phase is fixed).
+    # Pre-build the chord-token stream and the explicit chord-root sequence
+    # for each target key (phase is fixed).
     chord_tokens_by_key: dict[int, torch.Tensor] = {}
+    chord_seq_by_key:    dict[int, list[int]]    = {}
+    n_chord_positions = args.n_bars * args.chords_per_bar
     for target_key in args.target_keys:
         toks = []
         for sb in range(n_subbeats_window):
@@ -195,10 +198,15 @@ def main():
             root = (target_key + OFFSETS[(chord_in_window + args.phase) % 4]) % 12
             toks.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
         chord_tokens_by_key[target_key] = torch.tensor(toks, dtype=torch.int16)
+        chord_seq_by_key[target_key] = [
+            (target_key + OFFSETS[(c + args.phase) % 4]) % 12
+            for c in range(n_chord_positions)
+        ]
 
-    all_data:   list[torch.Tensor] = []
-    all_chords: list[torch.Tensor] = []
-    all_keys:   list[int]          = []   # target-key pitch class per window
+    all_data:      list[torch.Tensor] = []
+    all_chords:    list[torch.Tensor] = []
+    all_keys:      list[int]          = []   # target-key pitch class per window
+    all_chord_seq: list[list[int]]    = []   # (N_chords,) explicit chord-root sequence per window
     txt_lines:  list[str] = []
     per_key_counts: dict[int, int] = {k: 0 for k in args.target_keys}
     n_saved   = 0
@@ -258,6 +266,7 @@ def main():
                 all_data.append(win_t)
                 all_chords.append(chord_tokens_by_key[target_key])
                 all_keys.append(target_key)
+                all_chord_seq.append(chord_seq_by_key[target_key])
                 rel = f'{os.path.relpath(midi_path, args.in_dir)}#key{ROOT_NAMES[target_key]}'
                 txt_lines.append(f'{n_saved}\t{rel}')
                 per_key_counts[target_key] += 1
@@ -273,6 +282,7 @@ def main():
     torch.save(torch.zeros(n_saved, 2, dtype=torch.int8),     f'{args.out_pt}.pitch_shift_range.pt')
     torch.save(all_chords,                                     f'{args.out_pt}.beat_chords.pt')
     torch.save(torch.tensor(all_keys, dtype=torch.long),      f'{args.out_pt}.keys.pt')
+    torch.save(torch.tensor(all_chord_seq, dtype=torch.long), f'{args.out_pt}.chord_seq.pt')
     with open(f'{args.out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
 

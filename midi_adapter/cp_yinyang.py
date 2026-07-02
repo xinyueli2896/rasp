@@ -42,7 +42,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.bass_tracr_rule_model import BassTracrRuleModel, CPChordRuleModel, TRACR_D_MODEL
+from models.bass_tracr_rule_model import (
+    BassTracrRuleModel, CPChordRuleModel, ChordSeqRuleModel, TRACR_D_MODEL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,7 @@ class CPYinyangCrossAttention(nn.Module):
         ar_hidden:   torch.Tensor,   # (B, T_q, d_model)
         rule_hidden: torch.Tensor,   # (B, T_k, rule_d_model)
         sub_offset:  int = 0,        # absolute beat index of ar_hidden[:, 0, :]
+        use_causal:  bool = True,    # False for chord-seq mode: the full progression is given upfront
     ) -> torch.Tensor:
         B, T_q, _ = ar_hidden.shape
         _, T_k, _ = rule_hidden.shape
@@ -217,11 +220,12 @@ class CPYinyangCrossAttention(nn.Module):
 
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, H, T_q, T_k)
 
-        # Plain causal mask: beat (sub_offset + i) may attend to beat j iff j <= sub_offset + i
-        abs_q = torch.arange(sub_offset, sub_offset + T_q, device=ar_hidden.device)
-        k_rng = torch.arange(T_k, device=ar_hidden.device)
-        causal = abs_q.unsqueeze(1) >= k_rng.unsqueeze(0)              # (T_q, T_k)
-        scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float('-inf'))
+        if use_causal:
+            # Plain causal mask: beat (sub_offset + i) may attend to beat j iff j <= sub_offset + i
+            abs_q = torch.arange(sub_offset, sub_offset + T_q, device=ar_hidden.device)
+            k_rng = torch.arange(T_k, device=ar_hidden.device)
+            causal = abs_q.unsqueeze(1) >= k_rng.unsqueeze(0)          # (T_q, T_k)
+            scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
         out  = (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.embed_dim)
@@ -259,6 +263,7 @@ class CPYinyangTransformer(nn.Module):
         rule_mode:        str  = 'current',
         approach:         str  = 'bass',
         chords_per_bar:   int  = 2,
+        chord_seq_conditioning: bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -295,16 +300,21 @@ class CPYinyangTransformer(nn.Module):
         n_adapters = n_layers // n_skip
 
         # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
-        if approach == 'chord':
+        subbeats_per_chord = 16 // chords_per_bar
+        self.chords_per_bar         = chords_per_bar
+        self.chord_seq_conditioning = chord_seq_conditioning
+        if chord_seq_conditioning:
+            assert approach == 'chord', 'chord_seq_conditioning requires approach=chord'
+            assert not encoder_injected, \
+                'chord_seq_conditioning and encoder_injected are mutually exclusive'
+            self.rule_model = ChordSeqRuleModel()
+        elif approach == 'chord':
             # beats_per_bar here = subbeats per chord (at beat_div=4):
             #   chords_per_bar=1 → 16 subbeats per chord (one chord per bar)
             #   chords_per_bar=2 → 8  subbeats per chord (two chords per bar) [default]
-            subbeats_per_chord = 16 // chords_per_bar
             self.rule_model = CPChordRuleModel(beats_per_bar=subbeats_per_chord)
-            self.chords_per_bar = chords_per_bar
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
-            self.chords_per_bar = chords_per_bar
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
@@ -424,15 +434,21 @@ class CPYinyangTransformer(nn.Module):
             return enc_out, cur_pc                                 # logits, CE target
 
     def _rule_hidden(self, x_proc: torch.Tensor,
-                     key_override: torch.Tensor | None = None) -> torch.Tensor:
+                     key_override: torch.Tensor | None = None,
+                     chord_seq: torch.Tensor | None = None) -> torch.Tensor:
         """Compute frozen analytical rule_hidden from preprocessed tokens.
 
-        Reads key = pc[b, 0] from voice 0 (slot 1) and runs the rule model.
-        key_override, if provided as a (B,) long tensor of pitch classes,
-        replaces the input-derived key — used for paired-data training where
-        the intended key is known explicitly and doesn't need to be inferred
-        from the input's first pitch class.
+        chord_seq: (B, N_chords) explicit chord roots — uses ChordSeqRuleModel,
+                    returns (B, N_chords, 16). Requires chord_seq_conditioning=True.
+        key_override: (B,) explicit tonic — analytical expansion to
+                    (B, T, 16) via build_rule_hidden_analytic.
+        Neither: read key from the input's first pitch class (legacy path).
         """
+        if chord_seq is not None:
+            assert self.chord_seq_conditioning, \
+                'chord_seq provided but model was not built with chord_seq_conditioning=True'
+            return self.rule_model.build_rule_hidden_from_chord_seq(
+                chord_seq.to(x_proc.device))
         T = x_proc.shape[1]
         if key_override is not None:
             return self.rule_model.build_rule_hidden_analytic(
@@ -442,15 +458,14 @@ class CPYinyangTransformer(nn.Module):
         return h
 
     def forward(self, x: torch.Tensor,
-                 key_override: torch.Tensor | None = None) -> torch.Tensor:
+                 key_override: torch.Tensor | None = None,
+                 chord_seq: torch.Tensor | None = None) -> torch.Tensor:
         """
         x : (B, seq_len, subseq_len)  preprocessed CP tokens
-        key_override : optional (B,) long tensor of target-key pitch classes,
-                       used only when encoder_injected=False and bidirectional=False
-                       (i.e. the analytical-rule-model path). Enables paired-data
-                       training where the intended key is known and shouldn't be
-                       inferred from the input.
-        Returns logits of shape (B, seq_len, subseq_len, vocab_size) via local_decode.
+        key_override : (B,) → analytical rule-hidden expansion from one key
+        chord_seq    : (B, N_chords) → ChordSeqRuleModel: rule hidden at
+                       chord-position granularity, learned N_chords → seq_len
+                       alignment via cross-attention (use_causal=False)
         """
         base = self.base
         batch_size, seq_len, _ = x.shape
@@ -460,7 +475,8 @@ class CPYinyangTransformer(nn.Module):
         elif self.bidirectional:
             rule_hidden = None
         else:
-            rule_hidden = self._rule_hidden(x, key_override=key_override)
+            rule_hidden = self._rule_hidden(x, key_override=key_override,
+                                             chord_seq=chord_seq)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -474,18 +490,24 @@ class CPYinyangTransformer(nn.Module):
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden
-                h = h + self.yinyang_attn[adapter_idx](h, rule_h, sub_offset=0)
+                h = h + self.yinyang_attn[adapter_idx](
+                    h, rule_h, sub_offset=0,
+                    use_causal=not self.chord_seq_conditioning,
+                )
 
         return base.local_decode(h, emb)
 
     def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor,
-             key_override: torch.Tensor | None = None) -> torch.Tensor:
+             key_override: torch.Tensor | None = None,
+             chord_seq: torch.Tensor | None = None) -> torch.Tensor:
         x_proc = self.base.preprocess(x, pitch_shift)
-        # Same shift used to build the input has to be applied to the key so the
-        # rule signal moves in step with the audio: (key + shift) mod 12.
+        # Same shift used to build the input has to be applied to the rule
+        # signal so it moves in step with the audio: (root + shift) mod 12.
         if key_override is not None:
             key_override = (key_override + pitch_shift) % 12
-        logits = self(x_proc, key_override=key_override)
+        if chord_seq is not None:
+            chord_seq = (chord_seq + pitch_shift.unsqueeze(-1)) % 12
+        logits = self(x_proc, key_override=key_override, chord_seq=chord_seq)
         return F.cross_entropy(
             logits.view(-1, self.base.tokenizer.n_tokens),
             x_proc.view(-1),
@@ -504,6 +526,7 @@ class CPYinyangTransformer(nn.Module):
         max_seq_len: int   = 384,
         temperature: float = 1.0,
         sampling_func = None,
+        chord_seq:   torch.Tensor | None = None,   # (B, N_chords) — chord-seq mode only
     ) -> list:
         base = self.base
         batch_size, seed_len, _ = x.shape
@@ -511,7 +534,11 @@ class CPYinyangTransformer(nn.Module):
         # Pre-compute rule_hidden for standard and encoder_injected modes.
         # Bidirectional computes rule_hidden on-the-fly from AR states each step.
         pc_0 = (x[:, 0, 1] % 128 % 12).clamp(0, 11)   # (B,) starting pitch class / key
-        if self.encoder_injected and self.approach == 'bass':
+        if self.chord_seq_conditioning:
+            assert chord_seq is not None, 'chord_seq must be provided in chord-seq mode'
+            rule_hidden = self.rule_model.build_rule_hidden_from_chord_seq(
+                chord_seq.to(x.device))
+        elif self.encoder_injected and self.approach == 'bass':
             # Bass encoder: cur_pc is computable analytically → run learned encoder at inference.
             t_idx   = torch.arange(max_seq_len, device=x.device)
             offsets = self.rule_model._offsets[t_idx % 4]               # (max_seq_len,)
@@ -557,7 +584,8 @@ class CPYinyangTransformer(nn.Module):
                     # AR-derived rule trajectory up to step i.
                     rule_h = self.ar_to_rule[adapter_idx](h_out) if self.bidirectional else rule_hidden
                     correction = self.yinyang_attn[adapter_idx](
-                        h_out[:, -1:, :], rule_h, sub_offset=i
+                        h_out[:, -1:, :], rule_h, sub_offset=i,
+                        use_causal=not self.chord_seq_conditioning,
                     )
                     h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 

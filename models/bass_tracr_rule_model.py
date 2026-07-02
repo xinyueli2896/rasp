@@ -351,6 +351,64 @@ class CPChordRuleModel(nn.Module):
         return iter([])
 
 
+class ChordSeqRuleModel(nn.Module):
+    """
+    Chord-sequence rule model. Takes an EXPLICIT chord-root sequence and
+    outputs one rule hidden state per chord position (no analytical
+    expansion to per-subbeat resolution).
+
+    Input : chord_roots  (B, N_chords)   long, values 0-11
+    Output: rule_hidden  (B, N_chords, 16)
+        dims  0-11 : binary chromagram of major triad {root, root+4, root+7}
+        dims 12-15 : one-hot of (chord_position % 4)  — bar-phase style PE
+
+    Zero trainable parameters. Cross-attention on the CP side is expected to
+    learn the N_chords → T_subbeats alignment (queries at subbeat granularity
+    look up keys at chord-position granularity).
+    """
+
+    CHORD_INTERVALS: tuple = (0, 4, 7)
+    d_model:         int   = N_ROOTS + N_POS   # 16
+
+    def __init__(self):
+        super().__init__()
+        W_pos = torch.zeros(N_POS, self.d_model)
+        for i in range(N_POS):
+            W_pos[i, N_ROOTS + i] = 1.0
+        self.register_buffer('W_pos', W_pos)
+
+    def _root_to_chromagram(self, root: torch.Tensor) -> torch.Tensor:
+        """root: (B, N_chords) → chromagram (B, N_chords, 12) binary float."""
+        chroma = torch.zeros(*root.shape, N_ROOTS,
+                              device=root.device, dtype=torch.float)
+        for interval in self.CHORD_INTERVALS:
+            idx = (root + interval) % N_ROOTS
+            chroma.scatter_(-1, idx.unsqueeze(-1), 1.0)
+        return chroma
+
+    def build_rule_hidden_from_chord_seq(self, chord_seq: torch.Tensor
+                                          ) -> torch.Tensor:
+        """chord_seq: (B, N_chords) long chord roots (0-11).
+        Returns (B, N_chords, 16) rule hidden."""
+        B, n_chords = chord_seq.shape
+        device = chord_seq.device
+
+        chroma = self._root_to_chromagram(chord_seq)                    # (B, N, 12)
+        pos    = torch.arange(n_chords, device=device) % N_POS          # (N,)
+        pos_oh = F.one_hot(pos, num_classes=N_POS).float()              # (N, 4)
+
+        h = torch.zeros(B, n_chords, self.d_model, device=device)
+        h[:, :, :N_ROOTS] = chroma
+        h[:, :, N_ROOTS:] = pos_oh.unsqueeze(0).expand(B, -1, -1)
+        return h
+
+    def parameters(self, recurse=True):
+        return iter([])
+
+    def named_parameters(self, prefix='', recurse=True, remove_duplicate=True):
+        return iter([])
+
+
 if __name__ == '__main__':
     model = BassTracrRuleModel()
     print(f'TRACR_D_MODEL = {model.TRACR_D_MODEL}  d_model = {model.d_model}')

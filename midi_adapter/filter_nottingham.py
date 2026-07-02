@@ -594,8 +594,9 @@ def cmd_extract(args):
     from midi_adapter.chord_tokenizer import chord_str_to_token
 
     all_data:   list[torch.Tensor] = []
-    all_chords: list[torch.Tensor] = []
-    all_keys:   list[int]          = []
+    all_chords:    list[torch.Tensor] = []
+    all_keys:      list[int]          = []
+    all_chord_seq: list[list[int]]    = []
     txt_lines:  list[str] = []
     n_saved = 0
 
@@ -667,6 +668,11 @@ def cmd_extract(args):
                 beat_tokens.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
             all_chords.append(torch.tensor(beat_tokens, dtype=torch.int16))
             all_keys.append(target_key)
+            n_chord_positions = n_bars_window * entry_chords_per_bar
+            all_chord_seq.append([
+                (target_key + OFFSETS[(c + phase) % 4]) % 12
+                for c in range(n_chord_positions)
+            ])
 
             rel = f'nottingham_{n_saved:06d}_key{target_key}_phase{phase}.mid'
             txt_lines.append(f'{n_saved}\t{rel}')
@@ -685,6 +691,7 @@ def cmd_extract(args):
     torch.save(torch.zeros(n_saved, 2, dtype=torch.int8), f'{args.out_pt}.pitch_shift_range.pt')
     torch.save(all_chords,                                 f'{args.out_pt}.beat_chords.pt')
     torch.save(torch.tensor(all_keys, dtype=torch.long),  f'{args.out_pt}.keys.pt')
+    torch.save(torch.tensor(all_chord_seq, dtype=torch.long), f'{args.out_pt}.chord_seq.pt')
     with open(f'{args.out_pt}.txt', 'w') as f:
         f.write('\n'.join(txt_lines) + '\n')
 

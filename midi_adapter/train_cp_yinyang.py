@@ -97,14 +97,21 @@ class BassFramedDataset(FramedDataset):
             self.pitch_shift_range[self.pitch_shift_range[:, 1] > 6, 1] = 6
             if self.split in ('val', 'test'):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
-            # Optional paired keys tensor — one target-key pitch class per song.
+            # Optional paired-condition tensors — chord_seq wins over keys.
+            self.chord_seq = None
+            self.keys      = None
+            cs_path   = self.file_path[:-3] + '.chord_seq.pt'
             keys_path = self.file_path[:-3] + '.keys.pt'
-            if os.path.exists(keys_path):
+            if os.path.exists(cs_path):
+                self.chord_seq = torch.load(cs_path, weights_only=True).long()
+            elif os.path.exists(keys_path):
                 self.keys = torch.load(keys_path, weights_only=True).long()
-            else:
-                self.keys = None
-            print(f'Data for dataset {self.file_path} loaded.'
-                  + (f' Paired keys: {len(self.keys)}' if self.keys is not None else ''))
+            msg = f'Data for dataset {self.file_path} loaded.'
+            if self.chord_seq is not None:
+                msg += f' Paired chord_seq: {tuple(self.chord_seq.shape)}'
+            elif self.keys is not None:
+                msg += f' Paired keys: {len(self.keys)}'
+            print(msg)
 
         while True:
             if self.random_order:
@@ -137,7 +144,10 @@ class BassFramedDataset(FramedDataset):
                         ).long() + ps_range[:, 0]
                     )
 
-                if self.keys is not None:
+                if self.chord_seq is not None:
+                    yield (self.data[index_matrix], pitch_shift,
+                           self.chord_seq[raw_ids])
+                elif self.keys is not None:
                     yield self.data[index_matrix], pitch_shift, self.keys[raw_ids]
                 else:
                     yield self.data[index_matrix], pitch_shift
@@ -239,13 +249,19 @@ class CPYinyangLightning(L.LightningModule):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
+        key_override, chord_seq = None, None
         if len(batch) == 3:
-            x, pitch_shift, key_override = batch
+            x, pitch_shift, extra = batch
+            if extra.dim() == 2:
+                chord_seq = extra          # (B, N_chords)
+            else:
+                key_override = extra       # (B,)
         else:
             x, pitch_shift = batch
-            key_override   = None
         x_proc = self.model.base.preprocess(x, pitch_shift)
-        loss   = self.model.loss(x, pitch_shift, key_override=key_override)
+        loss   = self.model.loss(x, pitch_shift,
+                                  key_override=key_override,
+                                  chord_seq=chord_seq)
 
         if self.enc_loss_weight > 0:
             result = self.model.get_encoder_logits(x_proc)
@@ -271,12 +287,18 @@ class CPYinyangLightning(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        key_override, chord_seq = None, None
         if len(batch) == 3:
-            x, pitch_shift, key_override = batch
+            x, pitch_shift, extra = batch
+            if extra.dim() == 2:
+                chord_seq = extra
+            else:
+                key_override = extra
         else:
             x, pitch_shift = batch
-            key_override   = None
-        loss = self.model.loss(x, pitch_shift, key_override=key_override)
+        loss = self.model.loss(x, pitch_shift,
+                                key_override=key_override,
+                                chord_seq=chord_seq)
         key  = 'val_loss' if dataloader_idx == 0 else 'unseen_loss'
         self.log(key, loss, on_step=False, on_epoch=True,
                  sync_dist=True, add_dataloader_idx=False)
@@ -337,6 +359,7 @@ def main(args):
         rule_mode         = args.rule_mode,
         approach          = args.approach,
         chords_per_bar    = args.chords_per_bar,
+        chord_seq_conditioning = args.paired_chord_seq,
     )
 
     if args.unfreeze_base:
@@ -525,6 +548,12 @@ def get_args():
                    help='Harmonic rhythm. 2 (default) = chord changes every half-bar (8 '
                         'subbeats at beat_div=4); 1 = chord per bar. Must match the value '
                         'used to filter the training data.')
+    p.add_argument('--paired_chord_seq', action='store_true',
+                   help='Use the explicit chord-root sequence (from .chord_seq.pt) as the '
+                        'rule input, via ChordSeqRuleModel. Cross-attention runs at '
+                        'chord-position granularity on the rule side (T_k = n_bars * '
+                        'chords_per_bar) and the model learns the alignment to subbeat-'
+                        'level queries. Mutually exclusive with --encoder_injected.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
