@@ -268,7 +268,7 @@ def _save_repaired_snippet_original_tracks(midi_path: str, start_bar: int,
                                              wrong_positions: list[int],
                                              out_path: str,
                                              align_to_downbeat: bool = True,
-                                             tempo: float = 120.0) -> bool:
+                                             tempo: float = 0.0) -> bool:
     """Save the window as a multi-track MIDI (source track structure preserved),
     quantized onto the 16th-note grid at `tempo`, with repair applied ONLY
     inside wrong chord positions.
@@ -294,6 +294,9 @@ def _save_repaired_snippet_original_tracks(midi_path: str, start_bar: int,
     beats = pm.get_beats()
     if len(beats) < 2:
         return False
+    if tempo <= 0:
+        _, tempi = pm.get_tempo_changes()
+        tempo = float(tempi[0]) if len(tempi) and tempi[0] > 0 else 120.0
     if align_to_downbeat:
         downbeats = pm.get_downbeats()
         if len(downbeats) == 0:
@@ -524,7 +527,12 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
                                    out_path: str,
                                    align_to_downbeat: bool = True,
                                    quantize: bool = True,
-                                   tempo: float = 120.0) -> bool:
+                                   tempo: float = 0.0) -> bool:
+    """tempo:
+        0.0 (default) — inherit the source MIDI's initial tempo when it
+                        exists, otherwise fall back to 120.
+        >0            — force that exact BPM (previous behavior).
+    """
     """Slice bars [start_bar, start_bar + n_bars) from the source MIDI.
 
     align_to_downbeat: anchor bar 0 to pm.get_downbeats()[0] (default True).
@@ -539,6 +547,10 @@ def _save_original_tracks_snippet(midi_path: str, start_bar: int, n_bars: int,
     beats = pm.get_beats()
     if len(beats) < 2:
         return False
+
+    if tempo <= 0:
+        _, tempi = pm.get_tempo_changes()
+        tempo = float(tempi[0]) if len(tempi) and tempi[0] > 0 else 120.0
 
     if align_to_downbeat:
         downbeats = pm.get_downbeats()
