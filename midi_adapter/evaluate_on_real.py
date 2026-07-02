@@ -106,6 +106,68 @@ def _load_windows(pt_path: str, window_len: int
     return windows, keys, chord_seq
 
 
+def _detect_root_per_halfbar(sampled, local_i: int, total_beats: int,
+                              sub_per_chord: int, tokenizer) -> list[int]:
+    """Walk the full sampled sequence for one sample and detect the chord root
+    per half-bar (= per chord slot at chords_per_bar=2). Uses the same
+    chromagram + major-triad matcher as the filter."""
+    n_halfbars = total_beats // sub_per_chord
+    roots: list[int] = []
+    for h in range(n_halfbars):
+        chroma = np.zeros(12, dtype=np.float32)
+        for local_sb in range(sub_per_chord):
+            t   = h * sub_per_chord + local_sb
+            y_t = sampled[t][local_i]
+            S   = y_t.shape[0]
+            for v in range(0, S, 2):
+                a = int(y_t[v].item())
+                if a == tokenizer.eos_token or a == tokenizer.pad_token:
+                    break
+                if v + 1 >= S:
+                    break
+                b = int(y_t[v + 1].item())
+                if b == tokenizer.eos_token or b == tokenizer.pad_token or b < 128:
+                    continue
+                chroma[(b % 128) % 12] += 1.0
+        if chroma.sum() < 1e-3:
+            roots.append(-1)
+            continue
+        chroma /= chroma.sum()
+        best_r, best_s = 0, -1.0
+        for r in range(12):
+            s = chroma[r] + chroma[(r + 4) % 12] + chroma[(r + 7) % 12]
+            if s > best_s:
+                best_s, best_r = s, r
+        roots.append(best_r)
+    return roots
+
+
+def _print_demo(key: int, sample_i: int, gen_roots: list[int],
+                prompt_halfbars: int, chords_per_bar: int) -> None:
+    n_halfbars = len(gen_roots)
+    expected = [(key + OFFSETS[h % 4]) % 12 for h in range(n_halfbars)]
+    hb_col   = '  '.join(f'{h:>3}' for h in range(n_halfbars))
+    zone     = '  '.join(f'{("P" if h < prompt_halfbars else "G"):>3}' for h in range(n_halfbars))
+    exp_col  = '  '.join(f'{ROOT_NAMES[r]:>3}' for r in expected)
+    got_col  = '  '.join(f'{(ROOT_NAMES[r] if r >= 0 else "-"):>3}' for r in gen_roots)
+    marks    = []
+    for h, (g, e) in enumerate(zip(gen_roots, expected)):
+        if h < prompt_halfbars:
+            marks.append('·')
+        else:
+            marks.append('✓' if g == e else '✗')
+    mark_col = '  '.join(f'{m:>3}' for m in marks)
+    # Rule-following rate over generated half-bars only.
+    gen_slice = list(zip(gen_roots[prompt_halfbars:], expected[prompt_halfbars:]))
+    acc = sum(1 for g, e in gen_slice if g == e) / max(len(gen_slice), 1)
+    print(f'  Key {ROOT_NAMES[key]}, sample {sample_i}:  gen half-bar acc = {acc:.3f}')
+    print(f'    half-bar : {hb_col}')
+    print(f'    zone     : {zone}   (P = prompt half-bars, G = generated)')
+    print(f'    expected : {exp_col}')
+    print(f'    detected : {got_col}')
+    print(f'    match    : {mark_col}')
+
+
 @torch.no_grad()
 def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                      n_prompt_beats: int, n_gen_beats: int,
@@ -115,6 +177,7 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                      chord_seq: torch.Tensor | None = None,
                      save_midi_dir: str | None = None,
                      midi_prefix:   str = 'seen',
+                     n_demos_per_key: int = 0,
                      ) -> dict[int, dict[str, float]]:
     """Generate continuations for every window and score rule following.
     Returns per-key stats dict: {key: {'bass_acc': ..., 'chord_cov': ..., 'n': ...}}."""
@@ -122,10 +185,16 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
     total_beats  = n_prompt_beats + n_gen_beats
     per_key: dict[int, list[tuple[float, float]]] = {}
 
-    tokenizer = model.base.tokenizer
+    tokenizer     = model.base.tokenizer
+    sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
+    prompt_halfbars = n_prompt_beats // sub_per_chord
+    demos_shown: dict[int, int] = {}
 
     if save_midi_dir is not None:
         os.makedirs(save_midi_dir, exist_ok=True)
+
+    if n_demos_per_key > 0:
+        print(f'\n  Qualitative demos (up to {n_demos_per_key} per key):')
 
     for start in range(0, n_windows, batch_size):
         end = min(start + batch_size, n_windows)
@@ -177,6 +246,13 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                     cov_ok += 1
             per_key.setdefault(key, []).append(
                 (bass_ok / n_gen_beats, cov_ok / n_gen_beats))
+
+            if n_demos_per_key > 0 and demos_shown.get(key, 0) < n_demos_per_key:
+                demos_shown[key] = demos_shown.get(key, 0) + 1
+                gen_roots = _detect_root_per_halfbar(
+                    sampled, local_i, total_beats, sub_per_chord, tokenizer)
+                _print_demo(key, demos_shown[key], gen_roots,
+                             prompt_halfbars, chords_per_bar)
 
             if save_midi_dir is not None:
                 window_idx = start + local_i
@@ -253,6 +329,9 @@ def main():
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='If set, write one MIDI per generated window here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
+    p.add_argument('--n_demos_per_key', type=int, default=2,
+                   help='Print a chord-root-per-half-bar demo for the first '
+                        'N windows in each key. 0 = no demos.')
     args = p.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -289,16 +368,17 @@ def main():
 
         stats = evaluate_dataset(
             model, windows, keys,
-            n_prompt_beats=args.n_prompt_beats,
-            n_gen_beats   =n_gen,
-            temperature   =args.temperature,
-            chords_per_bar=args.chords_per_bar,
-            device        =device,
-            batch_size    =args.batch_size,
-            max_windows   =max_windows,
-            chord_seq     =cs_for_model,
-            save_midi_dir =midi_dir,
-            midi_prefix   =label,
+            n_prompt_beats  =args.n_prompt_beats,
+            n_gen_beats     =n_gen,
+            temperature     =args.temperature,
+            chords_per_bar  =args.chords_per_bar,
+            device          =device,
+            batch_size      =args.batch_size,
+            max_windows     =max_windows,
+            chord_seq       =cs_for_model,
+            save_midi_dir   =midi_dir,
+            midi_prefix     =label,
+            n_demos_per_key =args.n_demos_per_key,
         )
         _print_stats_table(f'{label.upper()} keys  (prompt={args.n_prompt_beats}, '
                             f'gen={n_gen}, T={args.temperature})', stats)
