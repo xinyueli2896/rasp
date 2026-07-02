@@ -178,6 +178,7 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                      save_midi_dir: str | None = None,
                      midi_prefix:   str = 'seen',
                      n_demos_per_key: int = 0,
+                     save_n_per_key: int = 0,
                      ) -> dict[int, dict[str, float]]:
     """Generate continuations for every window and score rule following.
     Returns per-key stats dict: {key: {'bass_acc': ..., 'chord_cov': ..., 'n': ...}}."""
@@ -188,7 +189,8 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
     tokenizer     = model.base.tokenizer
     sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
     prompt_halfbars = n_prompt_beats // sub_per_chord
-    demos_shown: dict[int, int] = {}
+    demos_shown:   dict[int, int] = {}
+    saved_per_key: dict[int, int] = {}
 
     if save_midi_dir is not None:
         os.makedirs(save_midi_dir, exist_ok=True)
@@ -267,7 +269,9 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                 _print_demo(key, demos_shown[key], gen_roots,
                              prompt_halfbars, chords_per_bar)
 
-            if save_midi_dir is not None:
+            if save_midi_dir is not None and \
+                    (save_n_per_key <= 0 or saved_per_key.get(key, 0) < save_n_per_key):
+                saved_per_key[key] = saved_per_key.get(key, 0) + 1
                 window_idx = start + local_i
                 out_path = os.path.join(
                     save_midi_dir,
@@ -350,8 +354,11 @@ def main():
                         '.chord_seq.pt sidecar and hands the chord sequence to '
                         'global_sampling as explicit rule conditioning.')
     p.add_argument('--save_midi_dir', type=str, default=None,
-                   help='If set, write one MIDI per generated window here '
+                   help='If set, write generated windows as MIDI here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
+    p.add_argument('--save_n_per_key', type=int, default=5,
+                   help='Cap MIDI files saved per key (accuracies are still '
+                        'computed over ALL windows). 0 = save every window.')
     p.add_argument('--n_demos_per_key', type=int, default=2,
                    help='Print a chord-root-per-half-bar demo for the first '
                         'N windows in each key. 0 = no demos.')
@@ -435,6 +442,7 @@ def main():
             save_midi_dir   =midi_dir,
             midi_prefix     =label,
             n_demos_per_key =args.n_demos_per_key,
+            save_n_per_key  =args.save_n_per_key,
         )
         _print_stats_table(f'{label.upper()} keys  (prompt={args.n_prompt_beats}, '
                             f'gen={n_gen}, T={args.temperature})', stats)
