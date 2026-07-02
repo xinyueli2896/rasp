@@ -359,6 +359,12 @@ def main():
     p.add_argument('--save_n_per_key', type=int, default=5,
                    help='Cap MIDI files saved per key (accuracies are still '
                         'computed over ALL windows). 0 = save every window.')
+    p.add_argument('--window_split', type=str, default='all',
+                   choices=['all', 'train', 'val', 'test'],
+                   help='Apply FramedDataset\'s window-index modulo-10 split '
+                        'before evaluating: val = idx%%10==1, test = idx%%10==0, '
+                        'train = the rest. Use "val" to score exactly the '
+                        'windows the training run held out as validation.')
     p.add_argument('--n_demos_per_key', type=int, default=2,
                    help='Print a chord-root-per-half-bar demo for the first '
                         'N windows in each key. 0 = no demos.')
@@ -418,6 +424,24 @@ def main():
         print(f'\nLoading {label.upper()} keys: {path}')
         windows, keys, chord_seq = _load_windows(path, args.window_len)
         print(f'  {len(windows)} windows')
+
+        # Optional window-level split filter — reproduces FramedDataset's
+        # modulo-10 partition so eval can use exactly the windows the training
+        # run treated as val (idx % 10 == 1) / test (== 0) / train (> 1).
+        if args.window_split != 'all':
+            idx = torch.arange(len(windows))
+            if args.window_split == 'val':
+                mask = (idx % 10) == 1
+            elif args.window_split == 'test':
+                mask = (idx % 10) == 0
+            else:   # train
+                mask = (idx % 10) > 1
+            windows = windows[mask]
+            keys    = [k for k, m in zip(keys, mask.tolist()) if m]
+            if chord_seq is not None:
+                chord_seq = chord_seq[mask]
+            print(f'  window_split={args.window_split}: kept {len(windows)} windows')
+
         if args.paired_chord_seq and chord_seq is None:
             raise SystemExit(f'--paired_chord_seq set but no .chord_seq.pt sidecar '
                              f'found next to {path}')
