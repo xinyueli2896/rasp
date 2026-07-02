@@ -207,42 +207,51 @@ def _extract_bar_roots_from_cp(cp_data: np.ndarray, chords_per_bar: int = 2) -> 
 
 def _find_ivvi_windows(chord_roots: list[int], n_bars: int = 4,
                        chords_per_bar: int = 2,
-                       phase_zero_only: bool = True) -> list[dict]:
-    """Return list of {start_bar, phase, key} dicts whose detected chord-root
-    sequence matches the I-IV-V-I rule at chords_per_bar harmonic rhythm:
+                       phase_zero_only: bool = True,
+                       allow_wrong: int = 0,
+                       max_consecutive_wrong: int = 0) -> list[dict]:
+    """Return {start_bar, phase, key, wrong_positions} for each window whose
+    detected chord-root sequence matches I-IV-V-I with at most `allow_wrong`
+    positions off. Passes must also satisfy `max_consecutive_wrong` (0 = no
+    consecutive wrongs; use a large value like 8 to disable the constraint).
 
-        chord_roots[i + j] == (key + OFFSETS[(j + phase) % 4]) % 12  for all j
-
-    A window covers `n_bars * chords_per_bar` chord positions, which must be a
-    multiple of 4 (= integer number of I-IV-V-I cycles). i steps in chord
-    positions; start_bar is reported as i // chords_per_bar (whole bars only)
-    so we never cut mid-bar.
+    Reports the (key, phase) with the FEWEST wrongs; ties broken by lowest key
+    then lowest phase, so results are deterministic.
     """
     n_chords_window = n_bars * chords_per_bar
     assert n_chords_window % 4 == 0, \
         f'n_bars * chords_per_bar = {n_chords_window} must be a multiple of 4'
     phases = (0,) if phase_zero_only else (0, 1, 2, 3)
     results = []
-    # Only start on bar boundaries (multiples of chords_per_bar) so windows
-    # always align to musical bar starts.
     for i in range(0, len(chord_roots) - n_chords_window + 1, chords_per_bar):
         roots = chord_roots[i:i + n_chords_window]
         if any(r < 0 for r in roots):
             continue
-        matched = False
+        best = None   # (n_wrong, key, phase, wrong_positions)
         for phase in phases:
             for key in range(12):
-                if all(roots[j] == (key + OFFSETS[(j + phase) % 4]) % 12
-                       for j in range(n_chords_window)):
-                    results.append({
-                        'start_bar': i // chords_per_bar,
-                        'phase':     phase,
-                        'key':       key,
-                    })
-                    matched = True
+                wrong = [j for j in range(n_chords_window)
+                         if roots[j] != (key + OFFSETS[(j + phase) % 4]) % 12]
+                if len(wrong) > allow_wrong:
+                    continue
+                # Consecutive-wrong constraint (0 = no adjacent pair allowed).
+                if any((wrong[k + 1] - wrong[k]) <= max_consecutive_wrong
+                       for k in range(len(wrong) - 1)):
+                    continue
+                if best is None or len(wrong) < best[0]:
+                    best = (len(wrong), key, phase, wrong)
+                if best[0] == 0:
                     break
-            if matched:
+            if best is not None and best[0] == 0:
                 break
+        if best is not None:
+            _, key, phase, wrong = best
+            results.append({
+                'start_bar':       i // chords_per_bar,
+                'phase':           phase,
+                'key':             key,
+                'wrong_positions': wrong,
+            })
     return results
 
 
@@ -252,6 +261,60 @@ def _find_ivvi_windows(chord_roots: list[int], n_bars: int = 4,
 # to 16th-note subbeats; one bar = 2 seconds = 16 subbeats * 0.125 s), instead
 # of the original variable-tempo timing that may have pickups / wobble.
 # ---------------------------------------------------------------------------
+
+def _save_repaired_snippet_from_cp(cp_data: np.ndarray, start_bar: int,
+                                    n_bars: int, chords_per_bar: int,
+                                    key: int, phase: int,
+                                    wrong_positions: list[int],
+                                    max_polyphony: int, out_path: str,
+                                    tempo: float = 120.0) -> bool:
+    """Render the (optionally repaired) 4-bar CP window as MIDI at 120 BPM so
+    you can hear exactly what would go into the training set. If
+    wrong_positions is empty this is identical to _save_midi_example."""
+    start_sb   = start_bar * SUBBEATS_PER_BAR
+    n_subbeats = n_bars * SUBBEATS_PER_BAR
+    if start_sb + n_subbeats > cp_data.shape[0]:
+        return False
+    window = cp_data[start_sb:start_sb + n_subbeats].copy()
+    if wrong_positions:
+        repaired = _repair_window(window, wrong_positions,
+                                   key=key, phase=phase,
+                                   chords_per_bar=chords_per_bar)
+        if repaired is None:
+            print(f'  repair failed at {out_path}; saving raw')
+        else:
+            window = repaired
+    # Now render `window` as MIDI at 120 BPM using the same logic as _save_midi_example.
+    seconds_per_subbeat = 60.0 / tempo / BEAT_DIV
+    out_pm    = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    inst_map: dict[int, pretty_midi.Instrument] = {}
+    any_note  = False
+    for local_sb in range(n_subbeats):
+        start = local_sb * seconds_per_subbeat
+        for v in range(max_polyphony):
+            prog    = int(window[local_sb, v * 4 + 0])
+            pitch   = int(window[local_sb, v * 4 + 1])
+            dur_idx = int(window[local_sb, v * 4 + 2])
+            vel     = int(window[local_sb, v * 4 + 3])
+            if prog == 254 or prog == 255:
+                break
+            if pitch == 255 or dur_idx >= len(DURATION_TEMPLATES):
+                continue
+            end = (local_sb + int(DURATION_TEMPLATES[dur_idx])) * seconds_per_subbeat
+            is_drum = (prog == 127)
+            key_id  = prog
+            if key_id not in inst_map:
+                inst_map[key_id] = pretty_midi.Instrument(
+                    program=0 if is_drum else prog, is_drum=is_drum)
+                out_pm.instruments.append(inst_map[key_id])
+            inst_map[key_id].notes.append(pretty_midi.Note(
+                velocity=vel if vel > 0 else 80, pitch=pitch, start=start, end=end))
+            any_note = True
+    if not any_note:
+        return False
+    out_pm.write(out_path)
+    return True
+
 
 def _save_midi_example(cp_data: np.ndarray, start_bar: int, n_bars: int,
                       max_polyphony: int, out_path: str,
@@ -491,7 +554,9 @@ def cmd_filter(args):
         windows = _find_ivvi_windows(
             chord_roots, n_bars=args.n_bars,
             chords_per_bar=args.chords_per_bar,
-            phase_zero_only=not args.all_phases)
+            phase_zero_only=not args.all_phases,
+            allow_wrong=args.allow_wrong,
+            max_consecutive_wrong=args.max_consecutive_wrong)
         n_subbeats_window = args.n_bars * SUBBEATS_PER_BAR
         for w in windows:
             start_sb = w['start_bar'] * SUBBEATS_PER_BAR
@@ -510,20 +575,25 @@ def cmd_filter(args):
                 'chord_roots': chord_roots[
                     w['start_bar'] * args.chords_per_bar:
                     (w['start_bar'] + args.n_bars) * args.chords_per_bar],
-                'chords_per_bar': args.chords_per_bar,
+                'chords_per_bar':   args.chords_per_bar,
+                'wrong_positions':  w.get('wrong_positions', []),
                 'n_polyphonic_subbeats': n_poly,
             })
             n_windows += 1
             if args.save_examples_dir and examples_per_key[w['key']] < args.examples_per_key:
                 stem = os.path.splitext(os.path.basename(midi_path))[0]
+                wrong_tag = f'_wrong{len(w.get("wrong_positions", []))}' \
+                            if w.get('wrong_positions') else ''
                 out  = os.path.join(
                     args.save_examples_dir,
-                    f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}_{stem}.mid',
+                    f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}{wrong_tag}_{stem}.mid',
                 )
                 try:
-                    if _save_original_tracks_snippet(
-                            midi_path, w['start_bar'], args.n_bars, out,
-                            align_to_downbeat=not args.no_align):
+                    wrote = _save_repaired_snippet_from_cp(
+                        cp_data, w['start_bar'], args.n_bars, args.chords_per_bar,
+                        w['key'], w['phase'], w.get('wrong_positions', []),
+                        args.max_polyphony, out)
+                    if wrote:
                         examples_per_key[w['key']] += 1
                 except Exception as e:
                     print(f'  example-save failed for {midi_path}: {e}')
@@ -560,6 +630,86 @@ def _signed_shift(target_key: int, base_key: int) -> int:
     Returns a value in [-5, +6]."""
     s = (target_key - base_key) % 12
     return s - 12 if s > 6 else s
+
+
+def _shift_segment_pitches(cp_seg: np.ndarray, shift: int) -> np.ndarray | None:
+    """Shift the pitch slot of every non-drum/EOS/pad note in a CP tensor slice
+    by `shift` semitones. Returns None if any note would clip outside [0, 127]."""
+    if shift == 0:
+        return cp_seg.copy()
+    out     = cp_seg.copy()
+    progs   = out[:, 0::4]
+    pitches = out[:, 1::4]
+    valid   = (progs < 127) & (pitches != 255)
+    shifted = pitches.astype(np.int32) + shift
+    if ((shifted < 0) | (shifted > 127))[valid].any():
+        return None
+    new_p = pitches.copy()
+    new_p[valid] = shifted[valid].astype(np.uint8)
+    out[:, 1::4] = new_p
+    return out
+
+
+def _repair_window(cp_window: np.ndarray, wrong_positions: list[int],
+                    key: int, phase: int, chords_per_bar: int
+                    ) -> np.ndarray | None:
+    """Fix each wrong chord slot in cp_window (shape (n_subbeats, subseq)):
+      1. Look for another chord slot with the SAME expected root that is
+         correct in this window → copy its subbeats verbatim.
+      2. If no same-slot donor is available, transpose the wrong slot's
+         subbeats by (expected_root - detected_root) semitones (chromagram-
+         based on the wrong segment itself).
+
+    Returns the repaired window, or None if any repair fails."""
+    sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
+    n_chords      = cp_window.shape[0] // sub_per_chord
+
+    def _expected(c: int) -> int:
+        return (key + OFFSETS[(c + phase) % 4]) % 12
+
+    # Correct positions by expected root (candidates for copy donors).
+    donors_by_root: dict[int, list[int]] = {}
+    for c in range(n_chords):
+        if c not in wrong_positions:
+            donors_by_root.setdefault(_expected(c), []).append(c)
+
+    out = cp_window.copy()
+    for wrong_c in wrong_positions:
+        exp_root = _expected(wrong_c)
+        dst_start = wrong_c * sub_per_chord
+
+        # Try copy-from-same-slot first.
+        donors = donors_by_root.get(exp_root, [])
+        if donors:
+            # Pick the temporally closest donor for smoother continuity.
+            src_c = min(donors, key=lambda c: abs(c - wrong_c))
+            src_start = src_c * sub_per_chord
+            out[dst_start:dst_start + sub_per_chord] = \
+                out[src_start:src_start + sub_per_chord]
+            continue
+
+        # Fallback: detect the segment's actual root, then transpose.
+        seg = out[dst_start:dst_start + sub_per_chord]
+        chroma = np.zeros(12, dtype=np.float32)
+        for sb in range(seg.shape[0]):
+            for v in range(seg.shape[1] // 4):
+                prog  = int(seg[sb, v * 4])
+                pitch = int(seg[sb, v * 4 + 1])
+                if prog == 255 or prog == 254 or prog == 127 or pitch == 255:
+                    continue
+                chroma[pitch % 12] += 1.0
+        if chroma.sum() < 1e-3:
+            return None   # empty segment, can't repair
+        det = int(chroma.argmax())   # rough detected root
+        shift = (exp_root - det) % 12
+        if shift > 6:
+            shift -= 12
+        shifted = _shift_segment_pitches(seg, shift)
+        if shifted is None:
+            return None
+        out[dst_start:dst_start + sub_per_chord] = shifted
+
+    return out
 
 
 def _transpose_window(window: torch.Tensor, shift: int) -> torch.Tensor | None:
@@ -643,15 +793,28 @@ def cmd_extract(args):
         if end_sb > cp_data.shape[0]:
             continue
 
-        base_window = torch.tensor(cp_data[start_sb:end_sb].copy(), dtype=torch.uint8)
+        base_key = entry['key']
+        phase    = entry['phase']
+        wrong    = entry.get('wrong_positions', [])
+
+        # If the filter accepted this window with wrongs, repair before
+        # sorting/transposing so downstream tensors follow the exact I-IV-V-I.
+        raw_window = cp_data[start_sb:end_sb].copy()
+        if wrong:
+            repaired = _repair_window(raw_window, wrong,
+                                       key=base_key, phase=phase,
+                                       chords_per_bar=entry_chords_per_bar)
+            if repaired is None:
+                print(f'  repair failed for window {n_saved} — skipping')
+                continue
+            raw_window = repaired
+
+        base_window = torch.tensor(raw_window, dtype=torch.uint8)
         base_window = pitch_sort_cp(base_window)
 
         n_notes = (base_window[:, 0::4] < 254).sum().item()
         if n_notes < n_bars_window * args.min_notes_per_bar:
             continue
-
-        base_key = entry['key']
-        phase    = entry['phase']
 
         for target_key in args.target_keys:
             shift = _signed_shift(target_key, base_key)
@@ -787,6 +950,16 @@ def main():
     pf.add_argument('--all_phases',    action='store_true',
                     help='Accept all 4 cyclic rotations (start on I/IV/V/I). '
                          'Default keeps only phase 0 (windows start on I).')
+    pf.add_argument('--allow_wrong',    type=int, default=0,
+                    help='Accept windows with up to this many chord positions '
+                         'that DO NOT match the expected I-IV-V-I. Repaired at '
+                         'extract time by copying from a same-slot correct '
+                         'donor (or transposing if none). Default 0 = strict.')
+    pf.add_argument('--max_consecutive_wrong', type=int, default=0,
+                    help='Additional constraint on --allow_wrong: reject '
+                         'windows where two wrong positions are within this '
+                         'many slots. 0 = no adjacent wrongs (safest); use a '
+                         'large value (e.g. 8) to disable the constraint.')
     pf.add_argument('--no_align',      action='store_true',
                     help='Skip downbeat alignment and the 4/4 time-signature check. '
                          'Bar 0 starts at pm.get_beats()[0]. Use for datasets that '
