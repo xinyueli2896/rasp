@@ -297,7 +297,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--base_ckpt',    default=None,
                    help='Base CP transformer ckpt (only needed for adapter-only .pt)')
-    p.add_argument('--adapter_ckpt', required=True)
+    p.add_argument('--adapter_ckpt', default=None,
+                   help='Adapter checkpoint. Omit together with --no_adapter to '
+                        'evaluate the plain pretrained base model as a baseline.')
+    p.add_argument('--no_adapter',   action='store_true',
+                   help='Baseline mode: generate with the ORIGINAL pretrained CP '
+                        'transformer only — no adapter, no rule conditioning. '
+                        'Requires --base_ckpt; --adapter_ckpt is ignored.')
     p.add_argument('--seen_data',    type=str, default=None,
                    help='.pt dataset of val windows in seen keys')
     p.add_argument('--unseen_data',  type=str, default=None,
@@ -339,13 +345,46 @@ def main():
     max_windows = args.max_windows or None
 
     print('Loading model ...')
-    model = load_model(args.base_ckpt, args.adapter_ckpt,
-                       args.model_size, args.adapter_rank, args.n_skip,
-                       args.bidirectional, args.encoder_injected,
-                       args.encoder_type, args.rule_mode, args.approach,
-                       chords_per_bar=args.chords_per_bar,
-                       chord_seq_conditioning=args.paired_chord_seq,
-                       device=device)
+    if args.no_adapter:
+        # Baseline: the plain pretrained CP transformer, no adapter layers,
+        # no rule conditioning. Wrapped so evaluate_dataset can use the same
+        # model.base.* / model.global_sampling interface.
+        if not args.base_ckpt or not os.path.exists(args.base_ckpt):
+            raise SystemExit('--no_adapter requires a valid --base_ckpt')
+        from cp_transformer import RoFormerSymbolicTransformer
+
+        class _BaseOnly:
+            def __init__(self, base):
+                self.base = base
+            def global_sampling(self, x, max_seq_len, temperature,
+                                 chord_seq=None, **kw):
+                # chord_seq accepted and ignored — the base model is unconditioned.
+                return self.base.global_sampling(
+                    x, max_seq_len=max_seq_len, temperature=temperature)
+            def eval(self):
+                self.base.eval()
+                return self
+
+        base = RoFormerSymbolicTransformer(size=args.model_size,
+                                           max_lr=1e-4, with_velocity=False)
+        state = torch.load(args.base_ckpt, map_location='cpu')
+        if 'state_dict' in state:
+            state = state['state_dict']
+        base.load_state_dict(state)
+        base.to(device)
+        model = _BaseOnly(base)
+        print(f'  BASELINE mode: pretrained base only ({args.base_ckpt})')
+    else:
+        if not args.adapter_ckpt:
+            raise SystemExit('--adapter_ckpt is required (or pass --no_adapter '
+                             'for the pretrained-base baseline)')
+        model = load_model(args.base_ckpt, args.adapter_ckpt,
+                           args.model_size, args.adapter_rank, args.n_skip,
+                           args.bidirectional, args.encoder_injected,
+                           args.encoder_type, args.rule_mode, args.approach,
+                           chords_per_bar=args.chords_per_bar,
+                           chord_seq_conditioning=args.paired_chord_seq,
+                           device=device)
     model.eval()
 
     for label, path in (('seen', args.seen_data),
