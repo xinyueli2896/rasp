@@ -262,6 +262,158 @@ def _find_ivvi_windows(chord_roots: list[int], n_bars: int = 4,
 # of the original variable-tempo timing that may have pickups / wobble.
 # ---------------------------------------------------------------------------
 
+def _save_repaired_snippet_original_tracks(midi_path: str, start_bar: int,
+                                             n_bars: int, chords_per_bar: int,
+                                             key: int, phase: int,
+                                             wrong_positions: list[int],
+                                             out_path: str,
+                                             align_to_downbeat: bool = True,
+                                             tempo: float = 120.0) -> bool:
+    """Save the window as a multi-track MIDI (source track structure preserved),
+    quantized onto the 16th-note grid at `tempo`, with repair applied ONLY
+    inside wrong chord positions.
+
+    For each wrong chord slot, per-track:
+      1. Try to copy the notes from a same-slot correct chord position in THIS
+         track (temporally closest donor picked).
+      2. If no same-slot donor is available, transpose that track's notes in
+         the wrong slot by (expected_root − dominant_pc) semitones (smallest
+         signed shift) so the segment aligns with the expected chord.
+
+    Everything else — every original track, every note in a correct position —
+    passes through unchanged, so the source's instrumentation and voicing is
+    preserved intact.
+    """
+    if not wrong_positions:
+        return _save_original_tracks_snippet(midi_path, start_bar, n_bars,
+                                              out_path,
+                                              align_to_downbeat=align_to_downbeat,
+                                              quantize=True, tempo=tempo)
+
+    pm = pretty_midi.PrettyMIDI(midi_path)
+    beats = pm.get_beats()
+    if len(beats) < 2:
+        return False
+    if align_to_downbeat:
+        downbeats = pm.get_downbeats()
+        if len(downbeats) == 0:
+            return False
+        start_beat_idx = int(np.searchsorted(beats, downbeats[0] - 1e-9, side='left'))
+    else:
+        start_beat_idx = 0
+    if start_beat_idx >= len(beats) - 1:
+        return False
+
+    subbeat_times: list[float] = []
+    for i in range(start_beat_idx, len(beats) - 1):
+        dt = (beats[i + 1] - beats[i]) / BEAT_DIV
+        for j in range(BEAT_DIV):
+            subbeat_times.append(beats[i] + j * dt)
+    subbeat_times.append(float(beats[-1]))
+    subbeat_times_arr = np.asarray(subbeat_times)
+
+    start_sb   = start_bar * SUBBEATS_PER_BAR
+    n_subbeats = n_bars * SUBBEATS_PER_BAR
+    end_sb     = start_sb + n_subbeats
+    if end_sb > len(subbeat_times_arr):
+        return False
+    t_win_start = subbeat_times_arr[start_sb]
+    t_win_end   = subbeat_times_arr[end_sb] if end_sb < len(subbeat_times_arr) \
+                  else subbeat_times_arr[-1]
+
+    sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
+    n_positions   = n_bars * chords_per_bar
+    sec_per_sb    = 60.0 / tempo / BEAT_DIV
+
+    def _expected(c: int) -> int:
+        return (key + OFFSETS[(c + phase) % 4]) % 12
+
+    donors_by_root: dict[int, list[int]] = {}
+    for c in range(n_positions):
+        if c not in wrong_positions:
+            donors_by_root.setdefault(_expected(c), []).append(c)
+
+    out_pm    = pretty_midi.PrettyMIDI(initial_tempo=tempo)
+    any_note  = False
+    eps       = 1e-4
+
+    for inst in pm.instruments:
+        # Quantize this track's notes into output-time subbeat coordinates.
+        quant: list[tuple[int, int, int, int]] = []   # (s_loc, e_loc, pitch, velocity)
+        for note in inst.notes:
+            if note.end <= t_win_start + eps or note.start >= t_win_end - eps:
+                continue
+            clip_start = max(note.start, t_win_start)
+            clip_end   = min(note.end,   t_win_end)
+            s_abs = int(np.searchsorted(subbeat_times_arr, clip_start + eps, side='right')) - 1
+            e_abs = int(np.searchsorted(subbeat_times_arr, clip_end   + eps, side='right')) - 1
+            s_loc = max(0, s_abs - start_sb)
+            e_loc = max(s_loc + 1, min(e_abs - start_sb, n_subbeats))
+            if s_loc >= n_subbeats:
+                continue
+            quant.append((s_loc, e_loc, int(note.pitch), int(note.velocity)))
+
+        if not quant:
+            continue
+
+        final: list[tuple[int, int, int, int]] = []
+        for c in range(n_positions):
+            c_start = c * sub_per_chord
+            c_end   = (c + 1) * sub_per_chord
+            in_c    = [(s, e, p, v) for (s, e, p, v) in quant
+                       if c_start <= s < c_end]
+
+            if c not in wrong_positions:
+                final.extend(in_c)
+                continue
+
+            exp_root = _expected(c)
+            donors   = donors_by_root.get(exp_root, [])
+            if donors:
+                src_c = min(donors, key=lambda x: abs(x - c))
+                src_start = src_c * sub_per_chord
+                offset    = c_start - src_start
+                for (s, e, p, v) in quant:
+                    if src_start <= s < src_start + sub_per_chord:
+                        final.append((s + offset,
+                                       min(e + offset, n_subbeats),
+                                       p, v))
+                continue
+
+            # Transpose fallback: detect wrong slot's dominant PC and shift.
+            if not in_c:
+                continue
+            pcs = np.zeros(12, dtype=np.int64)
+            for (_, _, p, _) in in_c:
+                pcs[p % 12] += 1
+            det = int(pcs.argmax())
+            shift = (exp_root - det) % 12
+            if shift > 6:
+                shift -= 12
+            for (s, e, p, v) in in_c:
+                np_ = p + shift
+                if 0 <= np_ <= 127:
+                    final.append((s, e, np_, v))
+
+        if not final:
+            continue
+        new_inst = pretty_midi.Instrument(
+            program=inst.program, is_drum=inst.is_drum, name=inst.name)
+        for (s, e, p, v) in final:
+            new_inst.notes.append(pretty_midi.Note(
+                velocity=v if v > 0 else 80, pitch=p,
+                start=s * sec_per_sb,
+                end  =e * sec_per_sb,
+            ))
+        out_pm.instruments.append(new_inst)
+        any_note = True
+
+    if not any_note:
+        return False
+    out_pm.write(out_path)
+    return True
+
+
 def _save_repaired_snippet_from_cp(cp_data: np.ndarray, start_bar: int,
                                     n_bars: int, chords_per_bar: int,
                                     key: int, phase: int,
@@ -589,10 +741,11 @@ def cmd_filter(args):
                     f'key{ROOT_NAMES[w["key"]]}_phase{w["phase"]}_bar{w["start_bar"]:04d}{wrong_tag}_{stem}.mid',
                 )
                 try:
-                    wrote = _save_repaired_snippet_from_cp(
-                        cp_data, w['start_bar'], args.n_bars, args.chords_per_bar,
+                    wrote = _save_repaired_snippet_original_tracks(
+                        midi_path, w['start_bar'], args.n_bars, args.chords_per_bar,
                         w['key'], w['phase'], w.get('wrong_positions', []),
-                        args.max_polyphony, out)
+                        out_path=out,
+                        align_to_downbeat=not args.no_align)
                     if wrote:
                         examples_per_key[w['key']] += 1
                 except Exception as e:
