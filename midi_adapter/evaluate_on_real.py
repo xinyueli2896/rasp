@@ -41,6 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from midi_adapter.evaluate_cp_yinyang import load_model
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
 from midi_adapter.filter_nottingham import ROOT_NAMES
+from midi_adapter.infer_cp_yinyang import decode_output
 
 
 _KEY_STR_TO_PC = {name: i for i, name in enumerate(ROOT_NAMES)}
@@ -62,11 +63,16 @@ def _expected_root(key: int, sb: int, chords_per_bar: int, phase: int = 0) -> in
     return (key + OFFSETS[(sb // sub_per_chord + phase) % 4]) % 12
 
 
-def _load_windows(pt_path: str, window_len: int) -> tuple[torch.Tensor, list[int]]:
+def _load_windows(pt_path: str, window_len: int
+                   ) -> tuple[torch.Tensor, list[int], torch.Tensor | None]:
     """Load a dataset produced by extract_orchestrated.
 
-    Returns (windows: (N, window_len, subseq), keys: list of target-key pitch
-    classes parsed from the .txt sidecar)."""
+    Returns:
+      windows: (N, window_len, subseq) uint8
+      keys:    list of target-key pitch classes (parsed from .txt sidecar
+                OR loaded from .keys.pt if present)
+      chord_seq: (N, N_chords) long — loaded from .chord_seq.pt if present, else None
+    """
     data = torch.load(pt_path, weights_only=True)   # (N * window_len, subseq)
     if data.dim() != 2:
         raise ValueError(f'Unexpected data shape {data.shape}')
@@ -76,16 +82,28 @@ def _load_windows(pt_path: str, window_len: int) -> tuple[torch.Tensor, list[int
     n_windows = n_rows // window_len
     windows = data.view(n_windows, window_len, subseq)
 
-    txt_path = pt_path[:-3] + '.txt'
-    with open(txt_path) as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    if len(lines) != n_windows:
-        print(f'  WARN: {txt_path} has {len(lines)} entries but data has {n_windows} windows')
-    keys: list[int] = []
-    for i in range(n_windows):
-        k = _parse_key(lines[i]) if i < len(lines) else None
-        keys.append(k if k is not None else -1)
-    return windows, keys
+    # Keys: prefer .keys.pt over parsing the .txt.
+    keys_path = pt_path[:-3] + '.keys.pt'
+    if os.path.exists(keys_path):
+        keys = torch.load(keys_path, weights_only=True).long().tolist()
+    else:
+        txt_path = pt_path[:-3] + '.txt'
+        with open(txt_path) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        if len(lines) != n_windows:
+            print(f'  WARN: {txt_path} has {len(lines)} entries but data has {n_windows} windows')
+        keys = []
+        for i in range(n_windows):
+            k = _parse_key(lines[i]) if i < len(lines) else None
+            keys.append(k if k is not None else -1)
+
+    # Optional paired chord_seq — required in chord-seq inference mode.
+    cs_path = pt_path[:-3] + '.chord_seq.pt'
+    chord_seq = None
+    if os.path.exists(cs_path):
+        chord_seq = torch.load(cs_path, weights_only=True).long()
+
+    return windows, keys, chord_seq
 
 
 @torch.no_grad()
@@ -93,7 +111,10 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                      n_prompt_beats: int, n_gen_beats: int,
                      temperature: float, chords_per_bar: int,
                      device: torch.device, batch_size: int = 8,
-                     max_windows: int | None = None
+                     max_windows: int | None = None,
+                     chord_seq: torch.Tensor | None = None,
+                     save_midi_dir: str | None = None,
+                     midi_prefix:   str = 'seen',
                      ) -> dict[int, dict[str, float]]:
     """Generate continuations for every window and score rule following.
     Returns per-key stats dict: {key: {'bass_acc': ..., 'chord_cov': ..., 'n': ...}}."""
@@ -102,7 +123,9 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
     per_key: dict[int, list[tuple[float, float]]] = {}
 
     tokenizer = model.base.tokenizer
-    S = model.base.hidden_size  # unused but keeps the tensor shape check honest
+
+    if save_midi_dir is not None:
+        os.makedirs(save_midi_dir, exist_ok=True)
 
     for start in range(0, n_windows, batch_size):
         end = min(start + batch_size, n_windows)
@@ -115,8 +138,13 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
         # contiguous tensor. The slice below is a non-contiguous view.
         prompt = x_proc[:, :n_prompt_beats].contiguous()
 
+        batch_chord_seq = None
+        if chord_seq is not None:
+            batch_chord_seq = chord_seq[start:end].to(device)
+
         sampled = model.global_sampling(prompt, max_seq_len=total_beats,
-                                         temperature=temperature)
+                                         temperature=temperature,
+                                         chord_seq=batch_chord_seq)
 
         # sampled[t] is (batch_size, subseq_len) preprocessed token for beat t.
         for local_i, key in enumerate(batch_keys):
@@ -149,6 +177,19 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                     cov_ok += 1
             per_key.setdefault(key, []).append(
                 (bass_ok / n_gen_beats, cov_ok / n_gen_beats))
+
+            if save_midi_dir is not None:
+                window_idx = start + local_i
+                out_path = os.path.join(
+                    save_midi_dir,
+                    f'{midi_prefix}_{window_idx:05d}_key{ROOT_NAMES[key]}.mid',
+                )
+                # Slice out this sample from every generated subbeat tensor.
+                per_sample = [sampled[t][local_i:local_i + 1, :] for t in range(total_beats)]
+                try:
+                    decode_output(per_sample, save_path=out_path)
+                except Exception as e:
+                    print(f'  MIDI-save failed for window {window_idx}: {e}')
 
     stats: dict[int, dict[str, float]] = {}
     for k, results in per_key.items():
@@ -205,6 +246,13 @@ def main():
     p.add_argument('--rule_mode',    type=str, default='current')
     p.add_argument('--approach',     type=str, default='chord', choices=['bass', 'chord'])
     p.add_argument('--chords_per_bar', type=int, default=2, choices=[1, 2, 4])
+    p.add_argument('--paired_chord_seq', action='store_true',
+                   help='Must match the flag used during training. Loads the '
+                        '.chord_seq.pt sidecar and hands the chord sequence to '
+                        'global_sampling as explicit rule conditioning.')
+    p.add_argument('--save_midi_dir', type=str, default=None,
+                   help='If set, write one MIDI per generated window here '
+                        '(named {seen|unseen}_NNNNN_keyX.mid).')
     args = p.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -215,16 +263,29 @@ def main():
     model = load_model(args.base_ckpt, args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip,
                        args.bidirectional, args.encoder_injected,
-                       args.encoder_type, args.rule_mode, args.approach, device)
+                       args.encoder_type, args.rule_mode, args.approach,
+                       chords_per_bar=args.chords_per_bar,
+                       chord_seq_conditioning=args.paired_chord_seq,
+                       device=device)
     model.eval()
 
-    for label, path in (('SEEN keys', args.seen_data),
-                         ('UNSEEN keys', args.unseen_data)):
+    for label, path in (('seen', args.seen_data),
+                         ('unseen', args.unseen_data)):
         if path is None:
             continue
-        print(f'\nLoading {label}: {path}')
-        windows, keys = _load_windows(path, args.window_len)
+        print(f'\nLoading {label.upper()} keys: {path}')
+        windows, keys, chord_seq = _load_windows(path, args.window_len)
         print(f'  {len(windows)} windows')
+        if args.paired_chord_seq and chord_seq is None:
+            raise SystemExit(f'--paired_chord_seq set but no .chord_seq.pt sidecar '
+                             f'found next to {path}')
+        # Only pass chord_seq to the model when we're in chord-seq mode; otherwise
+        # global_sampling handles rule conditioning itself from the prompt/key.
+        cs_for_model = chord_seq if args.paired_chord_seq else None
+
+        midi_dir = None
+        if args.save_midi_dir is not None:
+            midi_dir = os.path.join(args.save_midi_dir, label)
 
         stats = evaluate_dataset(
             model, windows, keys,
@@ -235,9 +296,12 @@ def main():
             device        =device,
             batch_size    =args.batch_size,
             max_windows   =max_windows,
+            chord_seq     =cs_for_model,
+            save_midi_dir =midi_dir,
+            midi_prefix   =label,
         )
-        _print_stats_table(f'{label}  (prompt={args.n_prompt_beats}, gen={n_gen}, '
-                            f'T={args.temperature})', stats)
+        _print_stats_table(f'{label.upper()} keys  (prompt={args.n_prompt_beats}, '
+                            f'gen={n_gen}, T={args.temperature})', stats)
 
 
 if __name__ == '__main__':
