@@ -37,10 +37,27 @@ VAL_ALL=$ROOT/val_all_keys
 RUN_NAME=pop909_ivvi_w1_orch_perkey
 
 # ─── Env activation helpers ──────────────────────────────────────────────────
+# Non-interactive bash doesn't source .bashrc, so conda may not be on PATH.
+# Locate the conda binary explicitly, checking the usual install locations.
+if command -v conda >/dev/null 2>&1; then
+    CONDA_BIN=$(command -v conda)
+else
+    CONDA_BIN=""
+    for c in "$HOME/anaconda3/bin/conda" "$HOME/miniconda3/bin/conda" \
+             /opt/anaconda3/bin/conda /opt/miniconda3/bin/conda \
+             /usr/local/anaconda3/bin/conda; do
+        if [ -x "$c" ]; then CONDA_BIN="$c"; break; fi
+    done
+    if [ -z "$CONDA_BIN" ]; then
+        echo "ERROR: conda not found. Edit CONDA_BIN in this script to point at your conda binary." >&2
+        exit 1
+    fi
+fi
+
 # `conda run -n <env> --live-stream <cmd>` runs one command in the named env
 # without needing conda to be initialized in the current shell.
-rasp_run() { conda run -n rasp --live-stream --no-capture-output "$@"; }
-sarr_run() { conda run -n sarr --live-stream --no-capture-output "$@"; }
+rasp_run() { "$CONDA_BIN" run -n rasp --live-stream --no-capture-output "$@"; }
+sarr_run() { "$CONDA_BIN" run -n sarr --live-stream --no-capture-output "$@"; }
 
 # ─── Step selector ───────────────────────────────────────────────────────────
 if [ $# -gt 0 ]; then
