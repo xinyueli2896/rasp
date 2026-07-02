@@ -66,6 +66,18 @@ class BassFramedDataset(FramedDataset):
                  disable_pitch_shift: bool = False, **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
         self.disable_pitch_shift = disable_pitch_shift
+        # Paired-condition tensors — populated in preload() or __iter__().
+        self.keys      = None
+        self.chord_seq = None
+
+    def _load_pair_files(self) -> None:
+        """Load optional .chord_seq.pt / .keys.pt sidecars (chord_seq wins)."""
+        cs_path   = self.file_path[:-3] + '.chord_seq.pt'
+        keys_path = self.file_path[:-3] + '.keys.pt'
+        if os.path.exists(cs_path):
+            self.chord_seq = torch.load(cs_path, weights_only=True).long()
+        elif os.path.exists(keys_path):
+            self.keys = torch.load(keys_path, weights_only=True).long()
 
     def preload(self, shared_data_cache: dict | None = None):
         """Load data and pitch_shift_range into memory now.
@@ -87,6 +99,12 @@ class BassFramedDataset(FramedDataset):
             psr = torch.zeros_like(psr)
         self.pitch_shift_range = psr
 
+        self._load_pair_files()
+        if self.chord_seq is not None:
+            print(f'  paired chord_seq: {tuple(self.chord_seq.shape)}')
+        elif self.keys is not None:
+            print(f'  paired keys: {len(self.keys)}')
+
     def __iter__(self):
         if self.data is None:
             self.data = torch.load(self.file_path, weights_only=True)
@@ -97,15 +115,7 @@ class BassFramedDataset(FramedDataset):
             self.pitch_shift_range[self.pitch_shift_range[:, 1] > 6, 1] = 6
             if self.split in ('val', 'test'):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
-            # Optional paired-condition tensors — chord_seq wins over keys.
-            self.chord_seq = None
-            self.keys      = None
-            cs_path   = self.file_path[:-3] + '.chord_seq.pt'
-            keys_path = self.file_path[:-3] + '.keys.pt'
-            if os.path.exists(cs_path):
-                self.chord_seq = torch.load(cs_path, weights_only=True).long()
-            elif os.path.exists(keys_path):
-                self.keys = torch.load(keys_path, weights_only=True).long()
+            self._load_pair_files()
             msg = f'Data for dataset {self.file_path} loaded.'
             if self.chord_seq is not None:
                 msg += f' Paired chord_seq: {tuple(self.chord_seq.shape)}'
