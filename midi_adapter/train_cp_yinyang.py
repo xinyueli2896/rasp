@@ -97,7 +97,14 @@ class BassFramedDataset(FramedDataset):
             self.pitch_shift_range[self.pitch_shift_range[:, 1] > 6, 1] = 6
             if self.split in ('val', 'test'):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
-            print(f'Data for dataset {self.file_path} loaded.')
+            # Optional paired keys tensor — one target-key pitch class per song.
+            keys_path = self.file_path[:-3] + '.keys.pt'
+            if os.path.exists(keys_path):
+                self.keys = torch.load(keys_path, weights_only=True).long()
+            else:
+                self.keys = None
+            print(f'Data for dataset {self.file_path} loaded.'
+                  + (f' Paired keys: {len(self.keys)}' if self.keys is not None else ''))
 
         while True:
             if self.random_order:
@@ -130,7 +137,10 @@ class BassFramedDataset(FramedDataset):
                         ).long() + ps_range[:, 0]
                     )
 
-                yield self.data[index_matrix], pitch_shift
+                if self.keys is not None:
+                    yield self.data[index_matrix], pitch_shift, self.keys[raw_ids]
+                else:
+                    yield self.data[index_matrix], pitch_shift
 
             if not self.repeat:
                 break
@@ -182,7 +192,8 @@ class UnseenAccuracyCallback(L.Callback):
             for batch_idx, batch in enumerate(self.dataloader):
                 if batch_idx >= self.n_batches:
                     break
-                x, pitch_shift = [t.to(device) for t in batch]
+                tensors = [t.to(device) for t in batch]
+                x, pitch_shift = tensors[0], tensors[1]
 
                 prompt = model.base.preprocess(
                     x[:, :self.n_prompt_beats, :], pitch_shift
@@ -228,9 +239,13 @@ class CPYinyangLightning(L.LightningModule):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        x, pitch_shift = batch
+        if len(batch) == 3:
+            x, pitch_shift, key_override = batch
+        else:
+            x, pitch_shift = batch
+            key_override   = None
         x_proc = self.model.base.preprocess(x, pitch_shift)
-        loss   = self.model.loss(x, pitch_shift)
+        loss   = self.model.loss(x, pitch_shift, key_override=key_override)
 
         if self.enc_loss_weight > 0:
             result = self.model.get_encoder_logits(x_proc)
@@ -256,8 +271,12 @@ class CPYinyangLightning(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        x, pitch_shift = batch
-        loss = self.model.loss(x, pitch_shift)
+        if len(batch) == 3:
+            x, pitch_shift, key_override = batch
+        else:
+            x, pitch_shift = batch
+            key_override   = None
+        loss = self.model.loss(x, pitch_shift, key_override=key_override)
         key  = 'val_loss' if dataloader_idx == 0 else 'unseen_loss'
         self.log(key, loss, on_step=False, on_epoch=True,
                  sync_dist=True, add_dataloader_idx=False)

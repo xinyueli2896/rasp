@@ -423,21 +423,33 @@ class CPYinyangTransformer(nn.Module):
             enc_out = self.rule_input_encoder(cur_pc)             # (B, T, 12)
             return enc_out, cur_pc                                 # logits, CE target
 
-    def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
+    def _rule_hidden(self, x_proc: torch.Tensor,
+                     key_override: torch.Tensor | None = None) -> torch.Tensor:
         """Compute frozen analytical rule_hidden from preprocessed tokens.
 
-        Reads key = pc[b, 0] from voice 0 (slot 1) and runs the rule model:
-          bass  : BassTracrRuleModel  → (B, T, 16/28) with one-hot pitch encoding
-          chord : CPChordRuleModel    → (B, T, 16) with binary chromagram encoding
-        Both models encode (key, t) → expected rule signal at position t.
+        Reads key = pc[b, 0] from voice 0 (slot 1) and runs the rule model.
+        key_override, if provided as a (B,) long tensor of pitch classes,
+        replaces the input-derived key — used for paired-data training where
+        the intended key is known explicitly and doesn't need to be inferred
+        from the input's first pitch class.
         """
+        T = x_proc.shape[1]
+        if key_override is not None:
+            return self.rule_model.build_rule_hidden_analytic(
+                key_override.to(x_proc.device), T, x_proc.device)
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T) voice-0 pitch class; pc[b,0] = key
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, d_model)
         return h
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                 key_override: torch.Tensor | None = None) -> torch.Tensor:
         """
         x : (B, seq_len, subseq_len)  preprocessed CP tokens
+        key_override : optional (B,) long tensor of target-key pitch classes,
+                       used only when encoder_injected=False and bidirectional=False
+                       (i.e. the analytical-rule-model path). Enables paired-data
+                       training where the intended key is known and shouldn't be
+                       inferred from the input.
         Returns logits of shape (B, seq_len, subseq_len, vocab_size) via local_decode.
         """
         base = self.base
@@ -448,7 +460,7 @@ class CPYinyangTransformer(nn.Module):
         elif self.bidirectional:
             rule_hidden = None
         else:
-            rule_hidden = self._rule_hidden(x)
+            rule_hidden = self._rule_hidden(x, key_override=key_override)
 
         h, emb = base.local_encode(x)
         h = h.view(batch_size, seq_len, base.hidden_size)
@@ -466,9 +478,14 @@ class CPYinyangTransformer(nn.Module):
 
         return base.local_decode(h, emb)
 
-    def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor) -> torch.Tensor:
+    def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor,
+             key_override: torch.Tensor | None = None) -> torch.Tensor:
         x_proc = self.base.preprocess(x, pitch_shift)
-        logits = self(x_proc)
+        # Same shift used to build the input has to be applied to the key so the
+        # rule signal moves in step with the audio: (key + shift) mod 12.
+        if key_override is not None:
+            key_override = (key_override + pitch_shift) % 12
+        logits = self(x_proc, key_override=key_override)
         return F.cross_entropy(
             logits.view(-1, self.base.tokenizer.n_tokens),
             x_proc.view(-1),
