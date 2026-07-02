@@ -11,3 +11,4 @@ build/
 .env
 data/
 input/
+midi_adapter/run_pipeline_pop909_w1_orch.sh
