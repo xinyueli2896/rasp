@@ -105,6 +105,16 @@ class BassFramedDataset(FramedDataset):
         elif self.keys is not None:
             print(f'  paired keys: {len(self.keys)}')
 
+    def __len__(self):
+        # A repeating iterator produces samples indefinitely. Reporting the
+        # single-pass batch count made DataLoader spam a warning each step
+        # once we passed that count. Return a huge number so DataLoader
+        # thinks we always have more to yield; Lightning uses
+        # val_check_interval, not __len__, to schedule val loops.
+        if self.repeat:
+            return 2**31 - 1
+        return super().__len__()
+
     def __iter__(self):
         if self.data is None:
             self.data = torch.load(self.file_path, weights_only=True)
