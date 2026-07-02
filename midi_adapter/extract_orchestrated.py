@@ -136,6 +136,12 @@ def main():
     p.add_argument('--phase',         type=int, default=0,
                    help='I-IV-V-I phase for the chord-token stream (all filter '
                         'matches are saved at phase=0 by default).')
+    p.add_argument('--per_folder_key_only', action='store_true',
+                   help='Option B pipeline: each folder was already orchestrated '
+                        'in its OWN target key (via pre-transposed leadsheets). '
+                        'Skip further transposition; each folder produces exactly '
+                        'one saved window in its own labeled key. --target_keys '
+                        'is ignored.')
     p.add_argument('--target_keys', type=int, nargs='+', default=list(SEEN_KEYS_DEFAULT),
                    help='Keys (pitch classes 0-11) to transpose each window into. '
                         'Default = 10 seen keys (excluding F#/G#).')
@@ -284,12 +290,39 @@ def main():
                     n_rule_skipped += 1
                     continue
 
-            for target_key in args.target_keys:
-                shift = _signed_shift(target_key, base_key)
-                win_t = _transpose_window(window, shift)
-                if win_t is None:
-                    continue   # clip would push notes outside MIDI [0, 127]
-                win_t = pitch_sort_cp(win_t)
+            # Option B: this folder was orchestrated in its own target key
+            # already, so we save exactly one window with no further shift.
+            if args.per_folder_key_only:
+                iter_keys = (base_key,)
+                do_shift  = False
+            else:
+                iter_keys = args.target_keys
+                do_shift  = True
+
+            for target_key in iter_keys:
+                if do_shift:
+                    shift = _signed_shift(target_key, base_key)
+                    win_t = _transpose_window(window, shift)
+                    if win_t is None:
+                        continue   # clip would push notes outside MIDI [0, 127]
+                    win_t = pitch_sort_cp(win_t)
+                else:
+                    win_t = pitch_sort_cp(window)
+
+                # Chord tokens / paired chord_seq must exist for the target key.
+                # In Option B, target_key == base_key; we compute inline in case
+                # base_key was outside the pre-built --target_keys set.
+                if target_key not in chord_tokens_by_key:
+                    toks = []
+                    for sb in range(n_subbeats_window):
+                        chord_in_window = sb // sub_per_chord
+                        root = (target_key + OFFSETS[(chord_in_window + args.phase) % 4]) % 12
+                        toks.append(chord_str_to_token(f'{ROOT_NAMES[root]}:maj'))
+                    chord_tokens_by_key[target_key] = torch.tensor(toks, dtype=torch.int16)
+                    chord_seq_by_key[target_key] = [
+                        (target_key + OFFSETS[(c + args.phase) % 4]) % 12
+                        for c in range(n_chord_positions)
+                    ]
 
                 all_data.append(win_t)
                 all_chords.append(chord_tokens_by_key[target_key])
