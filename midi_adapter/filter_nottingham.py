@@ -28,6 +28,7 @@ to a target-key set):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -778,6 +779,18 @@ SEEN_KEYS_DEFAULT   = (0, 1, 2, 3, 4, 5, 7, 9, 10, 11)
 UNSEEN_KEYS_DEFAULT = (6, 8)
 
 
+def song_split_side(song_id: str, val_frac: float, seed: int) -> str:
+    """Stable per-song train/val assignment: 'val' iff md5(seed:song_id)
+    maps below val_frac. Unlike a shuffle over the observed song set, the
+    result for a given song NEVER depends on which other songs are present —
+    so the direct-extract pipeline and the orchestrated-extract pipeline
+    agree on every song's side even when their song sets differ (e.g. a song
+    whose orchestrations all failed still counts as a val song everywhere)."""
+    h = hashlib.md5(f'{seed}:{song_id}'.encode()).digest()
+    frac = int.from_bytes(h[:4], 'big') / 2**32
+    return 'val' if frac < val_frac else 'train'
+
+
 def _signed_shift(target_key: int, base_key: int) -> int:
     """Smallest-magnitude semitone shift mapping base_key → target_key.
     Returns a value in [-5, +6]."""
@@ -914,8 +927,27 @@ def cmd_extract(args):
     print(f'Window length: {n_bars_window} bars ({n_subbeats_window} subbeats),  '
           f'chords_per_bar={entry_chords_per_bar}')
 
+    if args.split != 'all' and args.val_song_frac <= 0:
+        raise SystemExit('--split requires --val_song_frac > 0')
+    if args.val_song_frac > 0:
+        n_split_skipped = 0
+        split_songs = {
+            os.path.splitext(os.path.basename(e['midi_path']))[0]
+            for e in manifest
+        }
+        n_val = sum(1 for s in split_songs
+                    if song_split_side(s, args.val_song_frac, args.split_seed) == 'val')
+        print(f'Song split (stable hash, seed={args.split_seed}, '
+              f'val_frac={args.val_song_frac}): '
+              f'{len(split_songs) - n_val} train / {n_val} val songs — '
+              f'keeping "{args.split}"')
+
     for entry in manifest:
         midi_path = entry['midi_path']
+        if args.split != 'all':
+            sid = os.path.splitext(os.path.basename(midi_path))[0]
+            if song_split_side(sid, args.val_song_frac, args.split_seed) != args.split:
+                continue
         if midi_path not in cp_cache:
             try:
                 cp_arr = _load_midi_aligned(
@@ -1149,6 +1181,15 @@ def main():
                          'target key (smallest signed shift). Default: all 12 keys '
                          'except F# (6) and G# (8), reserved as unseen-eval keys. '
                          'Pass "6 8" to build the unseen-eval dataset.')
+    pe.add_argument('--val_song_frac',  type=float, default=0.0,
+                    help='Fraction of source songs to hold out as val (stable md5 '
+                         'hash of the song stem — matches extract_orchestrated\'s '
+                         'partition for the same seed, so both pipelines agree on '
+                         'every song\'s side).')
+    pe.add_argument('--split_seed',     type=int, default=42)
+    pe.add_argument('--split',          type=str, default='all',
+                    choices=['train', 'val', 'all'],
+                    help='Which songs to include when --val_song_frac > 0.')
 
     pl = sub.add_parser('leadsheets',
                         help='Save matched windows as multi-track MIDI files with '

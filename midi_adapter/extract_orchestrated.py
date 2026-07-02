@@ -75,6 +75,7 @@ from midi_adapter.filter_nottingham import (
     _signed_shift,
     _transpose_window,
     _extract_chord_roots_from_cp,
+    song_split_side,
     SEEN_KEYS_DEFAULT,
     ROOT_NAMES,
 )
@@ -109,15 +110,15 @@ def _song_id_from_folder(folder_name: str) -> str | None:
 
 def _partition_songs(song_ids: list[str], val_frac: float, seed: int
                      ) -> tuple[set[str], set[str]]:
-    """Deterministic song-level split. Same (song_ids, val_frac, seed) always
-    yields the same partition, so the training and val runs align."""
-    rng = np.random.default_rng(seed)
+    """Deterministic song-level split using the per-song stable hash from
+    filter_nottingham.song_split_side. Unlike a shuffle over the observed
+    song set, each song's side depends only on (song_id, seed) — so this
+    partition agrees with `filter_nottingham extract --val_song_frac ...`
+    even when the two pipelines see different song subsets."""
     unique = sorted(set(song_ids))
-    idx = np.arange(len(unique))
-    rng.shuffle(idx)
-    n_val = int(round(len(unique) * val_frac))
-    val_set   = {unique[i] for i in idx[:n_val]}
-    train_set = {unique[i] for i in idx[n_val:]}
+    val_set   = {s for s in unique
+                 if song_split_side(s, val_frac, seed) == 'val'}
+    train_set = set(unique) - val_set
     return train_set, val_set
 
 

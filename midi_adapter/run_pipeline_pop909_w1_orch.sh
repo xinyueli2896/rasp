@@ -34,7 +34,8 @@ SNIPPETS_PERKEY=$ROOT/snippets_perkey
 ORCH=$ROOT/orch_perkey
 TRAIN_ALL=$ROOT/train_all_keys
 VAL_ALL=$ROOT/val_all_keys
-RUN_NAME=pop909_ivvi_w1_orch_perkey
+DIRECT_TRAIN=$ROOT/direct_train_seenkeys       # direct (non-orchestrated) train data
+RUN_NAME=pop909_ivvi_w1_orch_perkey_mixed
 
 # ─── Env activation helpers ──────────────────────────────────────────────────
 # Non-interactive bash doesn't source .bashrc, so conda may not be on PATH.
@@ -192,15 +193,36 @@ PY
     fi
 fi
 
-# ─── Step 7: train ──────────────────────────────────────────────────────────
+# ─── Step 6c: direct (non-orchestrated) train dataset, same song split ──────
+# Extracts the repaired POP909 windows straight from the manifest, restricted
+# to TRAIN songs via the same stable-hash split — so no val song leaks into
+# training through the direct data. Seen keys only (extract's default
+# --target_keys already excludes F# and G#).
+if run_step 6; then
+    if [ -f "${DIRECT_TRAIN}.pt" ]; then
+        log "Step 6c — direct train dataset already exists, skipping"
+    else
+        log "Step 6c — extract direct dataset (train songs, seen keys)"
+        cd "$RASP_REPO"
+        rasp_run python -m midi_adapter.filter_nottingham extract \
+            --manifest "$MANIFEST" \
+            --out_dir  "$ROOT/direct_train_midi" \
+            --out_pt   "$DIRECT_TRAIN" \
+            --no_align \
+            --val_song_frac 0.1 --split_seed 42 --split train
+    fi
+fi
+
+# ─── Step 7: train (orchestrated + direct, interleaved 50/50) ───────────────
 if run_step 7; then
-    log "Step 7 — train adapter"
+    log "Step 7 — train adapter (mix orchestrated + direct)"
     cd "$RASP_REPO"
     rasp_run python -m midi_adapter.train_cp_yinyang \
-        --base_ckpt   "$BASE_CKPT" \
-        --train_data  "${TRAIN_ALL}_seenkeys.pt" \
-        --val_data    "${VAL_ALL}_seenkeys.pt" \
-        --unseen_data "${VAL_ALL}_unseenkeys.pt" \
+        --base_ckpt     "$BASE_CKPT" \
+        --train_data    "${TRAIN_ALL}_seenkeys.pt" \
+        --pretrain_data "${DIRECT_TRAIN}.pt" \
+        --val_data      "${VAL_ALL}_seenkeys.pt" \
+        --unseen_data   "${VAL_ALL}_unseenkeys.pt" \
         --approach chord --n_skip 1 --paired_chord_seq \
         --chords_per_bar 2 --model_size 1 --adapter_rank 256 --batch_size 8 \
         --max_steps 40000 \
