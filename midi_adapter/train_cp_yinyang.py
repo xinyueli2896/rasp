@@ -180,24 +180,35 @@ class BassFramedDataset(FramedDataset):
 # Unseen accuracy callback
 # ---------------------------------------------------------------------------
 
-class UnseenAccuracyCallback(L.Callback):
+class RuleFollowingCallback(L.Callback):
     """
-    At each val check, compute rule-following accuracy on unseen-key data using
-    AUTOREGRESSIVE generation so the metric reflects actual generation quality
-    rather than teacher-forced next-token prediction.
+    At each val check, run AUTOREGRESSIVE greedy generation on a val loader and
+    measure how often the generated content obeys the I-IV-V-I chord rule.
 
-    For each batch: preprocess the first n_prompt_beats as a prompt, generate
-    the next n_gen_beats autoregressively (greedy), then check whether the
-    pitch class of each generated beat matches the expected root.
+    Two metrics are logged per prefix:
 
-    beats_per_bar=1 : beat-level rule  expected_root[t] = (key + OFFSETS[t%4]) % 12
-    beats_per_bar=4 : bar-level  rule  expected_root[t] = (key + OFFSETS[(t//4)%4]) % 12
+      {prefix}_bass_acc   fraction of generated subbeats where voice 0's pitch
+                          class == expected chord root (bass-line rule)
+      {prefix}_chord_acc  fraction of generated subbeats where the expected
+                          major triad {root, root+4, root+7} ⊆ pitch classes
+                          across ALL voices (harmony rule)
+
+    `{prefix}_acc` is aliased to `{prefix}_bass_acc` for backwards compat.
+
+    The expected root at each generated subbeat is computed from the batch's
+    paired signal — the ground-truth key we trained on — NOT from the prompt's
+    first pitch class (which may not be the tonic). This makes the metric the
+    honest "does the model follow the rule we told it to follow" test.
+
+    beats_per_bar = subbeats per chord slot at beat_div=4:
+        16 → 1 chord per bar,  8 → 2 chords per bar (default at chords_per_bar=2).
     """
 
-    def __init__(self, dataloader: DataLoader, n_batches: int = 5,
-                 n_prompt_beats: int = 4, n_gen_beats: int = 16,
-                 beats_per_bar: int = 1):
+    def __init__(self, dataloader: DataLoader, prefix: str = 'unseen',
+                 n_batches: int = 5, n_prompt_beats: int = 4,
+                 n_gen_beats: int = 16, beats_per_bar: int = 1):
         self.dataloader     = dataloader
+        self.prefix         = prefix
         self.n_batches      = n_batches
         self.n_prompt_beats = n_prompt_beats
         self.n_gen_beats    = n_gen_beats
@@ -206,15 +217,16 @@ class UnseenAccuracyCallback(L.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
             return
-        # AR generation is expensive; only run on rank 0 to avoid DDP OOM / sync issues
-        if trainer.global_rank != 0:
+        if trainer.global_rank != 0:   # AR gen is expensive; rank 0 only
             return
         model       = pl_module.model
         device      = pl_module.device
         total_beats = self.n_prompt_beats + self.n_gen_beats
+        tokenizer   = model.base.tokenizer
 
-        correct = 0
-        total   = 0
+        bass_correct  = 0
+        chord_correct = 0
+        total         = 0
 
         torch.cuda.empty_cache()
         model.eval()
@@ -224,37 +236,73 @@ class UnseenAccuracyCallback(L.Callback):
                     break
                 tensors = [t.to(device) for t in batch]
                 x, pitch_shift = tensors[0], tensors[1]
-                # Third tensor (if present) is the paired condition. Route by shape:
-                # 2-D → chord_seq (B, N_chords); 1-D → key_override (B,).
-                chord_seq = None
-                if len(tensors) >= 3 and tensors[2].dim() == 2:
-                    chord_seq = (tensors[2] + pitch_shift.unsqueeze(-1)) % 12
+
+                # Route the 3rd tensor by shape; also derive the ground-truth
+                # key per sample from whichever paired signal is present.
+                chord_seq    = None
+                key_from_pair = None
+                if len(tensors) >= 3:
+                    if tensors[2].dim() == 2:
+                        chord_seq     = (tensors[2] + pitch_shift.unsqueeze(-1)) % 12
+                        key_from_pair = chord_seq[:, 0].long()   # first chord IS the tonic (phase=0)
+                    else:
+                        key_from_pair = (tensors[2] + pitch_shift) % 12
 
                 prompt = model.base.preprocess(
                     x[:, :self.n_prompt_beats, :], pitch_shift
-                )                                              # (B, n_prompt_beats, subseq)
+                )   # (B, n_prompt_beats, subseq)
 
-                # Autoregressive generation — greedy (temperature=0)
                 sampled = model.global_sampling(
                     prompt, max_seq_len=total_beats, temperature=0,
                     chord_seq=chord_seq,
                 )
 
-                # Extract key from prompt's first beat: slot 1 % 128 % 12
-                key = (prompt[:, 0, 1] % 128 % 12)            # (B,)
+                # Fallback: derive from prompt's first pitch class.
+                if key_from_pair is None:
+                    key_from_pair = (prompt[:, 0, 1] % 128) % 12   # (B,)
 
-                # sampled[t] is (B, subseq_len) preprocessed token for beat t.
-                # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
+                # Iterate over generated subbeats and score both metrics.
                 for t in range(self.n_prompt_beats, total_beats):
-                    y_t         = sampled[t]                                               # (B, subseq)
-                    pred_pc     = (y_t[:, 1] % 128) % 12                                  # (B,)
-                    phase       = (t // self.beats_per_bar) % 4
-                    expected_pc = (key + OFFSETS[phase]) % 12                             # (B,)
-                    correct    += (pred_pc == expected_pc).sum().item()
-                    total      += len(pred_pc)
+                    y_t   = sampled[t]                    # (B, subseq)
+                    B, S  = y_t.shape
 
-        acc = correct / max(total, 1)
-        pl_module.log('unseen_acc', acc, prog_bar=True)
+                    phase        = (t // self.beats_per_bar) % 4
+                    expected_root = (key_from_pair + OFFSETS[phase]) % 12   # (B,)
+
+                    # Bass rule — voice 0's pitch class
+                    pred_bass_pc = (y_t[:, 1] % 128) % 12
+                    bass_correct += (pred_bass_pc == expected_root).sum().item()
+
+                    # Chord rule — expected triad ⊆ pitch classes across all voices
+                    for b in range(B):
+                        pcs: set[int] = set()
+                        for v in range(0, S, 2):
+                            a = int(y_t[b, v].item())
+                            if a == tokenizer.eos_token or a == tokenizer.pad_token:
+                                break
+                            if v + 1 >= S:
+                                break
+                            bt = int(y_t[b, v + 1].item())
+                            if bt == tokenizer.eos_token or bt == tokenizer.pad_token or bt < 128:
+                                continue
+                            pcs.add((bt % 128) % 12)
+                        r = int(expected_root[b].item())
+                        expected_triad = {(r + i) % 12 for i in (0, 4, 7)}
+                        if expected_triad.issubset(pcs):
+                            chord_correct += 1
+
+                    total += B
+
+        bass_acc  = bass_correct  / max(total, 1)
+        chord_acc = chord_correct / max(total, 1)
+        pl_module.log(f'{self.prefix}_bass_acc',  bass_acc,  prog_bar=True)
+        pl_module.log(f'{self.prefix}_chord_acc', chord_acc, prog_bar=False)
+        # Legacy alias so existing checkpoints / dashboards keep working
+        pl_module.log(f'{self.prefix}_acc',       bass_acc,  prog_bar=False)
+
+
+# Back-compat alias
+UnseenAccuracyCallback = RuleFollowingCallback
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +474,22 @@ def main(args):
     train_loader = DataLoader(effective_train_ds, batch_size=None, num_workers=0)
     val_loader   = DataLoader(val_ds,   batch_size=None, num_workers=0)
 
-    val_loaders   = [val_loader]
+    val_loaders    = [val_loader]
+    # Beats-per-bar (= subbeats per chord slot) for the rule-following metric.
+    if args.approach == 'chord':
+        subs_per_chord = 16 // args.chords_per_bar   # 8 at chords_per_bar=2
+    else:
+        subs_per_chord = 4                            # bass approach: one root per beat
+
+    # Rule-following callback on the SEEN val set → seen_bass_acc / seen_chord_acc.
+    seen_acc_cb = RuleFollowingCallback(
+        val_loader, prefix='seen',
+        n_batches=5,
+        n_prompt_beats=args.train_length // 4,
+        n_gen_beats   =args.train_length - args.train_length // 4,
+        beats_per_bar =subs_per_chord,
+    )
+
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_ds = BassFramedDataset(args.unseen_data, args.train_length, args.batch_size,
@@ -435,35 +498,41 @@ def main(args):
         unseen_ds.preload(_cache)
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
         val_loaders.append(unseen_loader)
-        # beats_per_bar here = subbeats per chord position (rule changes every K subbeats)
-        if args.approach == 'chord':
-            subs_per_chord = 16 // args.chords_per_bar   # 8 at chords_per_bar=2
-        else:
-            subs_per_chord = 4   # bass approach: one root per beat
-        unseen_acc_cb = UnseenAccuracyCallback(
-            unseen_loader, n_batches=5,
+        unseen_acc_cb = RuleFollowingCallback(
+            unseen_loader, prefix='unseen',
+            n_batches=5,
             n_prompt_beats=args.train_length // 4,
             n_gen_beats   =args.train_length - args.train_length // 4,
-            beats_per_bar=subs_per_chord,
+            beats_per_bar =subs_per_chord,
         )
         print(f'Unseen eval data: {args.unseen_data}')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    # Always track val_loss on the SEEN val set — unseen_acc still gets logged
-    # for monitoring but doesn't drive checkpoint selection.
-    ckpt_monitor, ckpt_mode, ckpt_filename = (
-        'val_loss', 'min', run_name + '.{epoch:02d}.{val_loss:.5f}',
-    )
-    checkpoint_cb = L.callbacks.ModelCheckpoint(
-        monitor           = ckpt_monitor,
-        mode              = ckpt_mode,
+    # Two parallel checkpoint series — lowest val_loss (seen) and highest
+    # unseen_bass_acc (rule-following on unseen keys).
+    checkpoint_loss_cb = L.callbacks.ModelCheckpoint(
+        monitor           = 'val_loss',
+        mode              = 'min',
         save_top_k        = 5,
         save_last         = True,
         save_weights_only = True,
         enable_version_counter = False,
         dirpath    = os.path.join(args.ckpt_dir, run_name),
-        filename   = ckpt_filename,
+        filename   = run_name + '.by_val_loss.{epoch:02d}.{val_loss:.5f}',
     )
+    checkpoint_cbs = [checkpoint_loss_cb]
+    if unseen_acc_cb is not None:
+        checkpoint_acc_cb = L.callbacks.ModelCheckpoint(
+            monitor           = 'unseen_bass_acc',
+            mode              = 'max',
+            save_top_k        = 5,
+            save_last         = False,   # save_last already produced by the val_loss series
+            save_weights_only = True,
+            enable_version_counter = False,
+            dirpath    = os.path.join(args.ckpt_dir, run_name),
+            filename   = run_name + '.by_unseen_acc.{epoch:02d}.{unseen_bass_acc:.4f}',
+        )
+        checkpoint_cbs.append(checkpoint_acc_cb)
 
     loggers = []
     if args.wandb_project:
@@ -483,7 +552,8 @@ def main(args):
     else:
         strategy = 'auto'
 
-    callbacks = [checkpoint_cb]
+    callbacks = list(checkpoint_cbs)
+    callbacks.append(seen_acc_cb)
     if unseen_acc_cb is not None:
         callbacks.append(unseen_acc_cb)
 
@@ -507,8 +577,8 @@ def main(args):
     ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
     trainer.fit(lit, train_loader, val_loaders, ckpt_path=ckpt_path)
 
-    # Load best checkpoint and save adapter weights as plain .pt
-    best_ckpt = checkpoint_cb.best_model_path or checkpoint_cb.last_model_path
+    # Load best (by val_loss) checkpoint and save adapter weights as plain .pt
+    best_ckpt = checkpoint_loss_cb.best_model_path or checkpoint_loss_cb.last_model_path
     if best_ckpt and os.path.exists(best_ckpt):
         best_state = torch.load(best_ckpt, map_location='cpu')['state_dict']
         adapter_state = {k[len('model.'):]: v for k, v in best_state.items()
