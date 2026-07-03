@@ -191,10 +191,20 @@ def main():
     print(f'Found {len(files)} snippet MIDIs in {args.in_dir}')
 
     n_ok = 0
+    n_resumed = 0
     for i, fname in enumerate(files):
         stem = os.path.splitext(fname)[0]
         src  = os.path.join(args.in_dir, fname)
         song_dir = os.path.join(args.out_dir, stem)
+
+        # Resume support: skip inputs whose output folder already has the full
+        # set of band arrangements from a previous (possibly interrupted) run.
+        if all(os.path.exists(os.path.join(song_dir, f'arrangement_band-{k:02d}.mid'))
+               for k in range(args.num_sample)):
+            n_ok      += 1
+            n_resumed += 1
+            continue
+
         os.makedirs(song_dir, exist_ok=True)
         shutil.copy(src, os.path.join(song_dir, 'lead sheet.mid'))
 
@@ -234,7 +244,8 @@ def main():
         if (i + 1) % 10 == 0:
             print(f'  {i + 1}/{len(files)} processed ({n_ok} succeeded)')
 
-    print(f'\nDone. {n_ok}/{len(files)} succeeded.')
+    print(f'\nDone. {n_ok}/{len(files)} succeeded '
+          f'({n_resumed} resumed from a previous run).')
     print(f'Outputs: {args.out_dir}/<stem>/arrangement_band-NN.mid')
 
 

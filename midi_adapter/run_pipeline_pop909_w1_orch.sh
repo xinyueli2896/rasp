@@ -121,18 +121,17 @@ if run_step 3; then
 fi
 
 # ─── Step 4: AccoMontage Stage 2 (in the sarr conda env, from SA_REPO) ──────
+# batch_orchestrate resumes: folders that already have all num_sample band
+# arrangements are skipped instantly, so re-running after an interruption
+# only fills in the gaps.
 if run_step 4; then
-    if [ -d "$ORCH" ] && [ -n "$(find "$ORCH" -mindepth 2 -name 'arrangement_band-*.mid' -print -quit 2>/dev/null)" ]; then
-        log "Step 4 — orchestrated output already present in $ORCH, skipping"
-    else
-        log "Step 4 — orchestrate every transposed snippet (Stage 2 only)"
-        cd "$SA_REPO"
-        sarr_run python "$RASP_REPO/midi_adapter/batch_orchestrate.py" \
-            --in_dir    "$SNIPPETS_PERKEY" \
-            --out_dir   "$ORCH" \
-            --data_root "$SA_DATA_ROOT_REL/" \
-            --n_bars 4 --tempo 120 --num_sample 2
-    fi
+    log "Step 4 — orchestrate every transposed snippet (Stage 2 only, resumable)"
+    cd "$SA_REPO"
+    sarr_run python "$RASP_REPO/midi_adapter/batch_orchestrate.py" \
+        --in_dir    "$SNIPPETS_PERKEY" \
+        --out_dir   "$ORCH" \
+        --data_root "$SA_DATA_ROOT_REL/" \
+        --n_bars 4 --tempo 120 --num_sample 2
 fi
 
 # ─── Step 5+6: extract CP tensors with rule filter + song-level split ───────
