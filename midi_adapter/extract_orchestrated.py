@@ -331,7 +331,7 @@ def main():
                 all_chord_seq.append(chord_seq_by_key[target_key])
                 rel = f'{os.path.relpath(midi_path, args.in_dir)}#key{ROOT_NAMES[target_key]}'
                 txt_lines.append(f'{n_saved}\t{rel}')
-                per_key_counts[target_key] += 1
+                per_key_counts[target_key] = per_key_counts.get(target_key, 0) + 1
                 n_saved += 1
 
     if n_saved == 0:
