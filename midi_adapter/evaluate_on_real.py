@@ -290,28 +290,52 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
         bass = np.array([r[1] for r in results])
         cov  = np.array([r[2] for r in results])
         stats[k] = {
-            'halfbar_acc': float(hb.mean()),
-            'bass_acc':    float(bass.mean()),
-            'chord_cov':   float(cov.mean()),
+            'halfbar_acc': float(hb.mean()),   'halfbar_std': float(hb.std(ddof=1)) if len(hb) > 1 else 0.0,
+            'bass_acc':    float(bass.mean()), 'bass_std':    float(bass.std(ddof=1)) if len(bass) > 1 else 0.0,
+            'chord_cov':   float(cov.mean()),  'cov_std':     float(cov.std(ddof=1)) if len(cov) > 1 else 0.0,
             'n':           len(results),
+            # Raw per-window scores kept for pooled statistics downstream.
+            '_hb_raw':   hb,
+            '_bass_raw': bass,
+            '_cov_raw':  cov,
         }
     return stats
 
 
 def _print_stats_table(title: str, stats: dict[int, dict[str, float]]) -> None:
+    """Per-key rows show mean ± std over that key's windows. Two summary rows:
+    MEAN±kstd = mean over keys ± std across the 10/2 key means (key-level spread);
+    POOLED    = mean ± std over ALL windows regardless of key (window-level spread)."""
     print(f'\n── {title} ──')
-    print(f'  {"key":<4}  {"n":>4}  {"halfbar_acc":>12}  {"bass_acc":>10}  {"chord_cov":>10}')
-    means = {'hb': [], 'bass': [], 'cov': []}
+    print(f'  {"key":<4}  {"n":>4}  {"halfbar_acc":>16}  {"bass_acc":>16}  {"chord_cov":>16}')
+    key_means = {'hb': [], 'bass': [], 'cov': []}
+    raw       = {'hb': [], 'bass': [], 'cov': []}
     for k in sorted(stats):
         s = stats[k]
-        print(f'  {ROOT_NAMES[k]:<4}  {s["n"]:>4}  {s["halfbar_acc"]:>12.3f}  '
-              f'{s["bass_acc"]:>10.3f}  {s["chord_cov"]:>10.3f}')
-        means['hb'].append(s['halfbar_acc'])
-        means['bass'].append(s['bass_acc'])
-        means['cov'].append(s['chord_cov'])
-    if means['hb']:
-        print(f'  {"MEAN":<4}  {"":>4}  {np.mean(means["hb"]):>12.3f}  '
-              f'{np.mean(means["bass"]):>10.3f}  {np.mean(means["cov"]):>10.3f}')
+        print(f'  {ROOT_NAMES[k]:<4}  {s["n"]:>4}  '
+              f'{s["halfbar_acc"]:>8.3f} ±{s["halfbar_std"]:<6.3f}  '
+              f'{s["bass_acc"]:>8.3f} ±{s["bass_std"]:<6.3f}  '
+              f'{s["chord_cov"]:>8.3f} ±{s["cov_std"]:<6.3f}')
+        key_means['hb'].append(s['halfbar_acc'])
+        key_means['bass'].append(s['bass_acc'])
+        key_means['cov'].append(s['chord_cov'])
+        raw['hb'].append(s['_hb_raw'])
+        raw['bass'].append(s['_bass_raw'])
+        raw['cov'].append(s['_cov_raw'])
+    if key_means['hb']:
+        print(f'  {"MEAN":<4}  {"":>4}  '
+              f'{np.mean(key_means["hb"]):>8.3f} ±{np.std(key_means["hb"], ddof=1) if len(key_means["hb"]) > 1 else 0.0:<6.3f}  '
+              f'{np.mean(key_means["bass"]):>8.3f} ±{np.std(key_means["bass"], ddof=1) if len(key_means["bass"]) > 1 else 0.0:<6.3f}  '
+              f'{np.mean(key_means["cov"]):>8.3f} ±{np.std(key_means["cov"], ddof=1) if len(key_means["cov"]) > 1 else 0.0:<6.3f}'
+              f'   (± = std across key means)')
+        hb_all   = np.concatenate(raw['hb'])
+        bass_all = np.concatenate(raw['bass'])
+        cov_all  = np.concatenate(raw['cov'])
+        print(f'  {"POOL":<4}  {len(hb_all):>4}  '
+              f'{hb_all.mean():>8.3f} ±{hb_all.std(ddof=1):<6.3f}  '
+              f'{bass_all.mean():>8.3f} ±{bass_all.std(ddof=1):<6.3f}  '
+              f'{cov_all.mean():>8.3f} ±{cov_all.std(ddof=1):<6.3f}'
+              f'   (± = std across all windows)')
 
 
 def main():
