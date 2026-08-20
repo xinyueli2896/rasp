@@ -424,6 +424,11 @@ def main():
         state = torch.load(args.base_ckpt, map_location='cpu')
         if 'state_dict' in state:
             state = state['state_dict']
+        # Fine-tuned checkpoints from train_cp_yinyang --finetune_base wrap the
+        # base as `model.base.*`; strip the prefix so the raw base loads.
+        if any(k.startswith('model.base.') for k in state):
+            state = {k[len('model.base.'):]: v for k, v in state.items()
+                     if k.startswith('model.base.')}
         base.load_state_dict(state)
         base.to(device)
         model = _BaseOnly(base)

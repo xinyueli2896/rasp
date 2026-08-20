@@ -21,6 +21,7 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as L
 from pytorch_lightning.loggers import WandbLogger
@@ -309,6 +310,28 @@ UnseenAccuracyCallback = RuleFollowingCallback
 # Lightning module wrapper
 # ---------------------------------------------------------------------------
 
+class BaseFinetuneWrapper(nn.Module):
+    """Full fine-tuning baseline: the plain pretrained CP transformer with NO
+    adapter and NO rule conditioning. The model can only infer the key from
+    the prompt. Exposes the same .loss / .global_sampling / .base interface as
+    CPYinyangTransformer so the Lightning module and rule callbacks work
+    unchanged (paired condition tensors are accepted and ignored)."""
+
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.approach = 'chord'   # keeps downstream attribute reads happy
+
+    def loss(self, x, pitch_shift, key_override=None, chord_seq=None):
+        return self.base.loss(x, pitch_shift)
+
+    def global_sampling(self, x, max_seq_len=384, temperature=1.0,
+                         sampling_func=None, chord_seq=None):
+        return self.base.global_sampling(x, max_seq_len=max_seq_len,
+                                          temperature=temperature,
+                                          sampling_func=sampling_func)
+
+
 class CPYinyangLightning(L.LightningModule):
 
     def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int,
@@ -422,24 +445,32 @@ def main(args):
     else:
         print('WARNING: no base checkpoint found — training adapter from scratch.')
 
-    adapter = CPYinyangTransformer(
-        base_model        = base,
-        adapter_rank      = args.adapter_rank,
-        n_skip            = args.n_skip,
-        lora_rank         = args.lora_rank,
-        bidirectional     = args.bidirectional,
-        encoder_injected  = args.encoder_injected,
-        encoder_type      = args.encoder_type,
-        rule_mode         = args.rule_mode,
-        approach          = args.approach,
-        chords_per_bar    = args.chords_per_bar,
-        chord_seq_conditioning = args.paired_chord_seq,
-    )
-
-    if args.unfreeze_base:
-        for p in adapter.base.parameters():
+    if args.finetune_base:
+        # Full fine-tuning baseline — no adapter, no rule conditioning.
+        adapter = BaseFinetuneWrapper(base)
+        for p in adapter.parameters():
             p.requires_grad_(True)
-        print('Base model UNFROZEN — training base + adapter jointly')
+        max_lr = args.finetune_lr
+        print(f'FULL FINE-TUNE mode: training the entire base model, lr={max_lr}')
+    else:
+        adapter = CPYinyangTransformer(
+            base_model        = base,
+            adapter_rank      = args.adapter_rank,
+            n_skip            = args.n_skip,
+            lora_rank         = args.lora_rank,
+            bidirectional     = args.bidirectional,
+            encoder_injected  = args.encoder_injected,
+            encoder_type      = args.encoder_type,
+            rule_mode         = args.rule_mode,
+            approach          = args.approach,
+            chords_per_bar    = args.chords_per_bar,
+            chord_seq_conditioning = args.paired_chord_seq,
+        )
+
+        if args.unfreeze_base:
+            for p in adapter.base.parameters():
+                p.requires_grad_(True)
+            print('Base model UNFROZEN — training base + adapter jointly')
 
     n_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
     n_frozen    = sum(p.numel() for p in adapter.parameters() if not p.requires_grad)
@@ -616,6 +647,14 @@ def get_args():
     p.add_argument('--n_skip',             type=int, default=4)
     p.add_argument('--lora_rank',          type=int, default=0,
                    help='LoRA rank for base model Q/V projections (0 = frozen base)')
+    p.add_argument('--finetune_base',      action='store_true',
+                   help='Full fine-tuning baseline: train the ENTIRE pretrained base '
+                        'with no adapter and no rule conditioning. The model can only '
+                        'infer the key from the prompt. Evaluate with '
+                        'evaluate_on_real --no_adapter --base_ckpt <this run\'s ckpt>.')
+    p.add_argument('--finetune_lr',        type=float, default=1e-5,
+                   help='Learning rate for --finetune_base (default 1e-5, lower than '
+                        'adapter training since all 100M+ base weights move).')
     p.add_argument('--unfreeze_base',      action='store_true',
                    help='Unfreeze entire base model for joint base+adapter training (use with --pretrain_data when training from scratch)')
     p.add_argument('--bidirectional',     action='store_true',
