@@ -50,7 +50,10 @@ run_eval() {   # run_eval <cell_name> <extra model args...>
         *_direct) seen=$DIR_SEEN;  unseen=$DIR_UNSEEN  ;;
     esac
     if [ -s "$LOG_DIR/$cell.log" ] && grep -q 'POOL' "$LOG_DIR/$cell.log"; then
-        log "$cell — log already complete, skipping (delete $LOG_DIR/$cell.log to re-run)"
+        log "$cell — eval already complete, replaying existing log (delete $LOG_DIR/$cell.log to re-run)"
+        # Echo the stored output so the master full_run.log is always complete,
+        # even for cells whose eval was skipped this invocation.
+        cat "$LOG_DIR/$cell.log"
         return
     fi
     log "$cell"
