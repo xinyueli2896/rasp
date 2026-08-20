@@ -36,6 +36,10 @@ LOG_DIR=eval_logs_grid
 cd "$RASP_REPO"
 mkdir -p "$LOG_DIR"
 
+# Master log: everything this script prints (all cell outputs + final grid)
+# is mirrored into one file, in addition to the per-cell logs.
+exec > >(tee "$LOG_DIR/full_run.log") 2>&1
+
 log() { echo -e "\n════════════════════════════════════════════\n▶ $*\n════════════════════════════════════════════"; }
 
 run_eval() {   # run_eval <cell_name> <extra model args...>
