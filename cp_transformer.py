@@ -138,8 +138,6 @@ class RoFormerSymbolicTransformer(L.LightningModule):
         h = torch.cat([sos, h], dim=1)
         y = [x[:, i, :] for i in range(seq_len)]
         for i in range(seq_len, max_seq_len):
-            if i % 10 == 0:
-                print('Sampling', i, '/', max_seq_len)
             mask = self.buffered_future_mask(h)
             h_out = self.model(h, attention_mask=mask, return_dict=False)[0]
             y_next = self.local_sampling(h_out[:, -1], temperature=temperature, global_step=i, sampling_func=sampling_func)
