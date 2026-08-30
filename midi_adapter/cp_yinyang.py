@@ -181,6 +181,7 @@ class CPYinyangCrossAttention(nn.Module):
         max_beats:    int   = 512,
         positional_qk: bool = False,
         key_stride:    int  = 1,
+        qk_content_residual: bool = False,
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
@@ -189,8 +190,13 @@ class CPYinyangCrossAttention(nn.Module):
         self.embed_dim = embed_dim
         self.positional_qk = positional_qk
         self.key_stride    = key_stride
+        # With positional_qk, content projections are optional: when enabled
+        # they are ZERO-initialised and ADDED to the scaled positional Q/K, so
+        # the module starts exactly at the pure-positional routing and learns
+        # content-based deviations only where they help.
+        self.qk_content_residual = positional_qk and qk_content_residual
 
-        if not positional_qk:
+        if (not positional_qk) or self.qk_content_residual:
             self.q_proj = nn.Linear(d_model,      embed_dim)
             self.k_proj = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
@@ -226,6 +232,13 @@ class CPYinyangCrossAttention(nn.Module):
         for m in mods:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
+        if self.qk_content_residual:
+            # Zero start: Q = pe*SCALE + 0, K = pe*SCALE + 0. Gradients still
+            # flow (each projection's grad passes through the other side's
+            # non-zero positional term), so both can learn away from zero.
+            for m in (self.q_proj, self.k_proj):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(
         self,
@@ -255,8 +268,16 @@ class CPYinyangCrossAttention(nn.Module):
             k_pos = (torch.arange(T_k, device=ar_hidden.device, dtype=torch.float)
                      * self.key_stride + (self.key_stride - 1) / 2.0)
             k_pe  = self._pe_at(k_pos).to(q_pe.dtype)
-            Q = (q_pe * self.PE_SCALE).expand(B, -1, -1)
-            K = (k_pe * self.PE_SCALE).expand(B, -1, -1)
+            Q = q_pe * self.PE_SCALE
+            K = k_pe * self.PE_SCALE
+            if self.qk_content_residual:
+                # Zero-initialised, so this starts as a no-op and the routing
+                # is the pure-positional one; training can add content-driven
+                # deviations (anticipation, adaptive strength) on top.
+                Q = Q + self.q_proj(ar_hidden)
+                K = K + self.k_proj(rule_hidden)
+            Q = Q.expand(B, -1, -1) if Q.shape[0] == 1 else Q
+            K = K.expand(B, -1, -1) if K.shape[0] == 1 else K
         else:
             Q = self.q_proj(ar_hidden)   + self.pe[:, sub_offset:sub_offset + T_q, :]
             K = self.k_proj(rule_hidden) + self.pe[:, :T_k, :]
@@ -313,6 +334,7 @@ class CPYinyangTransformer(nn.Module):
         chords_per_bar:   int  = 2,
         chord_seq_conditioning: bool = False,
         positional_qk:    bool = False,
+        qk_content_residual: bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -376,6 +398,7 @@ class CPYinyangTransformer(nn.Module):
                 n_heads      = 8,
                 positional_qk = positional_qk,
                 key_stride    = key_stride,
+                qk_content_residual = qk_content_residual,
             )
             for _ in range(n_adapters)
         ])

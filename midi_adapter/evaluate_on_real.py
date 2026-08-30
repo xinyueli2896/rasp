@@ -383,6 +383,8 @@ def main():
                         'loads with its LoRA weights silently dropped.')
     p.add_argument('--positional_qk', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--qk_content_residual', action='store_true',
+                   help='Must match the flag used during training.')
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='If set, write generated windows as MIDI here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
@@ -451,6 +453,7 @@ def main():
                            chord_seq_conditioning=args.paired_chord_seq,
                            lora_rank=args.lora_rank,
                            positional_qk=args.positional_qk,
+                           qk_content_residual=args.qk_content_residual,
                            device=device)
     model.eval()
 

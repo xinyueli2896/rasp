@@ -466,6 +466,7 @@ def main(args):
             chords_per_bar    = args.chords_per_bar,
             chord_seq_conditioning = args.paired_chord_seq,
             positional_qk     = args.positional_qk,
+            qk_content_residual = args.qk_content_residual,
         )
 
         if args.unfreeze_base:
@@ -691,6 +692,11 @@ def get_args():
                         'hardcoded on the diagonal (strided in chord-seq mode) '
                         'instead of learned from content. Content flows only '
                         'through V.')
+    p.add_argument('--qk_content_residual', action='store_true',
+                   help='Only with --positional_qk. Adds ZERO-INITIALISED content '
+                        'projections on top of the scaled positional Q/K, so routing '
+                        'starts exactly positional but the music content can learn to '
+                        'modulate it (anticipation, adaptive strength).')
     p.add_argument('--paired_chord_seq', action='store_true',
                    help='Use the explicit chord-root sequence (from .chord_seq.pt) as the '
                         'rule input, via ChordSeqRuleModel. Cross-attention runs at '
