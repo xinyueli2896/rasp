@@ -377,6 +377,12 @@ def main():
                    help='Must match the flag used during training. Loads the '
                         '.chord_seq.pt sidecar and hands the chord sequence to '
                         'global_sampling as explicit rule conditioning.')
+    p.add_argument('--lora_rank', type=int, default=0,
+                   help='Must match the flag used during training (LoRA on the '
+                        'base Q/V projections). Without it a LoRA checkpoint '
+                        'loads with its LoRA weights silently dropped.')
+    p.add_argument('--positional_qk', action='store_true',
+                   help='Must match the flag used during training.')
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='If set, write generated windows as MIDI here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
@@ -443,6 +449,8 @@ def main():
                            args.encoder_type, args.rule_mode, args.approach,
                            chords_per_bar=args.chords_per_bar,
                            chord_seq_conditioning=args.paired_chord_seq,
+                           lora_rank=args.lora_rank,
+                           positional_qk=args.positional_qk,
                            device=device)
     model.eval()
 

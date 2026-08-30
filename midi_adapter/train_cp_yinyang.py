@@ -465,6 +465,7 @@ def main(args):
             approach          = args.approach,
             chords_per_bar    = args.chords_per_bar,
             chord_seq_conditioning = args.paired_chord_seq,
+            positional_qk     = args.positional_qk,
         )
 
         if args.unfreeze_base:
@@ -684,6 +685,12 @@ def get_args():
                    help='Harmonic rhythm. 2 (default) = chord changes every half-bar (8 '
                         'subbeats at beat_div=4); 1 = chord per bar. Must match the value '
                         'used to filter the training data.')
+    p.add_argument('--positional_qk', action='store_true',
+                   help='Adapter cross-attention uses PURELY positional Q/K scaled '
+                        'x20 (the integer-experiment recipe): temporal alignment is '
+                        'hardcoded on the diagonal (strided in chord-seq mode) '
+                        'instead of learned from content. Content flows only '
+                        'through V.')
     p.add_argument('--paired_chord_seq', action='store_true',
                    help='Use the explicit chord-root sequence (from .chord_seq.pt) as the '
                         'rule input, via ChordSeqRuleModel. Cross-attention runs at '

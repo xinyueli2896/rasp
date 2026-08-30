@@ -166,6 +166,11 @@ class CPYinyangCrossAttention(nn.Module):
     triangular: beat t may attend to beats 0..t.
     """
 
+    # Positional-QK mode: scale factor for the pure sin/cos Q and K, matching
+    # models/yinyang_model.py's PE_SCALE. Makes the softmax nearly one-hot on
+    # the aligned key so temporal alignment is hardcoded, not learned.
+    PE_SCALE = 20.0
+
     def __init__(
         self,
         d_model:      int,
@@ -174,21 +179,29 @@ class CPYinyangCrossAttention(nn.Module):
         n_heads:      int   = 8,
         dropout:      float = 0.1,
         max_beats:    int   = 512,
+        positional_qk: bool = False,
+        key_stride:    int  = 1,
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = embed_dim // n_heads
         self.embed_dim = embed_dim
+        self.positional_qk = positional_qk
+        self.key_stride    = key_stride
 
-        self.q_proj   = nn.Linear(d_model,      embed_dim)
-        self.k_proj   = nn.Linear(rule_d_model, embed_dim)
+        if not positional_qk:
+            self.q_proj = nn.Linear(d_model,      embed_dim)
+            self.k_proj = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
         self.gate      = nn.Parameter(torch.ones(1,))
         self.attn_drop = nn.Dropout(dropout)
 
-        # Single sinusoidal PE shared by Q and K (same beat index space)
+        # Single sinusoidal PE shared by Q and K (same beat index space).
+        # In positional_qk mode with key_stride > 1 (chord-seq conditioning),
+        # key c reads pe[c * key_stride] so its PE sits at the subbeat index
+        # its chord slot starts on — queries within the slot match it best.
         pe  = torch.zeros(max_beats, embed_dim)
         pos = torch.arange(max_beats).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
@@ -196,7 +209,10 @@ class CPYinyangCrossAttention(nn.Module):
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer('pe', pe.unsqueeze(0))   # (1, max_beats, embed_dim)
 
-        for m in [self.q_proj, self.k_proj, self.v_proj, self.out_proj]:
+        mods = [self.v_proj, self.out_proj]
+        if not positional_qk:
+            mods += [self.q_proj, self.k_proj]
+        for m in mods:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
 
@@ -210,8 +226,18 @@ class CPYinyangCrossAttention(nn.Module):
         B, T_q, _ = ar_hidden.shape
         _, T_k, _ = rule_hidden.shape
 
-        Q = self.q_proj(ar_hidden)   + self.pe[:, sub_offset:sub_offset + T_q, :]
-        K = self.k_proj(rule_hidden) + self.pe[:, :T_k, :]
+        if self.positional_qk:
+            # Purely positional Q/K, scaled ×PE_SCALE — softmax is nearly one-hot
+            # on the aligned key, so alignment is hardcoded (integer-experiment
+            # recipe). Content flows only through V.
+            q_pe = self.pe[:, sub_offset:sub_offset + T_q, :]
+            k_idx = torch.arange(T_k, device=ar_hidden.device) * self.key_stride
+            k_pe  = self.pe[:, k_idx, :]
+            Q = (q_pe * self.PE_SCALE).expand(B, -1, -1)
+            K = (k_pe * self.PE_SCALE).expand(B, -1, -1)
+        else:
+            Q = self.q_proj(ar_hidden)   + self.pe[:, sub_offset:sub_offset + T_q, :]
+            K = self.k_proj(rule_hidden) + self.pe[:, :T_k, :]
         V = self.v_proj(rule_hidden)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
@@ -264,6 +290,7 @@ class CPYinyangTransformer(nn.Module):
         approach:         str  = 'bass',
         chords_per_bar:   int  = 2,
         chord_seq_conditioning: bool = False,
+        positional_qk:    bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -316,12 +343,17 @@ class CPYinyangTransformer(nn.Module):
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
 
+        # In chord-seq mode, key c governs subbeats [c*stride, (c+1)*stride);
+        # positional-QK keys read the PE at their slot's starting subbeat.
+        key_stride = subbeats_per_chord if chord_seq_conditioning else 1
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
                 d_model      = self.base.hidden_size,
                 rule_d_model = self.rule_model.d_model,
                 embed_dim    = adapter_rank,
                 n_heads      = 8,
+                positional_qk = positional_qk,
+                key_stride    = key_stride,
             )
             for _ in range(n_adapters)
         ])

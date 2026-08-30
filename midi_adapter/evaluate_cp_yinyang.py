@@ -278,17 +278,21 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                approach: str = 'bass',
                chords_per_bar: int = 2,
                chord_seq_conditioning: bool = False,
+               lora_rank: int = 0,
+               positional_qk: bool = False,
                device: torch.device = None) -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
     model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip,
+                                 lora_rank=lora_rank,
                                  bidirectional=bidirectional,
                                  encoder_injected=encoder_injected,
                                  encoder_type=encoder_type,
                                  rule_mode=rule_mode,
                                  approach=approach,
                                  chords_per_bar=chords_per_bar,
-                                 chord_seq_conditioning=chord_seq_conditioning)
+                                 chord_seq_conditioning=chord_seq_conditioning,
+                                 positional_qk=positional_qk)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
         print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
