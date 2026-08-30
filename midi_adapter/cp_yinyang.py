@@ -202,12 +202,23 @@ class CPYinyangCrossAttention(nn.Module):
         # In positional_qk mode with key_stride > 1 (chord-seq conditioning),
         # key c reads pe[c * key_stride] so its PE sits at the subbeat index
         # its chord slot starts on — queries within the slot match it best.
-        pe  = torch.zeros(max_beats, embed_dim)
-        pos = torch.arange(max_beats).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+        pos = torch.arange(max_beats).unsqueeze(1).float()
+        pe  = torch.zeros(max_beats, embed_dim)
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
         self.register_buffer('pe', pe.unsqueeze(0))   # (1, max_beats, embed_dim)
+        # Kept so key PEs can be evaluated at FRACTIONAL positions (see forward).
+        self.register_buffer('pe_div', div)
+
+    def _pe_at(self, pos: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal PE at arbitrary (possibly fractional) positions.
+        pos: (T,) float → (1, T, embed_dim)."""
+        ang = pos.unsqueeze(1) * self.pe_div            # (T, embed_dim/2)
+        out = torch.zeros(pos.shape[0], self.embed_dim, device=pos.device)
+        out[:, 0::2] = torch.sin(ang)
+        out[:, 1::2] = torch.cos(ang)
+        return out.unsqueeze(0)
 
         mods = [self.v_proj, self.out_proj]
         if not positional_qk:
@@ -231,8 +242,19 @@ class CPYinyangCrossAttention(nn.Module):
             # on the aligned key, so alignment is hardcoded (integer-experiment
             # recipe). Content flows only through V.
             q_pe = self.pe[:, sub_offset:sub_offset + T_q, :]
-            k_idx = torch.arange(T_k, device=ar_hidden.device) * self.key_stride
-            k_pe  = self.pe[:, k_idx, :]
+            # Key c sits at the CENTRE of the subbeat span it governs:
+            #     centre_c = c*stride + (stride-1)/2
+            # Nearest-PE boundaries fall midway between consecutive keys, so
+            # centring lands them exactly on the slot edges. The centre is
+            # half-integer for even strides (stride 8 → 3.5, 11.5, ...), which
+            # puts every boundary BETWEEN two subbeats and leaves no subbeat
+            # tied — hence the PE is evaluated analytically rather than looked
+            # up. Anchoring keys at slot starts instead (0, 8, 16, ...) would
+            # send the second half of every slot to the NEXT chord's state.
+            # For stride 1 the offset is 0, leaving the diagonal untouched.
+            k_pos = (torch.arange(T_k, device=ar_hidden.device, dtype=torch.float)
+                     * self.key_stride + (self.key_stride - 1) / 2.0)
+            k_pe  = self._pe_at(k_pos).to(q_pe.dtype)
             Q = (q_pe * self.PE_SCALE).expand(B, -1, -1)
             K = (k_pe * self.PE_SCALE).expand(B, -1, -1)
         else:
