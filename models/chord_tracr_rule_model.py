@@ -64,10 +64,14 @@ class ChordTracrRuleModel(nn.Module):
         self,
         subbeats_per_chord: int   = 8,
         attn_scale:         float = 20.0,
+        n_phase_heads:      int   = 1,
     ):
         super().__init__()
+        assert 1 <= n_phase_heads <= N_POS, \
+            f'n_phase_heads must be 1..{N_POS}, got {n_phase_heads}'
         self.subbeats_per_chord = subbeats_per_chord
         self.attn_scale         = attn_scale
+        self.n_phase_heads      = n_phase_heads
         V, d = N_ROOTS, CHORD_TRACR_D_MODEL
         pos_base = d - N_POS                 # 24
 
@@ -106,6 +110,25 @@ class ChordTracrRuleModel(nn.Module):
             W_O[V + i, V + i] = 1.0
         self.register_buffer('W_O', W_O)
 
+        # ── extra phase heads ──────────────────────────────────────────
+        # Head 0 (W_Q/W_V above) reads the key off the I chords, where
+        # OFFSETS[0] = 0 so the root IS the key. Every other slot also carries
+        # the key, just rotated: key = (root - OFFSETS[p]) mod 12. A rotation
+        # is a permutation matrix, so head p can un-rotate its own slots for
+        # free and recover the same key. Summing the heads turns a
+        # single-source lookup into a 4-way ensemble, which matters because a
+        # 1-bar prompt contains exactly ONE phase-0 slot — misread it and the
+        # 1-head retrieval is wrong for the whole window.
+        for p in range(1, n_phase_heads):
+            Wq = torch.zeros(d, d)
+            for i in range(N_POS):
+                Wq[pos_base + p, pos_base + i] = 1.0     # select phase == p
+            self.register_buffer(f'W_Q_{p}', Wq)
+            Wv = torch.zeros(d, d)
+            for i in range(V):
+                Wv[V + ((i - OFFSETS[p]) % V), i] = 1.0  # un-rotate to the key
+            self.register_buffer(f'W_V_{p}', Wv)
+
         self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
 
     # ------------------------------------------------------------------
@@ -130,23 +153,38 @@ class ChordTracrRuleModel(nn.Module):
     # The frozen head — the entry point the bidirectional proxy uses
     # ------------------------------------------------------------------
 
+    def _head(self, x: torch.Tensor, W_Q: torch.Tensor,
+              W_V: torch.Tensor) -> torch.Tensor:
+        """One compiled head: select by phase, aggregate the un-rotated root."""
+        T = x.shape[1]
+        Q = x @ W_Q.T
+        K = x @ self.W_K.T
+        V = x @ W_V.T
+        scores = (Q @ K.transpose(-2, -1)) * self.attn_scale
+        causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        scores = scores.masked_fill(~causal, float('-inf'))
+        return (F.softmax(scores, dim=-1) @ V) @ self.W_O.T
+
     def run_attention(self, x: torch.Tensor) -> torch.Tensor:
-        """Run the compiled head over an ARBITRARY residual stream.
+        """Run the compiled head(s) over an ARBITRARY residual stream.
 
         x : (B, T, 28) — a learned proxy, or an analytically built stream.
         Returns (B, T, 28) with dims 12-23 carrying the retrieved tonic.
 
+        With n_phase_heads = 1 this is the seed_broadcast program: read the
+        key off the I chords. With 4, each head un-rotates its own phase, so
+        the tonic is averaged over all four slot types — the same answer when
+        the proxy is clean, and far more robust when it is not. Corrupting the
+        prompt's single phase-0 slot takes the 1-head retrieval from exact to
+        zero; the 4-head version is unaffected.
+
         Causal, so position t never reads rule state derived from the future.
         """
-        T = x.shape[1]
-        Q = x @ self.W_Q.T
-        K = x @ self.W_K.T
-        V = x @ self.W_V.T
-        scores = (Q @ K.transpose(-2, -1)) * self.attn_scale
-        causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        scores = scores.masked_fill(~causal, float('-inf'))
-        attn   = F.softmax(scores, dim=-1)
-        return x + (attn @ V) @ self.W_O.T
+        out = self._head(x, self.W_Q, self.W_V)
+        for p in range(1, self.n_phase_heads):
+            out = out + self._head(x, getattr(self, f'W_Q_{p}'),
+                                   getattr(self, f'W_V_{p}'))
+        return x + out / self.n_phase_heads
 
     # ------------------------------------------------------------------
     # Analytic construction (targets, eval, explicit-input mode)

@@ -447,6 +447,7 @@ def main(args):
     approach_suffix = f'_{args.approach}' if args.approach != 'bass' else ''
     bidir_suffix    = ('_bidir'
                        + ('_tracr' if args.rule_attention else '')
+                       + (f'_h{args.rule_heads}' if args.rule_heads > 1 else '')
                        + ('' if args.proxy_activation == 'none'
                           else f'_{args.proxy_activation}')
                        + (f'_proxy{args.proxy_loss_weight:g}'
@@ -496,6 +497,7 @@ def main(args):
             proxy_supervision = args.proxy_loss_weight > 0,
             rule_attention    = args.rule_attention,
             proxy_pos_inject  = not args.no_proxy_pos_inject,
+            rule_heads        = args.rule_heads,
             proxy_activation  = args.proxy_activation,
             proxy_temp        = args.proxy_temp,
         )
@@ -706,6 +708,13 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--rule_heads', type=int, default=1, choices=[1, 2, 3, 4],
+                   help='Phase heads in the compiled rule model. 1 reads the '
+                        'key only off the I chords (one source in a 1-bar '
+                        'prompt). 4 adds a head per phase that un-rotates its '
+                        'own slots by -OFFSETS[p], recovering the same key '
+                        'from every slot type — same answer on a clean proxy, '
+                        'robust to a misread slot. Requires --rule_attention.')
     p.add_argument('--proxy_activation', type=str, default='none',
                    choices=['none', 'softmax', 'hard'],
                    help="Shape ar_to_rule's 12-d root output before the frozen "

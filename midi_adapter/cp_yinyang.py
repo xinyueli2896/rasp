@@ -341,6 +341,7 @@ class CPYinyangTransformer(nn.Module):
         proxy_pos_inject:  bool = True,
         proxy_activation:  str  = 'none',
         proxy_temp:        float = 1.0,
+        rule_heads:        int  = 1,
     ):
         assert proxy_activation in ('none', 'softmax', 'hard'), \
             f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
@@ -410,7 +411,8 @@ class CPYinyangTransformer(nn.Module):
             # root = (key + OFFSETS[phase]) % 12 for the adapter to compute.
             # Structurally identical to the integer experiment's seed_broadcast.
             self.rule_model = ChordTracrRuleModel(
-                subbeats_per_chord=subbeats_per_chord)
+                subbeats_per_chord=subbeats_per_chord,
+                n_phase_heads=rule_heads)
         elif chord_seq_conditioning:
             assert approach == 'chord', 'chord_seq_conditioning requires approach=chord'
             assert not encoder_injected, \
