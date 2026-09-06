@@ -921,39 +921,25 @@ def _adapters():
 
 
 def _tower_right(with_input):
+    """Both variants run the SAME compiled head; only the source differs."""
     s = [_pt(TW_RX + TW_RW / 2, 62, 'RULE MODEL · 0 params', 'plane-t', 'middle')]
     cx = TW_RX + TW_RW / 2
     top, bot = TW_BAND
     s.append(_pbox(TW_RX, top, TW_RW, bot - top, 'pdash', 3))
 
+    # ── the one thing that differs: where the root dims come from ───────
     if with_input:
-        # its own external input, at the bottom, mirroring CP tokens
+        s.append(_label_box(TW_RX + 14, 272, TW_RW - 28, 30, 'embed roots',
+                            msub('W', 'E') + '[root] + ' + msub('W', 'pos') + '[phase]',
+                            'pacc'))
         s.append(_label_box(TW_RX, TW_Y['tokens'], TW_RW, 34, 'chord_seq',
-                            '(B, 8) roots', 'pacc'))
+                            'roots  7 0 2 7 7 0 2 7', 'pacc'))
         s.append(_parr(cx, TW_Y['tokens'], cx, bot + 4, 'parwa', 'ar-flow'))
-        for c, (deg, _) in enumerate(CHORDS):
-            x = 452 + c * 22
-            s.append(_pbox(x, 276, 20, 22, 'pacc', 2))
-            s.append(_pt(x + 10, 290, deg, 'pnum', 'middle'))
-        # titles read top-to-bottom even though the flow reads bottom-to-top
-        s.append(_pt(cx, 248, 'ChordSeqRuleModel', 'plbl', 'middle'))
-        s.append(_pt(cx, 262, 'table lookup — no computation', 'pcap', 'middle'))
-        s.append(_pt(cx, 224, 'rule_hidden  (8, 16)', 'pmath', 'middle'))
-        s.append(_pt(cx, 190, 'computed once,', 'pcap', 'middle'))
-        s.append(_pt(cx, 202, 'shared by all L adapters', 'pcap', 'middle'))
     else:
-        # no external input; the tower is fed by the transformer instead
+        s.append(_label_box(TW_RX + 14, 272, TW_RW - 28, 30, 'ar_to_rule',
+                            '768 → 12', 'pacc'))
         s.append(_pbox(TW_RX, TW_Y['tokens'], TW_RW, 34, 'pempty'))
         s.append(_pt(cx, TW_Y['tokens'] + 21, 'no input', 'pcap', 'middle'))
-        s.append(_label_box(TW_RX + 14, 272, TW_RW - 28, 30, 'ar_to_rule', '768 → 12', 'pacc'))
-        s.append(_parr(cx, 272, cx, 262, 'parwa', 'ar-flow'))
-        s.append(_pbox(TW_RX + 14, 218, TW_RW - 28, 40, 'pbx'))
-        s.append(_pt(cx, 234, 'compiled head', 'plbl', 'middle'))
-        s.append(_pt(cx, 249, 'Select · Aggregate', 'pcap', 'middle'))
-        s.append(_parr(cx, 218, cx, 208, 'parwa', 'ar-flow'))
-        s.append(_pbox(TW_RX + 14, 180, TW_RW - 28, 26, 'pacc'))
-        s.append(_pt(cx, 197, 'r :  root | tonic←key | phase', 'pnum', 'middle'))
-        # bus tapped off every layer's h, routed under the band into ar_to_rule
         bx = TW_AX - 12
         s.append(f'<line x1="{bx}" y1="{TW_ROWS[2][0] + 10}" x2="{bx}" y2="336" '
                  f'class="parwa"/>')
@@ -961,6 +947,17 @@ def _tower_right(with_input):
             s.append(f'<circle cx="{bx}" cy="{y + 10}" r="3" class="pdot"/>')
         s.append(poly([(bx, 336), (cx, 336), (cx, 304)], 'parwa', 'ar-flow'))
         s.append(_ptr(bx + 8, 350, msub('h', 'ℓ') + '  from every layer', 'pmathf'))
+
+    # ── shared from here up: stream → compiled head → r ────────────────
+    s.append(_parr(cx, 272, cx, 264, 'parwa', 'ar-flow'))
+    s.append(_pt(cx, 260, 'x :  root | tonic empty | phase', 'pnum', 'middle'))
+    s.append(_parr(cx, 250, cx, 242, 'parwa', 'ar-flow'))
+    s.append(_pbox(TW_RX + 14, 202, TW_RW - 28, 40, 'pbx'))
+    s.append(_pt(cx, 218, 'compiled head', 'plbl', 'middle'))
+    s.append(_pt(cx, 233, 'Select · Aggregate', 'pcap', 'middle'))
+    s.append(_parr(cx, 202, cx, 194, 'parwa', 'ar-flow'))
+    s.append(_pbox(TW_RX + 14, 166, TW_RW - 28, 26, 'pacc'))
+    s.append(_pt(cx, 183, 'r :  root | tonic←key | phase', 'pnum', 'middle'))
     return ''.join(s)
 
 
@@ -977,11 +974,11 @@ def _tw_panel(label, title, with_input, note):
 
 def fig_two_tower():
     a = _tw_panel('(a)', 'Rule model with an input',  True,
-                  'the progression is supplied at train and test time — '
-                  'the adapter renders a given plan')
+                  'the 8 chord roots are supplied, so the head retrieves the tonic '
+                  'from values that were already given')
     b = _tw_panel('(b)', 'Rule model with no input',  False,
-                  'nothing is supplied — the rule signal is read out of the '
-                  'transformer\u2019s own hidden states')
+                  'nothing is supplied — the roots are read out of the transformer, '
+                  'and the head retrieves the tonic from those')
     return f'<g>{a}</g><g transform="translate(700,0)">{b}</g>'
 
 
