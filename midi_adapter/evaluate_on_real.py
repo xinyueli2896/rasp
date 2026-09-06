@@ -286,6 +286,7 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                 o_ok / max(o_n, 1),                        # accuracy on IV/V slots
                 float(modal_n >= max(n_hb_gen - 1, 1)),    # parked on one chord
                 float(modal_root == key),                  # modal root == the key
+                halfbar_acc,                               # for conditional splits
             ))
 
             per_key.setdefault(key, []).append(
@@ -331,7 +332,8 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
     if diag_per_key:
         arr = np.array([r for rs in diag_per_key.values() for r in rs])
         diag = {'I_acc': arr[:, 0], 'IVV_acc': arr[:, 1],
-                'parked': arr[:, 2], 'key_found': arr[:, 3]}
+                'parked': arr[:, 2], 'key_found': arr[:, 3],
+                'halfbar': arr[:, 4]}
     return stats, diag
 
 
@@ -365,10 +367,28 @@ def _print_diag_table(diag: dict[str, np.ndarray], tonic_ref: float) -> None:
     print(f'    {"modal root == key":<26}{diag["key_found"].mean():>7.3f}')
     print(f'    {"constant-tonic reference":<26}{tonic_ref:>7.3f}'
           f'        (what "always emit the key" scores)')
+    # ── conditional splits: separate "found the key" from "applied the rule"
+    found = diag['key_found'] > 0.5
+    free  = diag['parked'] < 0.5
+    print()
+    if found.any():
+        print(f'    {"halfbar | key found":<26}{diag["halfbar"][found].mean():>7.3f}'
+              f'        (n={int(found.sum())} of {n})')
+        print(f'    {"IV/V   | key found":<26}{diag["IVV_acc"][found].mean():>7.3f}')
+    if (~found).any():
+        print(f'    {"halfbar | key MISSED":<26}{diag["halfbar"][~found].mean():>7.3f}'
+              f'        (n={int((~found).sum())})')
+    if free.any():
+        print(f'    {"IV/V   | not parked":<26}{diag["IVV_acc"][free].mean():>7.3f}'
+              f'        (n={int(free.sum())})')
+
     gap = diag['I_acc'].mean() - diag['IVV_acc'].mean()
     if gap > 0.35:
         print(f'    NOTE: I slots beat IV/V by {gap:.3f} — consistent with '
               f'parking on the tonic rather than following the schedule.')
+    if found.mean() < 0.6:
+        print(f'    NOTE: the key is identified in only {found.mean():.1%} of '
+              f'windows — key inference, not the schedule, is the bottleneck.')
 
 
 def _print_stats_table(title: str, stats: dict[int, dict[str, float]]) -> None:
