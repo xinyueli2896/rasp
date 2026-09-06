@@ -522,8 +522,8 @@ def panel_c():
     s.append(_pt(X + 224, 252, 'T queries attend to the T rule positions', 'pcap', 'middle'))
 
     s.append(_parr(X + 224, 260, X + 224, 284))
-    s.append(_label_box(X + 92, 284, 264, 32, 'h  ←  h  +  g ⊙ Δ', None, 'pacc'))
-    s.append(_pt(X + 224, 334, 'g : learned scalar gate, one per layer', 'pcap', 'middle'))
+    s.append(_label_box(X + 92, 284, 264, 32, 'h  ←  h  +  g · Δ', None, 'pacc'))
+    s.append(_pt(X + 224, 334, 'g : learned scalar gate, one per layer (init 1.0)', 'pcap', 'middle'))
     s.append(_pt(X + 224, 350, 'only shaded blocks are trained', 'pcap', 'middle'))
     return ''.join(s)
 
@@ -633,7 +633,7 @@ def fig_single():
 
     # gated residual back up into the +
     A(_parr(650, 274, 650, 116, 'parwa', 'ar-flow'))
-    A(_ptr(658, 190, 'g ⊙ Δ', 'pmathf'))
+    A(_ptr(658, 190, 'g · Δ', 'pmathf'))
 
     # ═══ LANE 3 — rule model ════════════════════════════════════════════
     A(_label_box(200, 396, 140, 40, 'ar_to_rule', '768 → 12', 'pacc'))
@@ -838,7 +838,7 @@ def fig_vertical():
     A(_pt(415, 864, 'queries from the music, keys and values from the rule', 'pcap', 'middle'))
 
     A(_parr(CX, 872, CX, 884, 'parwa', 'ar-flow'))
-    A(_ptr(348, 882, 'g ⊙ Δ', 'pmathf'))
+    A(_ptr(348, 882, 'g · Δ', 'pmathf'))
 
     # ── ⊕ and spine, bottom ─────────────────────────────────────────────
     A(f'<circle cx="{CX}" cy="900" r="18" class="pacc"/>')
@@ -915,7 +915,7 @@ def _adapters():
         s.append(_parr(TW_RX, y + 17, TW_AX + TW_AW + 2, y + 17, 'parwa', 'ar-flow'))
         if i == 0:
             s.append(_ptr(TW_LX + TW_LW + 4, y + 7, msub('h', 'ℓ'), 'pmath'))
-            s.append(_ptr(TW_LX + TW_LW + 4, y + 40, 'g ⊙ Δ', 'pmathf'))
+            s.append(_ptr(TW_LX + TW_LW + 4, y + 40, 'g · Δ', 'pmathf'))
             s.append(_pt(TW_AX + TW_AW + 5, y + 13, 'r', 'pmathf'))
     return ''.join(s)
 
