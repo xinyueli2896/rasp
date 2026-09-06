@@ -445,8 +445,10 @@ def main(args):
     rule_suffix     = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
     enc_suffix      = f'_{args.encoder_type}' if args.encoder_injected else ''
     approach_suffix = f'_{args.approach}' if args.approach != 'bass' else ''
-    bidir_suffix    = ('_bidir' + (f'_proxy{args.proxy_loss_weight:g}'
-                                   if args.proxy_loss_weight > 0 else '')
+    bidir_suffix    = ('_bidir'
+                       + ('_tracr' if args.rule_attention else '')
+                       + (f'_proxy{args.proxy_loss_weight:g}'
+                          if args.proxy_loss_weight > 0 else '')
                        ) if args.bidirectional else ''
     run_name = (
         args.run_name
@@ -490,6 +492,8 @@ def main(args):
             positional_qk     = args.positional_qk,
             qk_content_residual = args.qk_content_residual,
             proxy_supervision = args.proxy_loss_weight > 0,
+            rule_attention    = args.rule_attention,
+            proxy_pos_inject  = not args.no_proxy_pos_inject,
         )
 
         if args.unfreeze_base:
@@ -685,6 +689,19 @@ def get_args():
                    help='Unfreeze entire base model for joint base+adapter training (use with --pretrain_data when training from scratch)')
     p.add_argument('--bidirectional',     action='store_true',
                    help='No-input-to-rule-model variant: AR hidden states are projected to rule space via a learned linear instead of reading the key from the sequence')
+    p.add_argument('--rule_attention', action='store_true',
+                   help='Use the compiled TracR-style chord rule model '
+                        '(ChordTracrRuleModel, d_model=28): one FROZEN attention '
+                        'head retrieves the tonic from phase-0 slots, leaving '
+                        'root = (key + OFFSETS[phase]) %% 12 for the adapter to '
+                        'compute. Requires --bidirectional. The frozen head '
+                        'constrains the learned ar_to_rule proxy by construction, '
+                        'so --proxy_loss_weight can be left at 0 — this is the '
+                        'structural match to the integer experiment.')
+    p.add_argument('--no_proxy_pos_inject', action='store_true',
+                   help='With --rule_attention, do NOT add the frozen phase '
+                        'encoding to the proxy — make ar_to_rule recover bar '
+                        'phase from the base hidden states on its own.')
     p.add_argument('--proxy_loss_weight', type=float, default=0.0,
                    help='Weight of the auxiliary loss pulling each layer\'s '
                         'ar_to_rule proxy toward the analytical rule hidden '

@@ -385,6 +385,12 @@ def main():
                    help='Must match the flag used during training.')
     p.add_argument('--qk_content_residual', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--rule_attention', action='store_true',
+                   help='Must match the flag used during training. Without it '
+                        'the rule model is rebuilt at the wrong width (16 vs 28) '
+                        'and ar_to_rule fails to load.')
+    p.add_argument('--no_proxy_pos_inject', action='store_true',
+                   help='Must match the flag used during training.')
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='If set, write generated windows as MIDI here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
@@ -454,6 +460,8 @@ def main():
                            lora_rank=args.lora_rank,
                            positional_qk=args.positional_qk,
                            qk_content_residual=args.qk_content_residual,
+                           rule_attention=args.rule_attention,
+                           proxy_pos_inject=not args.no_proxy_pos_inject,
                            device=device)
     model.eval()
 

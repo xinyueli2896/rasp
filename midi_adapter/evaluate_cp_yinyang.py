@@ -281,6 +281,8 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                lora_rank: int = 0,
                positional_qk: bool = False,
                qk_content_residual: bool = False,
+               rule_attention: bool = False,
+               proxy_pos_inject: bool = True,
                device: torch.device = None) -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
@@ -293,6 +295,8 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                                  approach=approach,
                                  chords_per_bar=chords_per_bar,
                                  chord_seq_conditioning=chord_seq_conditioning,
+                                 rule_attention=rule_attention,
+                                 proxy_pos_inject=proxy_pos_inject,
                                  positional_qk=positional_qk,
                                  qk_content_residual=qk_content_residual)
 

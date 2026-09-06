@@ -45,6 +45,7 @@ import torch.nn.functional as F
 from models.bass_tracr_rule_model import (
     BassTracrRuleModel, CPChordRuleModel, ChordSeqRuleModel, TRACR_D_MODEL,
 )
+from models.chord_tracr_rule_model import ChordTracrRuleModel
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +337,15 @@ class CPYinyangTransformer(nn.Module):
         positional_qk:    bool = False,
         qk_content_residual: bool = False,
         proxy_supervision: bool = False,
+        rule_attention:    bool = False,
+        proxy_pos_inject:  bool = True,
     ):
+        assert not (rule_attention and not bidirectional), \
+            ("rule_attention requires bidirectional: the compiled head exists to "
+             "constrain the learned ar_to_rule proxy, and there is no proxy "
+             "without it")
+        assert not (rule_attention and approach != 'chord'), \
+            "rule_attention is the chord rule model; use rule_mode for bass"
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
         assert not (bidirectional and chord_seq_conditioning), \
@@ -362,6 +371,8 @@ class CPYinyangTransformer(nn.Module):
         self.encoder_injected = encoder_injected
         self.approach         = approach
         self.proxy_supervision = proxy_supervision
+        self.rule_attention    = rule_attention
+        self.proxy_pos_inject  = proxy_pos_inject
         # Per-layer ar_to_rule outputs stashed during a training forward so the
         # auxiliary rule loss can be computed without a second base pass.
         self._proxies: list = []
@@ -387,7 +398,14 @@ class CPYinyangTransformer(nn.Module):
         subbeats_per_chord = 16 // chords_per_bar
         self.chords_per_bar         = chords_per_bar
         self.chord_seq_conditioning = chord_seq_conditioning
-        if chord_seq_conditioning:
+        if rule_attention:
+            # Compiled TracR-style head (d_model=28): one frozen attention head
+            # retrieves the tonic from phase-0 slots, leaving
+            # root = (key + OFFSETS[phase]) % 12 for the adapter to compute.
+            # Structurally identical to the integer experiment's seed_broadcast.
+            self.rule_model = ChordTracrRuleModel(
+                subbeats_per_chord=subbeats_per_chord)
+        elif chord_seq_conditioning:
             assert approach == 'chord', 'chord_seq_conditioning requires approach=chord'
             assert not encoder_injected, \
                 'chord_seq_conditioning and encoder_injected are mutually exclusive'
@@ -584,15 +602,41 @@ class CPYinyangTransformer(nn.Module):
             h = layer(h, attention_mask=mask)[0]
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
-                rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden
-                if self.proxy_supervision and self.training:
-                    self._proxies.append(rule_h)
+                rule_h = (self._rule_proxy(h, adapter_idx)
+                          if self.bidirectional else rule_hidden)
                 h = h + self.yinyang_attn[adapter_idx](
                     h, rule_h, sub_offset=0,
                     use_causal=not self.chord_seq_conditioning,
                 )
 
         return base.local_decode(h, emb)
+
+    def _rule_proxy(self, h: torch.Tensor, adapter_idx: int) -> torch.Tensor:
+        """Rule signal for one adapter, read out of the base's own hidden states.
+
+        With --rule_attention the projection is then pushed through the frozen
+        compiled head, so what the adapter attends to is the OUTPUT OF A
+        COMPUTATION (the retrieved tonic) rather than a table lookup. The head
+        routes on the phase subspace and moves only the root subspace, so a
+        proxy that does not populate those cleanly yields a blurred retrieval
+        and a useless tonic — which is what constrains it, in place of an
+        auxiliary loss.
+
+        Phase is injected from a frozen table by default: it follows from
+        position alone and says nothing about the key, so handing it over keeps
+        ar_to_rule focused on the pitch content that is actually under test.
+        """
+        proxy = self.ar_to_rule[adapter_idx](h)
+        if self.rule_attention and self.proxy_pos_inject:
+            proxy = proxy + self.rule_model.pos_embed(
+                h.shape[1], h.device).to(proxy.dtype)
+        # Supervision, when enabled, targets the PRE-attention proxy — the part
+        # ar_to_rule is responsible for.
+        if self.proxy_supervision and self.training:
+            self._proxies.append(proxy)
+        if self.rule_attention:
+            proxy = self.rule_model.run_attention(proxy)
+        return proxy
 
     def proxy_rule_loss(self, key: torch.Tensor, T: int) -> torch.Tensor | None:
         """Auxiliary loss pulling each layer's ar_to_rule proxy into rule space.
@@ -613,9 +657,23 @@ class CPYinyangTransformer(nn.Module):
         """
         if not self._proxies:
             return None
+        device = self._proxies[0].device
         with torch.no_grad():
             target = self.rule_model.build_rule_hidden_analytic(
-                key.to(self._proxies[0].device), T, self._proxies[0].device)
+                key.to(device), T, device)
+
+        if self.rule_attention:
+            # d_model = 28. Only dims 0-11 are the proxy's responsibility:
+            # 12-23 are written by the frozen head, 24-27 are the injected
+            # clock. Optional here — the head is the intended constraint.
+            root_t = target[..., :12].argmax(-1)
+            total = 0.0
+            for proxy in self._proxies:
+                total = total + F.cross_entropy(
+                    proxy[..., :12].reshape(-1, 12), root_t.reshape(-1))
+            return total / len(self._proxies)
+
+        # d_model = 16: [12-d triad chromagram | 4-d phase one-hot]
         chroma_t, phase_t = target[..., :12], target[..., 12:].argmax(-1)
         total = 0.0
         for proxy in self._proxies:
@@ -718,7 +776,8 @@ class CPYinyangTransformer(nn.Module):
                     # Bidirectional: project the full AR sequence to rule space on-the-fly;
                     # the cross-attention query (last position) can then attend to the full
                     # AR-derived rule trajectory up to step i.
-                    rule_h = self.ar_to_rule[adapter_idx](h_out) if self.bidirectional else rule_hidden
+                    rule_h = (self._rule_proxy(h_out, adapter_idx)
+                              if self.bidirectional else rule_hidden)
                     correction = self.yinyang_attn[adapter_idx](
                         h_out[:, -1:, :], rule_h, sub_offset=i,
                         use_causal=not self.chord_seq_conditioning,
