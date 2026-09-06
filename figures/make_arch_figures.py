@@ -342,6 +342,226 @@ def write_all():
         print(f'  {name}.svg  ({w}x{h})')
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Paper figure — three panels: pipeline | rule model | cross-attention
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _pbox(x, y, w, h, cls='pbx', rx=2):
+    return f'<rect x="{x}" y="{y}" width="{w}" height="{h}" rx="{rx}" class="{cls}"/>'
+
+
+def _pt(x, y, s, cls='plbl', anchor='start'):
+    a = f' text-anchor="{anchor}"' if anchor != 'start' else ''
+    return f'<text x="{x}" y="{y}"{a} class="{cls}">{esc(s)}</text>'
+
+
+def _ptr(x, y, raw, cls='plbl', anchor='start'):
+    """Text node whose content is raw markup (for <tspan> sub/superscripts)."""
+    a = f' text-anchor="{anchor}"' if anchor != 'start' else ''
+    return f'<text x="{x}" y="{y}"{a} class="{cls}">{raw}</text>'
+
+
+def msub(base, sub):
+    return f'{base}<tspan font-size="70%" baseline-shift="-20%">{sub}</tspan>'
+
+
+def msup(base, sup):
+    return f'{base}<tspan font-size="68%" baseline-shift="32%">{sup}</tspan>'
+
+
+def _parr(x1, y1, x2, y2, cls='parw', marker='ar-ink'):
+    return line(x1, y1, x2, y2, cls, marker)
+
+
+def _label_box(x, y, w, h, main, sub=None, cls='pbx'):
+    o = _pbox(x, y, w, h, cls)
+    if sub is None:
+        o += _pt(x + w / 2, y + h / 2 + 4, main, 'plbl', 'middle')
+    else:
+        o += _pt(x + w / 2, y + h / 2 - 2, main, 'plbl', 'middle')
+        o += _ptr(x + w / 2, y + h / 2 + 12, sub, 'pmath', 'middle')
+    return o
+
+
+def panel_a():
+    """Pipeline: frozen base, adapter injection, rule path."""
+    s = [_pt(8, 26, '(a)', 'ppanel'),
+         _pt(38, 26, 'Adapter injection into the frozen transformer', 'phead')]
+    BX, BW = 130, 180                       # base column
+    cx = BX + BW / 2
+
+    s.append(_label_box(BX, 56, BW, 32, 'CP tokens', msup('x ∈ ℝ', 'T×S') + ',  T = 64'))
+    s.append(_parr(cx, 88, cx, 104))
+    s.append(_label_box(BX, 104, BW, 30, 'local encoder', None))
+    s.append(_parr(cx, 134, cx, 152))
+
+    # repeated block
+    s.append(_pbox(14, 152, 380, 116, 'pdash', 3))
+    s.append(_pt(384, 166, '× L = 12', 'pcap', 'end'))
+    s.append(_label_box(BX, 166, BW, 30, 'self-attention layer', None, 'pfroz'))
+    s.append(_pt(BX + BW - 6, 178, 'frozen', 'ptag', 'end'))
+    s.append(_parr(cx, 196, cx, 212))
+    s.append(_label_box(BX, 212, BW, 30, 'cross-attn adapter', None, 'pacc'))
+    s.append(_pt(BX + BW - 6, 224, 'trained', 'ptag', 'end'))
+
+    # rule path on the left, inside the repeated block
+    s.append(_label_box(24, 164, 86, 26, 'ar_to_rule', None, 'pacc'))
+    s.append(_label_box(24, 202, 86, 30, 'rule model', None, 'pacc'))
+    s.append(_pt(67, 244, '(b)', 'pcap', 'middle'))
+    s.append(_parr(BX - 2, 177, 112, 177, 'parwa', 'ar-flow'))
+    s.append(_pt(120, 172, 'h', 'pmathf'))
+    s.append(_parr(67, 190, 67, 200, 'parwa', 'ar-flow'))
+    s.append(_parr(112, 224, BX - 2, 224, 'parwa', 'ar-flow'))
+    s.append(_pt(120, 219, 'r', 'pmathf'))
+
+    s.append(_parr(cx, 268, cx, 284))
+    s.append(_label_box(BX, 284, BW, 30, 'local decoder', None))
+    s.append(_parr(cx, 314, cx, 330))
+    s.append(_label_box(BX, 330, BW, 32, 'note-tuple logits', msup('ŷ ∈ ℝ', 'T×S×|V|')))
+    return ''.join(s)
+
+
+def panel_b():
+    """The compiled rule head: stream in, retrieval, stream out."""
+    X = 440
+    s = [_pt(X, 26, '(b)', 'ppanel'),
+         _pt(X + 30, 26, 'Rule model: one compiled attention head', 'phead')]
+
+    # ── input residual stream ───────────────────────────────────────────
+    sx, sw = X + 14, 424
+    r1, r2 = sw * 12 / 28, sw * 12 / 28
+    s.append(_pt(sx, 54, 'input stream  x', 'pcap'))
+    s.append(_pbox(sx, 60, r1, 26, 'pacc'))
+    s.append(_pbox(sx + r1, 60, r2, 26, 'pempty'))
+    s.append(_pbox(sx + r1 + r2, 60, sw - r1 - r2, 26, 'pfroz'))
+    s.append(_pt(sx + r1 / 2, 77, 'root  (12)', 'plbl', 'middle'))
+    s.append(_pt(sx + r1 + r2 / 2, 77, 'tonic  (12)  empty', 'pcap', 'middle'))
+    s.append(_pt(sx + r1 + r2 + (sw - r1 - r2) / 2, 77, 'phase (4)', 'pcap', 'middle'))
+
+    # ── head ────────────────────────────────────────────────────────────
+    s.append(_pbox(sx, 100, sw, 196, 'pdash', 3))
+
+    # attention grid, 8x8
+    gx, gy, cell = sx + 18, 132, 15.5
+    T = 8
+    s.append(_pt(gx, 124, 'key  k →', 'pcap'))
+    s.append(f'<text x="{gx - 8}" y="{gy + 4 * cell}" class="pcap" '
+             f'transform="rotate(-90 {gx - 8} {gy + 4 * cell})" '
+             f'text-anchor="middle">query  q →</text>')
+    for q in range(T):
+        for k in range(T):
+            cls = 'gcell-off'
+            if k <= q:
+                cls = 'gcell-hit' if k % 4 == 0 else 'gcell-vis'
+            s.append(f'<rect x="{gx + k*cell:.1f}" y="{gy + q*cell:.1f}" '
+                     f'width="{cell-1:.1f}" height="{cell-1:.1f}" class="{cls}"/>')
+    for k in range(T):
+        s.append(_pt(gx + k * cell + cell / 2 - 0.5, gy + T * cell + 11,
+                     str(k), 'pnum', 'middle'))
+    s.append(_pt(gx, gy + T * cell + 26, 'shaded = attended (phase 0)', 'pcap'))
+
+    # the two mechanisms, stated as equations
+    ex = gx + T * cell + 34
+    s.append(_pt(ex, 146, 'Select', 'plblb'))
+    s.append(_ptr(ex, 162, msub('Q = W', 'Q') + ' x'
+                  + '  →  every query = ' + msub('e', '24'), 'pmath'))
+    s.append(_ptr(ex, 176, msub('K = W', 'K') + ' x'
+                  + '  →  K[k] = ' + msub('e', '24 + phase(k)'), 'pmath'))
+    s.append(_ptr(ex, 194, '⟨Q, K⟩ · 20  =  20 · 1[ phase(k) = 0 ]', 'pmathf'))
+
+    s.append(_pt(ex, 224, 'Aggregate', 'plblb'))
+    s.append(_ptr(ex, 240, msub('V = W', 'V') + ' x   →   root copied to tonic',
+                  'pmath'))
+    s.append(_ptr(ex, 258, 'r = x + softmax(·) V ' + msub('W', 'O'), 'pmathf'))
+    s.append(_pt(ex, 276, 'retrieves the key; does not apply', 'pcap'))
+    s.append(_pt(ex, 288, 'the rule', 'pcap'))
+
+    # ── output residual stream ──────────────────────────────────────────
+    s.append(_parr(sx + sw / 2, 296, sx + sw / 2, 332))
+    s.append(_pt(sx, 330, 'output stream  r', 'pcap'))
+    s.append(_pbox(sx, 336, r1, 26, 'pacc'))
+    s.append(_pbox(sx + r1, 336, r2, 26, 'pacc'))
+    s.append(_pbox(sx + r1 + r2, 336, sw - r1 - r2, 26, 'pfroz'))
+    s.append(_pt(sx + r1 / 2, 353, 'root  (12)', 'plbl', 'middle'))
+    s.append(_pt(sx + r1 + r2 / 2, 353, 'tonic ← key', 'plbl', 'middle'))
+    s.append(_pt(sx + r1 + r2 + (sw - r1 - r2) / 2, 353, 'phase (4)', 'pcap', 'middle'))
+    return ''.join(s)
+
+
+def panel_c():
+    """The cross-attention adapter."""
+    X = 932
+    s = [_pt(X, 26, '(c)', 'ppanel'),
+         _pt(X + 30, 26, 'Rule–music cross-attention', 'phead')]
+
+    s.append(_label_box(X + 12, 60, 190, 32, 'music  h', msup('ℝ', 'T×768'), 'pfroz'))
+    s.append(_label_box(X + 246, 60, 190, 32, 'rule  r', msup('ℝ', 'T×28'), 'pacc'))
+
+    s.append(_parr(X + 107, 92, X + 107, 112))
+    s.append(_label_box(X + 32, 112, 150, 28, 'q_proj  /  PE × 20', None))
+    s.append(_parr(X + 341, 92, X + 296, 112, 'parwa', 'ar-flow'))
+    s.append(_parr(X + 341, 92, X + 386, 112, 'parwa', 'ar-flow'))
+    s.append(_label_box(X + 224, 112, 100, 28, 'k_proj', None, 'pacc'))
+    s.append(_label_box(X + 336, 112, 100, 28, 'v_proj', None, 'pacc'))
+
+    s.append(_pt(X + 112, 158, 'Q', 'pmath'))
+    s.append(_pt(X + 268, 158, 'K', 'pmathf'))
+    s.append(_pt(X + 380, 158, 'V', 'pmathf'))
+    s.append(_parr(X + 107, 140, X + 107, 168))
+    s.append(_parr(X + 274, 140, X + 274, 168, 'parwa', 'ar-flow'))
+    s.append(_parr(X + 386, 140, X + 386, 168, 'parwa', 'ar-flow'))
+
+    s.append(_pbox(X + 12, 168, 424, 92, 'pdash', 3))
+    s.append(_ptr(X + 224, 192, 'A = softmax( Q Kᵀ / √' + msub('d', 'h') + ' )',
+                  'pmathf', 'middle'))
+    s.append(_ptr(X + 224, 214, 'Δ = ( A V ) ' + msub('W', 'O'), 'pmathf', 'middle'))
+    s.append(_ptr(X + 224, 238, '8 heads · ' + msub('d', 'h') + ' = 32 · causal',
+                  'pcap', 'middle'))
+    s.append(_pt(X + 224, 252, 'T queries attend to the T rule positions', 'pcap', 'middle'))
+
+    s.append(_parr(X + 224, 260, X + 224, 284))
+    s.append(_label_box(X + 92, 284, 264, 32, 'h  ←  h  +  g ⊙ Δ', None, 'pacc'))
+    s.append(_pt(X + 224, 334, 'g : learned scalar gate, one per layer', 'pcap', 'middle'))
+    s.append(_pt(X + 224, 350, 'only shaded blocks are trained', 'pcap', 'middle'))
+    return ''.join(s)
+
+
+def fig_paper():
+    return panel_a() + panel_b() + panel_c()
+
+
+PAPER_CSS = """
+.pbx    {{ fill: {panel}; stroke: {ink}; stroke-width: 1; }}
+.pfroz  {{ fill: {frozen_fill}; stroke: {muted}; stroke-width: 1; }}
+.pacc   {{ fill: {flow_fill}; stroke: {flow}; stroke-width: 1.2; }}
+.pempty {{ fill: none; stroke: {muted}; stroke-width: 1; stroke-dasharray: 3 3; }}
+.pdash  {{ fill: none; stroke: {muted}; stroke-width: .9; stroke-dasharray: 4 3; }}
+.ppanel {{ font: 700 14px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {ink}; }}
+.phead  {{ font: 600 12.5px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {ink}; }}
+.plbl   {{ font: 400 11.5px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {ink}; }}
+.plblb  {{ font: 600 11.5px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {ink};
+           letter-spacing: .04em; }}
+.pmath  {{ font: italic 400 11px Georgia,'Times New Roman',serif; fill: {ink}; }}
+.pmathf {{ font: italic 400 11.5px Georgia,'Times New Roman',serif; fill: {flow}; }}
+.pcap   {{ font: 400 9.5px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {muted}; }}
+.ptag   {{ font: 400 8.5px 'IBM Plex Sans',Helvetica,Arial,sans-serif; fill: {muted};
+           letter-spacing: .05em; }}
+.pnum   {{ font: 400 8px 'IBM Plex Mono',monospace; fill: {muted}; }}
+.parw   {{ stroke: {ink}; stroke-width: 1.1; fill: none; }}
+.parwa  {{ stroke: {flow}; stroke-width: 1.2; fill: none; }}
+.gcell-off {{ fill: none;            stroke: {rule};   stroke-width: .6; }}
+.gcell-vis {{ fill: {frozen_fill};   stroke: {rule};   stroke-width: .6; }}
+.gcell-hit {{ fill: {flow};          stroke: {flow};   stroke-width: .6; }}
+"""
+
+FIGS.append(('model_architecture', 1400, 420, fig_paper,
+             'Adapter injection into the frozen transformer, the compiled rule '
+             'head, and the rule-music cross-attention'))
+CSS = CSS + PAPER_CSS
+
+
 if __name__ == '__main__':
     print('Writing figures to', OUT)
     write_all()
