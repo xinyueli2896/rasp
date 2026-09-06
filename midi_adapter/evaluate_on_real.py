@@ -185,6 +185,7 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
     n_windows = len(windows) if max_windows is None else min(max_windows, len(windows))
     total_beats  = n_prompt_beats + n_gen_beats
     per_key: dict[int, list[tuple[float, float]]] = {}
+    diag_per_key: dict[int, list[tuple[float, ...]]] = {}
 
     tokenizer     = model.base.tokenizer
     sub_per_chord = SUBBEATS_PER_BAR // chords_per_bar
@@ -261,6 +262,32 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
                     n_hb_ok += 1
             halfbar_acc = n_hb_ok / max(n_hb_gen, 1)
 
+            # ── diagnostics ────────────────────────────────────────────
+            # Half the generated slots are I chords (OFFSETS[phase] == 0), so
+            # a model that just parks on the key scores 0.500 on halfbar_acc
+            # without following the rule at all. Splitting the accuracy by
+            # degree separates "found the key" from "applied the schedule";
+            # `parked` measures the pathology directly.
+            i_ok = i_n = o_ok = o_n = 0
+            root_counts: dict[int, int] = {}
+            for h in range(prompt_halfbars, len(gen_roots)):
+                exp = (key + OFFSETS[h % 4]) % 12
+                hit = int(gen_roots[h] == exp)
+                if OFFSETS[h % 4] == 0:
+                    i_n += 1; i_ok += hit
+                else:
+                    o_n += 1; o_ok += hit
+                if gen_roots[h] >= 0:
+                    root_counts[gen_roots[h]] = root_counts.get(gen_roots[h], 0) + 1
+            modal_root, modal_n = (max(root_counts.items(), key=lambda kv: kv[1])
+                                   if root_counts else (-1, 0))
+            diag_per_key.setdefault(key, []).append((
+                i_ok / max(i_n, 1),                        # accuracy on I slots
+                o_ok / max(o_n, 1),                        # accuracy on IV/V slots
+                float(modal_n >= max(n_hb_gen - 1, 1)),    # parked on one chord
+                float(modal_root == key),                  # modal root == the key
+            ))
+
             per_key.setdefault(key, []).append(
                 (halfbar_acc, bass_ok / n_gen_beats, cov_ok / n_gen_beats))
 
@@ -299,7 +326,49 @@ def evaluate_dataset(model, windows: torch.Tensor, keys: list[int],
             '_bass_raw': bass,
             '_cov_raw':  cov,
         }
-    return stats
+
+    diag: dict[str, np.ndarray] = {}
+    if diag_per_key:
+        arr = np.array([r for rs in diag_per_key.values() for r in rs])
+        diag = {'I_acc': arr[:, 0], 'IVV_acc': arr[:, 1],
+                'parked': arr[:, 2], 'key_found': arr[:, 3]}
+    return stats, diag
+
+
+def _constant_tonic_score(n_prompt_beats: int, total_beats: int,
+                           chords_per_bar: int) -> float:
+    """What 'always emit the key' scores on halfbar_acc for this slot layout.
+
+    OFFSETS[0] and OFFSETS[3] are both 0, so half the slots are I chords. Any
+    no-input model must clear this bar before halfbar_acc means anything.
+    """
+    spc = 16 // chords_per_bar
+    gen = range(n_prompt_beats // spc, total_beats // spc)
+    gen = list(gen)
+    if not gen:
+        return float('nan')
+    return sum(1 for h in gen if OFFSETS[h % 4] == 0) / len(gen)
+
+
+def _print_diag_table(diag: dict[str, np.ndarray], tonic_ref: float) -> None:
+    """Separate 'found the key' from 'applied the schedule'."""
+    if not diag:
+        return
+    n = len(diag['I_acc'])
+    print(f'\n  diagnostics (n={n})')
+    print(f'    {"I slots (phase 0,3)":<26}{diag["I_acc"].mean():>7.3f} '
+          f'±{diag["I_acc"].std(ddof=1) if n > 1 else 0.0:<6.3f}')
+    print(f'    {"IV/V slots (phase 1,2)":<26}{diag["IVV_acc"].mean():>7.3f} '
+          f'±{diag["IVV_acc"].std(ddof=1) if n > 1 else 0.0:<6.3f}')
+    print(f'    {"parked on one chord":<26}{diag["parked"].mean():>7.3f}'
+          f'        (all but one generated slot identical)')
+    print(f'    {"modal root == key":<26}{diag["key_found"].mean():>7.3f}')
+    print(f'    {"constant-tonic reference":<26}{tonic_ref:>7.3f}'
+          f'        (what "always emit the key" scores)')
+    gap = diag['I_acc'].mean() - diag['IVV_acc'].mean()
+    if gap > 0.35:
+        print(f'    NOTE: I slots beat IV/V by {gap:.3f} — consistent with '
+              f'parking on the tonic rather than following the schedule.')
 
 
 def _print_stats_table(title: str, stats: dict[int, dict[str, float]]) -> None:
@@ -514,7 +583,7 @@ def main():
         if args.save_midi_dir is not None:
             midi_dir = os.path.join(args.save_midi_dir, label)
 
-        stats = evaluate_dataset(
+        stats, diag = evaluate_dataset(
             model, windows, keys,
             n_prompt_beats  =args.n_prompt_beats,
             n_gen_beats     =n_gen,
@@ -531,6 +600,8 @@ def main():
         )
         _print_stats_table(f'{label.upper()} keys  (prompt={args.n_prompt_beats}, '
                             f'gen={n_gen}, T={args.temperature})', stats)
+        _print_diag_table(diag, _constant_tonic_score(
+            args.n_prompt_beats, args.n_prompt_beats + n_gen, args.chords_per_bar))
 
 
 if __name__ == '__main__':
