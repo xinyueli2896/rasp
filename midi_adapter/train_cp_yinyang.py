@@ -249,6 +249,12 @@ class RuleFollowingCallback(L.Callback):
                     else:
                         key_from_pair = (tensors[2] + pitch_shift) % 12
 
+                # Bidirectional derives rule_hidden from its own AR states;
+                # global_sampling would ignore chord_seq anyway, but drop it
+                # here so the no-rule-input claim is explicit at the call site.
+                if model.bidirectional:
+                    chord_seq = None
+
                 prompt = model.base.preprocess(
                     x[:, :self.n_prompt_beats, :], pitch_shift
                 )   # (B, n_prompt_beats, subseq)
@@ -335,17 +341,25 @@ class BaseFinetuneWrapper(nn.Module):
 class CPYinyangLightning(L.LightningModule):
 
     def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int,
-                 enc_loss_weight: float = 0.0):
+                 enc_loss_weight: float = 0.0, proxy_loss_weight: float = 0.0):
         super().__init__()
-        self.model           = model
-        self.max_lr          = max_lr
-        self.max_steps       = max_steps
-        self.enc_loss_weight = enc_loss_weight
+        self.model             = model
+        self.max_lr            = max_lr
+        self.max_steps         = max_steps
+        self.enc_loss_weight   = enc_loss_weight
+        self.proxy_loss_weight = proxy_loss_weight
 
     def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def _unpack(self, batch):
+        """→ (x, pitch_shift, key_override, chord_seq).
+
+        Datasets ship both a .keys.pt and a .chord_seq.pt sidecar and the loader
+        prefers chord_seq, so bidirectional runs — which must NOT be handed a
+        chord sequence — recover the tonic from it instead: chord slot 0 is
+        phase 0, i.e. the I chord, so its root IS the key.
+        """
         key_override, chord_seq = None, None
         if len(batch) == 3:
             x, pitch_shift, extra = batch
@@ -355,6 +369,12 @@ class CPYinyangLightning(L.LightningModule):
                 key_override = extra       # (B,)
         else:
             x, pitch_shift = batch
+        if self.model.bidirectional and chord_seq is not None:
+            key_override, chord_seq = chord_seq[:, 0].long(), None
+        return x, pitch_shift, key_override, chord_seq
+
+    def training_step(self, batch, batch_idx):
+        x, pitch_shift, key_override, chord_seq = self._unpack(batch)
         x_proc = self.model.base.preprocess(x, pitch_shift)
         loss   = self.model.loss(x, pitch_shift,
                                   key_override=key_override,
@@ -376,6 +396,13 @@ class CPYinyangLightning(L.LightningModule):
                 loss = loss + self.enc_loss_weight * enc_loss
                 self.log('enc_loss', enc_loss, on_step=True, on_epoch=False)
 
+        # Bidirectional ("no rule input") mode: pull each layer's ar_to_rule
+        # proxy toward the analytical rule hidden. Train-time only.
+        if self.proxy_loss_weight > 0 and self.model._proxy_loss is not None:
+            proxy_loss = self.model._proxy_loss
+            loss = loss + self.proxy_loss_weight * proxy_loss
+            self.log('proxy_loss', proxy_loss, on_step=True, on_epoch=False)
+
         self.log('train_loss', loss, on_step=True, on_epoch=False)
         scheduler = self.lr_schedulers()
         if scheduler is not None:
@@ -384,15 +411,7 @@ class CPYinyangLightning(L.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        key_override, chord_seq = None, None
-        if len(batch) == 3:
-            x, pitch_shift, extra = batch
-            if extra.dim() == 2:
-                chord_seq = extra
-            else:
-                key_override = extra
-        else:
-            x, pitch_shift = batch
+        x, pitch_shift, key_override, chord_seq = self._unpack(batch)
         loss = self.model.loss(x, pitch_shift,
                                 key_override=key_override,
                                 chord_seq=chord_seq)
@@ -426,10 +445,13 @@ def main(args):
     rule_suffix     = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
     enc_suffix      = f'_{args.encoder_type}' if args.encoder_injected else ''
     approach_suffix = f'_{args.approach}' if args.approach != 'bass' else ''
+    bidir_suffix    = ('_bidir' + (f'_proxy{args.proxy_loss_weight:g}'
+                                   if args.proxy_loss_weight > 0 else '')
+                       ) if args.bidirectional else ''
     run_name = (
         args.run_name
         or f'cp_yinyang_size{args.model_size}_rank{args.adapter_rank}_skip{args.n_skip}'
-           f'{lora_suffix}{rule_suffix}{enc_suffix}{approach_suffix}'
+           f'{lora_suffix}{rule_suffix}{enc_suffix}{approach_suffix}{bidir_suffix}'
     )
 
     # Build base CP transformer and load pretrained weights
@@ -467,6 +489,7 @@ def main(args):
             chord_seq_conditioning = args.paired_chord_seq,
             positional_qk     = args.positional_qk,
             qk_content_residual = args.qk_content_residual,
+            proxy_supervision = args.proxy_loss_weight > 0,
         )
 
         if args.unfreeze_base:
@@ -479,7 +502,8 @@ def main(args):
     print(f'Trainable: {n_trainable:,}   Frozen: {n_frozen:,}')
 
     lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps,
-                             enc_loss_weight=args.enc_loss_weight)
+                             enc_loss_weight=args.enc_loss_weight,
+                             proxy_loss_weight=args.proxy_loss_weight)
 
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
@@ -661,6 +685,14 @@ def get_args():
                    help='Unfreeze entire base model for joint base+adapter training (use with --pretrain_data when training from scratch)')
     p.add_argument('--bidirectional',     action='store_true',
                    help='No-input-to-rule-model variant: AR hidden states are projected to rule space via a learned linear instead of reading the key from the sequence')
+    p.add_argument('--proxy_loss_weight', type=float, default=0.0,
+                   help='Weight of the auxiliary loss pulling each layer\'s '
+                        'ar_to_rule proxy toward the analytical rule hidden '
+                        '(BCE on the triad chromagram + CE on bar phase). '
+                        'Requires --bidirectional. 0 = leave ar_to_rule '
+                        'unconstrained, which lets the adapter collapse into '
+                        'plain self-attention. Recommended: 1.0. Supervision '
+                        'is train-time only — inference needs no rule input.')
     p.add_argument('--encoder_injected', action='store_true',
                    help='Replace the one-hot W_E pitch-class lookup with a learned encoder; W_pos stays frozen')
     p.add_argument('--encoder_type', type=str, default='embedding',

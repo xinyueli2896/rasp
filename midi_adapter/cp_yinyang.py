@@ -335,9 +335,17 @@ class CPYinyangTransformer(nn.Module):
         chord_seq_conditioning: bool = False,
         positional_qk:    bool = False,
         qk_content_residual: bool = False,
+        proxy_supervision: bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
+        assert not (bidirectional and chord_seq_conditioning), \
+            ("bidirectional and chord_seq_conditioning are mutually exclusive: "
+             "chord-seq mode disables the causal mask (T_k = n_chords), but the "
+             "bidirectional proxy is per-subbeat (T_k = T_q), so an uncausal "
+             "mask would let position t read rule state derived from the future")
+        assert not (proxy_supervision and not bidirectional), \
+            "proxy_supervision requires bidirectional (it supervises ar_to_rule)"
         assert not (encoder_injected and rule_mode != 'current'), \
             "encoder_injected only supported with rule_mode='current'"
         assert encoder_type in ('embedding', 'token_mlp'), \
@@ -353,6 +361,11 @@ class CPYinyangTransformer(nn.Module):
         self.bidirectional    = bidirectional
         self.encoder_injected = encoder_injected
         self.approach         = approach
+        self.proxy_supervision = proxy_supervision
+        # Per-layer ar_to_rule outputs stashed during a training forward so the
+        # auxiliary rule loss can be computed without a second base pass.
+        self._proxies: list = []
+        self._proxy_loss = None
 
         # Freeze everything in the base model
         for p in self.base.parameters():
@@ -417,12 +430,16 @@ class CPYinyangTransformer(nn.Module):
 
         if bidirectional:
             # Learned AR→rule projection (one per adapter layer).
-            # Replaces the TracR rule model: AR hidden states are projected to
-            # TRACR_D_MODEL space and used as rule_hidden, so the adapter learns
-            # to extract the rule signal from the base model's representations
-            # rather than reading pc[:, 0] from the input sequence.
+            # Replaces the rule model's input entirely: AR hidden states are
+            # projected into rule space and used as rule_hidden, so the adapter
+            # reads the rule signal out of the base model's own representations
+            # instead of being handed a key or a chord_seq. Nothing external is
+            # required at inference — this is the "no rule input" variant.
+            #
+            # The base stack is causal and forward() shifts it by one
+            # (h = [sos, h[:-1]]), so proxy[t] is a function of tokens < t only.
             self.ar_to_rule = nn.ModuleList([
-                nn.Linear(self.base.hidden_size, TRACR_D_MODEL)
+                nn.Linear(self.base.hidden_size, self.rule_model.d_model)
                 for _ in range(n_adapters)
             ])
 
@@ -562,17 +579,53 @@ class CPYinyangTransformer(nn.Module):
 
         mask = base.buffered_future_mask(h)
 
+        self._proxies = []
         for i, layer in enumerate(base.model.layer):
             h = layer(h, attention_mask=mask)[0]
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden
+                if self.proxy_supervision and self.training:
+                    self._proxies.append(rule_h)
                 h = h + self.yinyang_attn[adapter_idx](
                     h, rule_h, sub_offset=0,
                     use_causal=not self.chord_seq_conditioning,
                 )
 
         return base.local_decode(h, emb)
+
+    def proxy_rule_loss(self, key: torch.Tensor, T: int) -> torch.Tensor | None:
+        """Auxiliary loss pulling each layer's ar_to_rule proxy into rule space.
+
+        In the integer experiment the proxy was passed through the TracR rule
+        model's FROZEN attention (W_Q/W_K/W_V/W_O), which pinned it to rule
+        coordinates for free. CPChordRuleModel is a pure lookup with no
+        attention, so nothing constrains the proxy here — without this loss
+        ar_to_rule is an unconstrained Linear and the adapter degenerates into
+        plain self-attention over music hidden states.
+
+        Target is the analytical rule hidden for the window's key:
+            dims  0-11 : binary chromagram of the expected major triad
+            dims 12-15 : one-hot of bar-phase (t // subbeats_per_chord) % 4
+        Supervision is train-time only; inference still needs no rule input.
+
+        key : (B,) tonic, already pitch-shifted to match x_proc
+        """
+        if not self._proxies:
+            return None
+        with torch.no_grad():
+            target = self.rule_model.build_rule_hidden_analytic(
+                key.to(self._proxies[0].device), T, self._proxies[0].device)
+        chroma_t, phase_t = target[..., :12], target[..., 12:].argmax(-1)
+        total = 0.0
+        for proxy in self._proxies:
+            chroma_loss = F.binary_cross_entropy_with_logits(
+                proxy[..., :12], chroma_t)
+            phase_loss = F.cross_entropy(
+                proxy[..., 12:].reshape(-1, proxy.shape[-1] - 12),
+                phase_t.reshape(-1))
+            total = total + chroma_loss + phase_loss
+        return total / len(self._proxies)
 
     def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor,
              key_override: torch.Tensor | None = None,
@@ -585,6 +638,12 @@ class CPYinyangTransformer(nn.Module):
         if chord_seq is not None:
             chord_seq = (chord_seq + pitch_shift.unsqueeze(-1)) % 12
         logits = self(x_proc, key_override=key_override, chord_seq=chord_seq)
+        # In bidirectional mode key_override is NOT an input to the model —
+        # forward() ignores it and builds rule_hidden from the AR states. It is
+        # only read here, as the target for the proxy loss.
+        self._proxy_loss = None
+        if self.proxy_supervision and key_override is not None:
+            self._proxy_loss = self.proxy_rule_loss(key_override, x_proc.shape[1])
         return F.cross_entropy(
             logits.view(-1, self.base.tokenizer.n_tokens),
             x_proc.view(-1),
