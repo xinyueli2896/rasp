@@ -339,7 +339,11 @@ class CPYinyangTransformer(nn.Module):
         proxy_supervision: bool = False,
         rule_attention:    bool = False,
         proxy_pos_inject:  bool = True,
+        proxy_activation:  str  = 'none',
+        proxy_temp:        float = 1.0,
     ):
+        assert proxy_activation in ('none', 'softmax', 'hard'), \
+            f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
         assert not (rule_attention and not bidirectional), \
             ("rule_attention requires bidirectional: the compiled head exists to "
              "constrain the learned ar_to_rule proxy, and there is no proxy "
@@ -373,6 +377,8 @@ class CPYinyangTransformer(nn.Module):
         self.proxy_supervision = proxy_supervision
         self.rule_attention    = rule_attention
         self.proxy_pos_inject  = proxy_pos_inject
+        self.proxy_activation  = proxy_activation
+        self.proxy_temp        = proxy_temp
         # Per-layer ar_to_rule outputs stashed during a training forward so the
         # auxiliary rule loss can be computed without a second base pass.
         self._proxies: list = []
@@ -625,6 +631,33 @@ class CPYinyangTransformer(nn.Module):
 
         return base.local_decode(h, emb)
 
+    def _activate_root(self, logits: torch.Tensor) -> torch.Tensor:
+        """Shape ar_to_rule's raw 12-d output before the frozen head reads it.
+
+        'none'     raw logits. Magnitude is unconstrained, so the retrieved
+                   tonic's scale drifts and does not match the explicit-input
+                   variant, where W_E[root] is a unit one-hot.
+        'softmax'  a distribution over the 12 roots: non-negative, sums to 1,
+                   so the scale matches W_E[root] exactly and the retrieved
+                   tonic is a convex combination of roots — a soft belief about
+                   the key. Fully differentiable; temperature sharpens it.
+        'hard'     straight-through: the forward pass is an exact one-hot, so
+                   the stream is bit-identical in form to the explicit-input
+                   variant; the backward pass uses the soft distribution.
+
+        NOTE: a one-hot HERE does not guarantee a one-hot tonic. Aggregate
+        averages over every phase-0 position, so if the model predicts
+        different roots at different I-chord slots the retrieval is a mixture
+        of them. One-hot inputs make that mixture legible, not impossible.
+        """
+        if self.proxy_activation == 'none':
+            return logits
+        soft = F.softmax(logits / self.proxy_temp, dim=-1)
+        if self.proxy_activation == 'softmax':
+            return soft
+        hard = F.one_hot(soft.argmax(-1), N_ROOTS).to(soft.dtype)
+        return hard + soft - soft.detach()      # straight-through estimator
+
     def _rule_proxy(self, h: torch.Tensor, adapter_idx: int) -> torch.Tensor:
         """Rule signal for one adapter, read out of the base's own hidden states.
 
@@ -650,7 +683,7 @@ class CPYinyangTransformer(nn.Module):
             # The tonic slot is left at zero so the frozen head is the only
             # thing that can fill it.
             B, T = proxy.shape[0], proxy.shape[1]
-            root = proxy[..., :N_ROOTS]
+            root = self._activate_root(proxy[..., :N_ROOTS])
             if self.proxy_pos_inject:
                 phase = self.rule_model.pos_embed(
                     T, h.device).to(proxy.dtype)[..., -N_POS:].expand(B, -1, -1)

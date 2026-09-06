@@ -391,6 +391,13 @@ def main():
                         'and ar_to_rule fails to load.')
     p.add_argument('--no_proxy_pos_inject', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--proxy_activation', type=str, default='none',
+                   choices=['none', 'softmax', 'hard'],
+                   help='Must match training — it changes the forward pass, '
+                        'not the weights, so a mismatch loads cleanly and '
+                        'scores a different model.')
+    p.add_argument('--proxy_temp', type=float, default=1.0,
+                   help='Must match training.')
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='If set, write generated windows as MIDI here '
                         '(named {seen|unseen}_NNNNN_keyX.mid).')
@@ -462,6 +469,8 @@ def main():
                            qk_content_residual=args.qk_content_residual,
                            rule_attention=args.rule_attention,
                            proxy_pos_inject=not args.no_proxy_pos_inject,
+                           proxy_activation=args.proxy_activation,
+                           proxy_temp=args.proxy_temp,
                            device=device)
     model.eval()
 

@@ -447,6 +447,8 @@ def main(args):
     approach_suffix = f'_{args.approach}' if args.approach != 'bass' else ''
     bidir_suffix    = ('_bidir'
                        + ('_tracr' if args.rule_attention else '')
+                       + ('' if args.proxy_activation == 'none'
+                          else f'_{args.proxy_activation}')
                        + (f'_proxy{args.proxy_loss_weight:g}'
                           if args.proxy_loss_weight > 0 else '')
                        ) if args.bidirectional else ''
@@ -494,6 +496,8 @@ def main(args):
             proxy_supervision = args.proxy_loss_weight > 0,
             rule_attention    = args.rule_attention,
             proxy_pos_inject  = not args.no_proxy_pos_inject,
+            proxy_activation  = args.proxy_activation,
+            proxy_temp        = args.proxy_temp,
         )
 
         if args.unfreeze_base:
@@ -702,6 +706,19 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--proxy_activation', type=str, default='none',
+                   choices=['none', 'softmax', 'hard'],
+                   help="Shape ar_to_rule's 12-d root output before the frozen "
+                        "head reads it. 'softmax' normalises it to a "
+                        "distribution so its scale matches W_E[root] in the "
+                        "explicit-input variant; 'hard' is straight-through "
+                        "one-hot (exact one-hot forward, soft gradient). Must "
+                        "match at eval — it changes the forward pass, not the "
+                        "weights, so a mismatch silently changes behaviour.")
+    p.add_argument('--proxy_temp', type=float, default=1.0,
+                   help='Softmax temperature for --proxy_activation. Below 1 '
+                        'sharpens toward one-hot; only read when the activation '
+                        'is softmax or hard.')
     p.add_argument('--proxy_loss_weight', type=float, default=0.0,
                    help='Weight of the auxiliary loss pulling each layer\'s '
                         'ar_to_rule proxy toward the analytical rule hidden '
