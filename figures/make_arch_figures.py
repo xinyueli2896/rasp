@@ -726,6 +726,145 @@ FIGS.append(('model_architecture_single', 1340, 700, fig_single,
 CSS = CSS + SINGLE_CSS
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Vertical (portrait) integrated figure — same graph, top-to-bottom flow.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fig_vertical():
+    s = []
+    A = s.append
+    CX = 340                                   # spine centre
+
+    # ── repeated-block enclosure ────────────────────────────────────────
+    A(_pbox(30, 168, 760, 762, 'pdash', 4))
+    A(_pt(786, 182, 'repeated for every layer  ×  L = 12', 'pcap', 'end'))
+
+    # ── spine, top ──────────────────────────────────────────────────────
+    A(_label_box(240, 56, 200, 40, 'CP tokens', msup('x ∈ ℝ', 'T×S')))
+    A(_parr(CX, 96, CX, 114))
+    A(_label_box(240, 116, 200, 40, 'local encoder', None))
+    A(_parr(CX, 156, CX, 174))
+    A(_label_box(210, 176, 260, 46, 'self-attention', 'layer ℓ', 'pfroz'))
+
+    # h fan-out ─ left into the rule path, right into the query path
+    A(_parr(300, 222, 300, 256, 'parwa', 'ar-flow'))
+    A(_ptr(308, 244, msub('h', 'ℓ'), 'pmathf'))
+    A(poly([(470, 199), (660, 199), (660, 766)], 'parwa', 'ar-flow'))
+    A(f'<circle cx="660" cy="199" r="3.5" class="pdot"/>')
+    A(_ptr(668, 232, msub('h', 'ℓ'), 'pmathf'))
+
+    # frozen residual skip, down the left edge into the ⊕
+    A(poly([(210, 199), (70, 199), (70, 900), (318, 900)], 'parw', 'ar-ink'))
+    A(_pt(80, 300, 'residual', 'pcap'))
+
+    # ── rule path ───────────────────────────────────────────────────────
+    A(_label_box(240, 258, 200, 40, 'ar_to_rule', '768 → 12', 'pacc'))
+    A(_parr(CX, 298, CX, 316))
+
+    sx, sw = 110, 530
+    r1 = sw * 12 / 28
+    A(_pt(sx, 312, 'residual stream  x  (28)', 'pcap'))
+    A(_pbox(sx, 318, r1, 44, 'pacc'))
+    A(_pbox(sx + r1, 318, r1, 44, 'pempty'))
+    A(_pbox(sx + 2 * r1, 318, sw - 2 * r1, 44, 'pfroz'))
+    A(_pt(sx + r1 / 2, 338, 'root (12)', 'plbl', 'middle'))
+    A(_pt(sx + r1 / 2, 352, 'from ar_to_rule', 'pcap', 'middle'))
+    A(_pt(sx + r1 * 1.5, 338, 'tonic (12)', 'pcap', 'middle'))
+    A(_pt(sx + r1 * 1.5, 352, 'empty', 'pcap', 'middle'))
+    A(_pt(sx + 2 * r1 + (sw - 2 * r1) / 2, 338, 'phase (4)', 'pcap', 'middle'))
+    A(_pt(sx + 2 * r1 + (sw - 2 * r1) / 2, 352, 'frozen clock', 'pcap', 'middle'))
+    A(_parr(CX, 362, CX, 386))
+
+    # the compiled head
+    A(_pbox(110, 388, 530, 226, 'pdash', 3))
+    A(_pt(124, 408, 'ONE COMPILED ATTENTION HEAD', 'plblb'))
+    A(_pt(632, 408, 'frozen · 0 params', 'pcap', 'end'))
+
+    gx, gy, cell, T = 146, 428, 14.0, 8
+    A(_pt(gx, 424, 'k →', 'pcap'))
+    A(f'<text x="{gx-7}" y="{gy+4*cell}" class="pcap" text-anchor="middle" '
+      f'transform="rotate(-90 {gx-7} {gy+4*cell})">q →</text>')
+    for q in range(T):
+        for k in range(T):
+            cls = ('gcell-hit' if k % 4 == 0 else 'gcell-vis') if k <= q else 'gcell-off'
+            A(f'<rect x="{gx+k*cell:.1f}" y="{gy+q*cell:.1f}" width="{cell-1:.1f}" '
+              f'height="{cell-1:.1f}" class="{cls}"/>')
+    A(_pt(gx + 56, gy + T * cell + 14, 'attention', 'pcap', 'middle'))
+
+    ex = 278
+    A(_pt(ex, 436, 'Select', 'plblb'))
+    A(_ptr(ex, 454, msub('Q = W', 'Q') + ' x  →  every query = ' + msub('e', '24'), 'pmath'))
+    A(_ptr(ex, 470, msub('K = W', 'K') + ' x  →  K[k] = ' + msub('e', '24 + phase(k)'), 'pmath'))
+    A(_ptr(ex, 488, '⟨Q, K⟩ · 20 = 20 · 1[ phase(k) = 0 ]', 'pmathf'))
+    A(_pt(ex, 518, 'Aggregate', 'plblb'))
+    A(_ptr(ex, 536, msub('V = W', 'V') + ' x  →  root copied into tonic', 'pmath'))
+    A(_ptr(ex, 554, 'r = x + softmax(·) V ' + msub('W', 'O'), 'pmathf'))
+    A(_pt(ex, 578, 'retrieves the key —', 'pcap'))
+    A(_pt(ex, 590, 'does not apply the rule', 'pcap'))
+
+    A(_parr(CX, 614, CX, 636))
+
+    # output stream r
+    A(_pt(sx, 632, 'output stream  r', 'pcap'))
+    A(_pbox(sx, 638, r1, 44, 'pacc'))
+    A(_pbox(sx + r1, 638, r1, 44, 'pacc'))
+    A(_pbox(sx + 2 * r1, 638, sw - 2 * r1, 44, 'pfroz'))
+    A(_pt(sx + r1 / 2, 664, 'root', 'plbl', 'middle'))
+    A(_pt(sx + r1 * 1.5, 658, 'tonic ← key', 'plbl', 'middle'))
+    A(_pt(sx + r1 * 1.5, 672, 'written by the head', 'pcap', 'middle'))
+    A(_pt(sx + 2 * r1 + (sw - 2 * r1) / 2, 664, 'phase', 'pcap', 'middle'))
+
+    # ── projections ─────────────────────────────────────────────────────
+    A(_parr(190, 682, 190, 724, 'parwa', 'ar-flow'))
+    A(_parr(350, 682, 350, 724, 'parwa', 'ar-flow'))
+    A(_label_box(130, 726, 120, 40, 'k_proj', '28 → 256', 'pacc'))
+    A(_label_box(290, 726, 120, 40, 'v_proj', '28 → 256', 'pacc'))
+    A(_label_box(600, 726, 120, 40, 'q_proj', '768 → 256', 'pacc'))
+
+    A(_parr(190, 766, 190, 790, 'parwa', 'ar-flow'))
+    A(_parr(350, 766, 350, 790, 'parwa', 'ar-flow'))
+    A(_parr(660, 766, 660, 790))
+    A(_pt(198, 784, 'K', 'pmathf'))
+    A(_pt(358, 784, 'V', 'pmathf'))
+    A(_pt(668, 784, 'Q', 'pmath'))
+
+    # ── cross-attention ─────────────────────────────────────────────────
+    A(_pbox(110, 788, 610, 84, 'pdash', 3))
+    A(_ptr(415, 810, 'A = softmax( Q Kᵀ / √' + msub('d', 'h') + ' )', 'pmathf', 'middle'))
+    A(_ptr(415, 830, 'Δ = ( A V ) ' + msub('W', 'O'), 'pmathf', 'middle'))
+    A(_ptr(415, 850, '8 heads · ' + msub('d', 'h') + ' = 32 · causal', 'pcap', 'middle'))
+    A(_pt(415, 864, 'queries from the music, keys and values from the rule', 'pcap', 'middle'))
+
+    A(_parr(CX, 872, CX, 884, 'parwa', 'ar-flow'))
+    A(_ptr(348, 882, 'g ⊙ Δ', 'pmathf'))
+
+    # ── ⊕ and spine, bottom ─────────────────────────────────────────────
+    A(f'<circle cx="{CX}" cy="900" r="18" class="pacc"/>')
+    A(_pt(CX, 905, '+', 'pplus', 'middle'))
+    A(_parr(CX, 918, CX, 948))
+    A(_label_box(240, 950, 200, 40, 'local decoder', None))
+    A(_parr(CX, 990, CX, 1008))
+    A(_label_box(240, 1010, 200, 40, 'logits', msup('ŷ ∈ ℝ', 'T×S×|V|')))
+
+    # ── legend ──────────────────────────────────────────────────────────
+    lx, ly = 570, 46
+    A(_pbox(lx, ly, 250, 82, 'pbx', 3))
+    for i, (cls, lab) in enumerate((
+            ('pfroz', 'frozen — pretrained'),
+            ('pacc',  'trained — adapter'),
+            ('pempty', 'empty stream region'))):
+        A(_pbox(lx + 12, ly + 14 + i * 22, 22, 13, cls, 2))
+        A(_pt(lx + 44, ly + 24 + i * 22, lab, 'pcap'))
+    return ''.join(s)
+
+
+FIGS.append(('model_architecture_vertical', 860, 1080, fig_vertical,
+             'Portrait diagram: the frozen music path top to bottom, with the '
+             'rule model and cross-attention adapter branching from it'))
+
+
 if __name__ == '__main__':
     print('Writing figures to', OUT)
     write_all()
