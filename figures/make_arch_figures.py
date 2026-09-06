@@ -865,6 +865,125 @@ FIGS.append(('model_architecture_vertical', 860, 1080, fig_vertical,
              'rule model and cross-attention adapter branching from it'))
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Two-tower figure: transformer (left) — adapters (middle) — rule model (right)
+# Panel (a) the rule model has an input;  panel (b) it has none.
+# ═══════════════════════════════════════════════════════════════════════════
+
+TW_LX, TW_LW = 40, 190      # left tower
+TW_AX, TW_AW = 280, 136     # adapter column
+TW_RX, TW_RW = 440, 200     # right tower
+TW_ROWS = [(160, '1'), (202, '2'), (262, 'L = 12')]
+
+
+def _tower_left():
+    s = []
+    cx = TW_LX + TW_LW / 2
+    s.append(_label_box(TW_LX, 64, TW_LW, 34, 'CP tokens', None))
+    s.append(_parr(cx, 98, cx, 106))
+    s.append(_label_box(TW_LX, 108, TW_LW, 34, 'local encoder', None))
+    s.append(_parr(cx, 142, cx, 158))
+    for i, (y, name) in enumerate(TW_ROWS):
+        s.append(_label_box(TW_LX, y, TW_LW, 32, f'self-attention {name}', None, 'pfroz'))
+        if i < 2:
+            s.append(_parr(cx, y + 32, cx, y + 40))
+    s.append(f'<line x1="{cx}" y1="236" x2="{cx}" y2="258" class="parw" '
+             f'stroke-dasharray="2 3" marker-end="url(#ar-ink)"/>')
+    s.append(_pt(cx, 252, '⋮', 'plbl', 'middle'))
+    s.append(_parr(cx, 294, cx, 314))
+    s.append(_label_box(TW_LX, 316, TW_LW, 34, 'local decoder', None))
+    s.append(_parr(cx, 350, cx, 358))
+    s.append(_label_box(TW_LX, 360, TW_LW, 34, 'logits', None))
+    s.append(_pt(cx, 54, 'PRETRAINED TRANSFORMER · frozen', 'plane-t', 'middle'))
+    return ''.join(s)
+
+
+def _adapters():
+    """The bridge: h in from the left, r in from the right, gΔ back left."""
+    s = [_pt(TW_AX + TW_AW / 2, 54, 'ADAPTER · trained', 'plane-t', 'middle')]
+    for i, (y, _) in enumerate(TW_ROWS):
+        s.append(_label_box(TW_AX, y, TW_AW, 32, 'cross-attn', None, 'pacc'))
+        s.append(_parr(TW_LX + TW_LW, y + 10, TW_AX - 2, y + 10))
+        s.append(_parr(TW_AX, y + 24, TW_LX + TW_LW + 2, y + 24, 'parwa', 'ar-flow'))
+        s.append(_parr(TW_RX, y + 17, TW_AX + TW_AW + 2, y + 17, 'parwa', 'ar-flow'))
+        if i == 0:
+            s.append(_ptr(TW_LX + TW_LW + 4, y + 7, msub('h', 'ℓ'), 'pmath'))
+            s.append(_pt(TW_AX + TW_AW + 5, y + 13, 'r', 'pmathf'))
+        if i == len(TW_ROWS) - 1:
+            s.append(_ptr(TW_LX + TW_LW + 4, y + 40, 'g ⊙ Δ', 'pmathf'))
+    return ''.join(s)
+
+
+def _tower_right(with_input):
+    s = [_pt(TW_RX + TW_RW / 2, 54, 'RULE MODEL · 0 params', 'plane-t', 'middle')]
+    cx = TW_RX + TW_RW / 2
+    s.append(_pbox(TW_RX, 160, TW_RW, 134, 'pdash', 3))
+
+    if with_input:
+        # its own external input, mirroring CP tokens on the left
+        s.append(_label_box(TW_RX, 64, TW_RW, 34, 'chord_seq', '(B, 8) roots', 'pacc'))
+        s.append(_parr(cx, 98, cx, 158, 'parwa', 'ar-flow'))
+        s.append(_pt(cx, 180, 'ChordSeqRuleModel', 'plbl', 'middle'))
+        s.append(_pt(cx, 194, 'table lookup — no computation', 'pcap', 'middle'))
+        for c, (deg, _) in enumerate(CHORDS):
+            x = 452 + c * 22
+            s.append(_pbox(x, 206, 20, 22, 'pacc', 2))
+            s.append(_pt(x + 10, 220, deg, 'pnum', 'middle'))
+        s.append(_pt(cx, 246, 'rule_hidden  (8, 16)', 'pmath', 'middle'))
+        s.append(_pt(cx, 266, 'computed once,', 'pcap', 'middle'))
+        s.append(_pt(cx, 278, 'shared by all L adapters', 'pcap', 'middle'))
+    else:
+        # fed by the transformer instead: no external input exists
+        s.append(_pbox(TW_RX, 64, TW_RW, 34, 'pempty'))
+        s.append(_pt(cx, 85, 'no input', 'pcap', 'middle'))
+        s.append(_label_box(TW_RX + 14, 170, TW_RW - 28, 30, 'ar_to_rule', '768 → 12', 'pacc'))
+        s.append(_parr(cx, 200, cx, 208, 'parwa', 'ar-flow'))
+        s.append(_pbox(TW_RX + 14, 210, TW_RW - 28, 40, 'pbx'))
+        s.append(_pt(cx, 225, 'compiled head', 'plbl', 'middle'))
+        s.append(_pt(cx, 240, 'Select · Aggregate', 'pcap', 'middle'))
+        s.append(_parr(cx, 250, cx, 258, 'parwa', 'ar-flow'))
+        s.append(_pbox(TW_RX + 14, 260, TW_RW - 28, 26, 'pacc'))
+        s.append(_pt(cx, 277, 'r :  root | tonic←key | phase', 'pnum', 'middle'))
+        # bus tapped off every layer's h, routed over the top into ar_to_rule
+        bx = TW_AX - 12                               # in the tower/adapter gap
+        s.append(f'<line x1="{bx}" y1="150" x2="{bx}" y2="{TW_ROWS[-1][0] + 10}" '
+                 f'class="parwa"/>')
+        for y, _ in TW_ROWS:
+            s.append(f'<circle cx="{bx}" cy="{y + 10}" r="3" class="pdot"/>')
+        s.append(poly([(bx, 150), (cx, 150), (cx, 166)], 'parwa', 'ar-flow'))
+        s.append(_ptr(bx + 8, 144, msub('h', 'ℓ') + '  from every layer', 'pmathf'))
+    return ''.join(s)
+
+
+def _tw_panel(label, title, with_input, note):
+    s = [_pbox(0.5, 40, 659, 406, 'pdash', 4)]
+    s.append(_pt(10, 30, label, 'ppanel'))
+    s.append(_pt(40, 30, title, 'phead'))
+    s.append(_tower_left())
+    s.append(_adapters())
+    s.append(_tower_right(with_input))
+    s.append(_pt(330, 424, note, 'pcap', 'middle'))
+    return ''.join(s)
+
+
+def fig_two_tower():
+    a = _tw_panel('(a)', 'Rule model with an input',  True,
+                  'the progression is supplied at train and test time — '
+                  'the adapter renders a given plan')
+    b = _tw_panel('(b)', 'Rule model with no input',  False,
+                  'nothing is supplied — the rule signal is read out of the '
+                  'transformer’s own hidden states')
+    return f'<g>{a}</g><g transform="translate(700,0)">{b}</g>'
+
+
+FIGS.append(('two_tower_architecture', 1360, 460, fig_two_tower,
+             'Pretrained transformer on the left, rule model on the right, '
+             'cross-attention adapters bridging them, with and without an '
+             'input to the rule model'))
+
+
 if __name__ == '__main__':
     print('Writing figures to', OUT)
     write_all()
