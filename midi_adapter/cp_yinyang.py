@@ -45,7 +45,7 @@ import torch.nn.functional as F
 from models.bass_tracr_rule_model import (
     BassTracrRuleModel, CPChordRuleModel, ChordSeqRuleModel, TRACR_D_MODEL,
 )
-from models.chord_tracr_rule_model import ChordTracrRuleModel
+from models.chord_tracr_rule_model import ChordTracrRuleModel, N_ROOTS, N_POS
 
 
 # ---------------------------------------------------------------------------
@@ -456,8 +456,22 @@ class CPYinyangTransformer(nn.Module):
             #
             # The base stack is causal and forward() shifts it by one
             # (h = [sos, h[:-1]]), so proxy[t] is a function of tokens < t only.
+            #
+            # With rule_attention the projection emits ONLY the 12 root dims.
+            # The other 16 are structurally zero before the frozen head runs:
+            # dims 12-23 are the head's output slot, and letting ar_to_rule
+            # write there would let it place a "tonic" directly, bypassing the
+            # retrieval and making the compiled head decorative. Dims 24-27 are
+            # then filled by the frozen phase clock. Same shape as the
+            # encoder-injected path, which pads a 12-d encoder up to d_model
+            # so W_pos lands in an otherwise-empty subspace.
+            # Without the frozen clock the projection must also emit the 4
+            # phase dims itself, or every key would score 0 and the retrieval
+            # would smear uniformly over the whole causal prefix.
+            proj_out = (self.rule_model.d_model if not rule_attention else
+                        (N_ROOTS if proxy_pos_inject else N_ROOTS + N_POS))
             self.ar_to_rule = nn.ModuleList([
-                nn.Linear(self.base.hidden_size, self.rule_model.d_model)
+                nn.Linear(self.base.hidden_size, proj_out)
                 for _ in range(n_adapters)
             ])
 
@@ -627,14 +641,23 @@ class CPYinyangTransformer(nn.Module):
         ar_to_rule focused on the pitch content that is actually under test.
         """
         proxy = self.ar_to_rule[adapter_idx](h)
-        if self.rule_attention and self.proxy_pos_inject:
-            proxy = proxy + self.rule_model.pos_embed(
-                h.shape[1], h.device).to(proxy.dtype)
         # Supervision, when enabled, targets the PRE-attention proxy — the part
         # ar_to_rule is responsible for.
         if self.proxy_supervision and self.training:
             self._proxies.append(proxy)
         if self.rule_attention:
+            # Assemble the 28-d stream: [root | EMPTY tonic slot | phase].
+            # The tonic slot is left at zero so the frozen head is the only
+            # thing that can fill it.
+            B, T = proxy.shape[0], proxy.shape[1]
+            root = proxy[..., :N_ROOTS]
+            if self.proxy_pos_inject:
+                phase = self.rule_model.pos_embed(
+                    T, h.device).to(proxy.dtype)[..., -N_POS:].expand(B, -1, -1)
+            else:
+                phase = proxy[..., N_ROOTS:]
+            proxy = torch.cat(
+                [root, root.new_zeros(B, T, N_ROOTS), phase], dim=-1)
             proxy = self.rule_model.run_attention(proxy)
         return proxy
 
