@@ -718,6 +718,7 @@ SINGLE_CSS = """
 .pbrk    {{ fill: none; stroke: {muted}; stroke-width: .9; }}
 .pdot    {{ fill: {flow}; stroke: none; }}
 .pplus   {{ font: 400 17px 'IBM Plex Sans',Helvetica,sans-serif; fill: {flow}; }}
+.pplussm {{ font: 400 12px 'IBM Plex Sans',Helvetica,sans-serif; fill: {flow}; }}
 """
 
 FIGS.append(('model_architecture_single', 1340, 700, fig_single,
@@ -911,7 +912,11 @@ def _adapters():
     for i, (y, _) in enumerate(TW_ROWS):
         s.append(_label_box(TW_AX, y, TW_AW, 32, 'cross-attn', None, 'pacc'))
         s.append(_parr(TW_LX + TW_LW, y + 10, TW_AX - 2, y + 10))
-        s.append(_parr(TW_AX, y + 24, TW_LX + TW_LW + 2, y + 24, 'parwa', 'ar-flow'))
+        # the correction is ADDED into the residual stream, not substituted:
+        # with g = 0 the frozen model comes back exactly.
+        s.append(_parr(TW_AX, y + 24, TW_LX + TW_LW + 10, y + 24, 'parwa', 'ar-flow'))
+        s.append(f'<circle cx="{TW_LX + TW_LW}" cy="{y + 24}" r="7.5" class="pacc"/>')
+        s.append(_pt(TW_LX + TW_LW, y + 28, '+', 'pplussm', 'middle'))
         s.append(_parr(TW_RX, y + 17, TW_AX + TW_AW + 2, y + 17, 'parwa', 'ar-flow'))
         if i == 0:
             s.append(_ptr(TW_LX + TW_LW + 4, y + 7, msub('h', 'ℓ'), 'pmath'))
