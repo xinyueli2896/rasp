@@ -111,23 +111,36 @@ for cls, kw in ((ChordTracrRuleModel, dict(n_phase_heads=2)),
           torch.allclose(a[:, :40], b[:, :40], atol=1e-5),
           f'max delta {float((a[:, :40] - b[:, :40]).abs().max()):.2e}')
 
-print('\n6. Degradation — how many extra active dims before the answer breaks')
-m = ChordRaspCompiled(subbeats_per_chord=SPC, rule_input='triad')
-r, phase = roots_for(7)
-g = torch.Generator().manual_seed(0)
-for extra in (0, 1, 2):
+print('\n6. The MLP transposes an ARBITRARY pitch-class set')
+m = ChordRaspCompiled(subbeats_per_chord=SPC)
+phase_full = (torch.arange(T) // SPC) % N_POS
+def transpose_check(pcs):
     x = torch.zeros(1, T, m.d_model)
-    base = enc_of(m, r)
-    for t in range(T):
-        v = base[t].clone()
-        off = (v == 0).nonzero().flatten()
-        for p in off[torch.randperm(len(off), generator=g)[:extra]]:
-            v[p] = 1.0
-        x[0, t, m.R0:m.R0 + N_ROOTS] = v
-    x[0, :, m.P0:m.P0 + N_POS] = F.one_hot(phase, N_POS).float()
+    v = torch.zeros(N_ROOTS); v[list(pcs)] = 1.0
+    x[0, :, m.K0:m.K0 + N_ROOTS] = v
+    x[0, :, m.P0:m.P0 + N_POS] = F.one_hot(phase_full, N_POS).float()
     out = m.run_attention(x)[0, :, m.O0:m.O0 + N_ROOTS]
-    exact = torch.allclose((out > 0.5).float(), base, atol=1e-5)
-    print(f'       +{extra} extra pitch classes -> exact: {exact}')
+    return all(torch.allclose(out[t], torch.roll(v, OFFSETS[int(phase_full[t])]),
+                              atol=1e-5) for t in range(T))
+CHORDS = {'major': {7,11,2}, 'minor': {7,10,2}, 'dom7': {7,11,2,5},
+          'maj7': {7,11,2,6}, 'sus4': {7,0,2}, 'single': {7},
+          'six-note': {7,11,2,5,9,0}}
+check('transposes every chord type exactly',
+      all(transpose_check(p) for p in CHORDS.values()),
+      ', '.join(CHORDS))
+
+print('\n6b. Linear in the key for values in [0,1]; broken outside')
+def err(kv, ph=1):
+    x = torch.zeros(1, T, m.d_model)
+    x[0, :, m.K0:m.K0 + N_ROOTS] = kv
+    x[0, :, m.P0 + ph] = 1.0
+    out = m.run_attention(x)[0, 0, m.O0:m.O0 + N_ROOTS]
+    return float((out - torch.roll(kv, OFFSETS[ph])).abs().max())
+torch.manual_seed(0)
+check('softmax key is transposed exactly', err(F.softmax(torch.randn(12), -1)) < 1e-6)
+check('arbitrary [0,1] key is transposed exactly', err(torch.rand(12)) < 1e-6)
+check('raw logits DO break it', err(torch.randn(12) * 2) > 0.1,
+      'which is why proxy_activation=none is rejected for MLP programs')
 
 print('\n7. build_rule_hidden_analytic matches the program it describes')
 # The analytic builder returns an idealised one-hot. The program cannot: the

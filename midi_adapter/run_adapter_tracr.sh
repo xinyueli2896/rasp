@@ -65,7 +65,13 @@ NO_POS="${NO_POS:-0}"
 HEADS="${HEADS:-2}"
 FROM_LAYER="${FROM_LAYER:--1}"
 CR="${CR:-none}"
-PROXY_ACT="${PROXY_ACT:-none}"
+# Programs with an MLP need the key region bounded in [0,1]; sigmoid is
+# the right default when dims 0-11 are read as a chromagram.
+if [ "${PROGRAM:-retrieve}" != retrieve ]; then
+    PROXY_ACT="${PROXY_ACT:-sigmoid}"
+else
+    PROXY_ACT="${PROXY_ACT:-none}"
+fi
 PROGRAM="${PROGRAM:-retrieve}"
 RULE_IN="${RULE_IN:-root}"
 

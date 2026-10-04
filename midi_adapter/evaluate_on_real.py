@@ -498,7 +498,7 @@ def main():
                    help='Must match training — it changes the rule model\'s '
                         'buffers, so a mismatch fails to load.')
     p.add_argument('--proxy_activation', type=str, default='none',
-                   choices=['none', 'softmax', 'hard'],
+                   choices=['none', 'softmax', 'sigmoid', 'hard'],
                    help='Must match training — it changes the forward pass, '
                         'not the weights, so a mismatch loads cleanly and '
                         'scores a different model.')

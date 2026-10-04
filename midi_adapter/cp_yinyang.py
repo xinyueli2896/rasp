@@ -381,8 +381,18 @@ class CPYinyangTransformer(nn.Module):
              "with no chord computed")
         assert rule_program in ('retrieve', 'full', 'mlp_only'), \
             f"rule_program must be retrieve|full|mlp_only, got {rule_program!r}"
-        assert proxy_activation in ('none', 'softmax', 'hard'), \
-            f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
+        assert proxy_activation in ('none', 'softmax', 'sigmoid', 'hard'), \
+            f"proxy_activation must be none|softmax|sigmoid|hard, got {proxy_activation!r}"
+        # Programs with an MLP need the key region in [0, 1]: the hidden layer
+        # is ReLU(key_i + phase_j - 1), which is EXACTLY key_i when phase is
+        # one-hot and key_i is in range. Negative entries are clipped and
+        # entries > 1 leak into the other phases' cells, so raw logits break
+        # the arithmetic outright.
+        assert not (rule_program in ('full', 'mlp_only')
+                    and proxy_activation == 'none'), \
+            (f"rule_program={rule_program} needs a bounded --proxy_activation "
+             f"(sigmoid|softmax|hard); raw logits leave [0,1] and corrupt the "
+             f"MLP's AND-detector")
         assert not (rule_attention and not bidirectional), \
             ("rule_attention requires bidirectional: the compiled head exists to "
              "constrain the learned ar_to_rule proxy, and there is no proxy "
@@ -731,6 +741,11 @@ class CPYinyangTransformer(nn.Module):
         """
         if self.proxy_activation == 'none':
             out = logits
+        elif self.proxy_activation == 'sigmoid':
+            # Per-dimension, multi-label: the natural choice when dims 0-11 are
+            # a CHROMAGRAM. softmax would force the 12 dims to sum to 1, so a
+            # four-note chord would come out at ~0.25 per note instead of ~1.
+            out = torch.sigmoid(logits / self.proxy_temp)
         else:
             soft = F.softmax(logits / self.proxy_temp, dim=-1)
             if self.proxy_activation == 'softmax':

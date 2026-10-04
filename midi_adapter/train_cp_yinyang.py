@@ -777,14 +777,18 @@ def get_args():
                         'from every slot type — same answer on a clean proxy, '
                         'robust to a misread slot. Requires --rule_attention.')
     p.add_argument('--proxy_activation', type=str, default='none',
-                   choices=['none', 'softmax', 'hard'],
+                   choices=['none', 'softmax', 'sigmoid', 'hard'],
                    help="Shape ar_to_rule's 12-d root output before the frozen "
                         "head reads it. 'softmax' normalises it to a "
                         "distribution so its scale matches W_E[root] in the "
-                        "explicit-input variant; 'hard' is straight-through "
-                        "one-hot (exact one-hot forward, soft gradient). Must "
-                        "match at eval — it changes the forward pass, not the "
-                        "weights, so a mismatch silently changes behaviour.")
+                        "explicit-input variant; 'sigmoid' is per-dimension and "
+                        "is the right choice when dims 0-11 are a CHROMAGRAM, "
+                        "since softmax would force a four-note chord to ~0.25 "
+                        "per note; 'hard' is straight-through one-hot. Any "
+                        "program with an MLP REQUIRES one of these: the hidden "
+                        "layer is ReLU(key_i + phase_j - 1), exact for key in "
+                        "[0,1] and corrupted by raw logits. Must match at eval "
+                        "— it changes the forward pass, not the weights.")
     p.add_argument('--proxy_temp', type=float, default=1.0,
                    help='Softmax temperature for --proxy_activation. Below 1 '
                         'sharpens toward one-hot; only read when the activation '
