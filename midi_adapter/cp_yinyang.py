@@ -729,12 +729,22 @@ class CPYinyangTransformer(nn.Module):
         of them. One-hot inputs make that mixture legible, not impossible.
         """
         if self.proxy_activation == 'none':
-            return logits
-        soft = F.softmax(logits / self.proxy_temp, dim=-1)
-        if self.proxy_activation == 'softmax':
-            return soft
-        hard = F.one_hot(soft.argmax(-1), N_ROOTS).to(soft.dtype)
-        return hard + soft - soft.detach()      # straight-through estimator
+            out = logits
+        else:
+            soft = F.softmax(logits / self.proxy_temp, dim=-1)
+            if self.proxy_activation == 'softmax':
+                out = soft
+            else:
+                hard = F.one_hot(soft.argmax(-1), N_ROOTS).to(soft.dtype)
+                out = hard + soft - soft.detach()   # straight-through estimator
+        if self.rule_input == 'triad':
+            # The program's root subspace is a CHROMAGRAM in this mode, so turn
+            # the root estimate into one with the fixed major-triad circulant.
+            # With 'hard' this is an exact 3-hot, which is what the MLP needs:
+            # it fires one hidden cell per active dim, so a smeared input adds
+            # spurious transposed notes to the answer.
+            out = sum(out.roll(k, dims=-1) for k in (0, 4, 7))
+        return out
 
     def _rule_proxy(self, h: torch.Tensor, adapter_idx: int) -> torch.Tensor:
         """Rule signal for one adapter, read out of the base's own hidden states.
