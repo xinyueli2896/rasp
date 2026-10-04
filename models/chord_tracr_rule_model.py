@@ -43,9 +43,15 @@ No trainable parameters.
 """
 from __future__ import annotations
 
+import os
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Importable as a module and runnable directly (python models/<this>.py).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rasp_program.sequence_rule import OFFSETS
 
@@ -260,45 +266,6 @@ class ChordTracrRuleModel(nn.Module):
         return iter([])
 
 
-if __name__ == '__main__':
-    torch.set_printoptions(linewidth=200)
-    spc = 8
-    m = ChordTracrRuleModel(subbeats_per_chord=spc)
-
-    # 4-bar window in G (key=7): I IV V I I IV V I over 8 slots / 64 subbeats.
-    key = torch.tensor([7])
-    T = 64
-    phase = m.phase_at(T, 'cpu')
-    roots = (key[:, None] + m._offsets[phase][None, :]) % 12
-
-    print('phase  :', phase[::8].tolist(), '(one per slot)')
-    print('roots  :', roots[0, ::8].tolist(), '(expect 7 0 2 7 7 0 2 7)')
-
-    logits, h = m(roots, return_hidden=True)
-    retrieved = logits.argmax(-1)[0]
-    print('tonic  :', retrieved[::8].tolist(), '(expect all 7)')
-    print('exact  :', bool((retrieved == 7).all()))
-
-    # The head must be sharp: check the attention actually concentrates on
-    # phase-0 positions rather than smearing.
-    x = m._stream_from_roots(roots)
-    Q, K = x @ m.W_Q.T, x @ m.W_K.T
-    s = (Q @ K.transpose(-2, -1)) * m.attn_scale
-    s = s.masked_fill(~torch.tril(torch.ones(T, T, dtype=torch.bool)), float('-inf'))
-    a = F.softmax(s, dim=-1)[0]
-    p0 = (phase == 0)
-    print('mass on phase-0 keys, last row: '
-          f'{a[-1][p0].sum():.4f}  (expect ~1.0)')
-
-    # Analytic target must match what the head produces.
-    tgt = m.build_rule_hidden_analytic(key, T, 'cpu')
-    print('analytic == compiled:', bool(torch.allclose(tgt, h, atol=1e-5)))
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Conventional TracR compilation of the full rule — attention + MLP
-# ═══════════════════════════════════════════════════════════════════════════
-
 RASP_D_MODEL = N_ROOTS * 2 + N_POS + N_ROOTS      # 40
 
 
@@ -484,3 +451,65 @@ class ChordRaspCompiled(nn.Module):
 
     def named_parameters(self, prefix='', recurse=True, remove_duplicate=True):
         return iter([])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    """Compile the flagship rule model and run it. No training, no data."""
+    torch.set_printoptions(linewidth=200, sci_mode=False)
+    NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+    SPC, T, KEY = 8, 64, 7                      # 8 subbeats/slot, 4 bars, key G
+
+    m = ChordRaspCompiled(subbeats_per_chord=SPC)   # <- compiles here
+    R0, K0, P0, O0 = m.R0, m.K0, m.P0, m.O0
+
+    print(f'compiled  d_model={m.d_model}  params={len(list(m.parameters()))}')
+    print(f'  layout   root {R0}-{K0-1} | key {K0}-{P0-1} | '
+          f'phase {P0}-{O0-1} | out {O0}-{m.d_model-1}')
+    print(f'  rule     OFFSETS = {m._offsets.tolist()}  (lives in W_out only)')
+    print()
+    print('nonzeros per matrix')
+    for n in ('W_E', 'W_pos', 'W_Q', 'W_K', 'W_V', 'W_O', 'W_in', 'W_out'):
+        W = getattr(m, n)
+        print(f'  {n:<6}{str(tuple(W.shape)):<12}{int((W != 0).sum()):>5} nonzero')
+
+    # ── run it ──────────────────────────────────────────────────────────
+    phase = m.phase_at(T, 'cpu')
+    roots = (KEY + m._offsets[phase]) % N_ROOTS            # ground-truth input
+    x     = m._stream_from_roots(roots.unsqueeze(0))
+    out   = m.run_attention(x)
+
+    print()
+    print(f'input: the chord root at every subbeat, key {NAMES[KEY]}')
+    print(f'  slot   {[t // SPC for t in range(0, T, SPC)]}')
+    print(f'  phase  {phase[::SPC].tolist()}')
+    print(f'  root   {[NAMES[r] for r in roots[::SPC]]}')
+    print()
+    print('output')
+    print(f'  key    {[NAMES[int(out[0, t, K0:P0].argmax())] for t in range(0, T, SPC)]}'
+          f"   <- retrieved by the attention head")
+    print(f'  out    {[NAMES[int(out[0, t, O0:].argmax())] for t in range(0, T, SPC)]}'
+          f"   <- computed by the MLP")
+    print(f'  truth  {[NAMES[r] for r in roots[::SPC]]}')
+
+    # ── and it is key-agnostic: same weights, any key ────────────────────
+    print()
+    print('same compiled weights, every key:')
+    for k in (0, 3, 7, 11):
+        r = (k + m._offsets[phase]) % N_ROOTS
+        o = m.run_attention(m._stream_from_roots(r.unsqueeze(0)))
+        got = [NAMES[int(o[0, t, O0:].argmax())] for t in range(0, T, SPC)][:4]
+        print(f'  key {NAMES[k]:<3} -> {got}')
+
+    print()
+    print('swap the cadence by rewriting W_out alone:')
+    for offs, name in (([0, 5, 7, 0], 'I-IV-V-I'), ([0, 9, 5, 7], 'I-vi-IV-V')):
+        W = torch.zeros_like(m.W_out)
+        for i in range(N_ROOTS):
+            for j in range(N_POS):
+                W[O0 + (i + offs[j]) % N_ROOTS, i * N_POS + j] = 1.0
+        m.W_out.copy_(W); m._offsets.copy_(torch.tensor(offs))
+        r = (KEY + m._offsets[phase]) % N_ROOTS
+        o = m.run_attention(m._stream_from_roots(r.unsqueeze(0)))
+        print(f'  {str(offs):<14}{name:<12}'
+              f'{[NAMES[int(o[0, t, O0:].argmax())] for t in range(0, T, SPC)][:4]}')
