@@ -56,10 +56,11 @@ class StubBase:
 class Stub:
     """Minimum surface equivariance_loss touches."""
 
-    def __init__(self, chroma, rule_from_layer=0):
+    def __init__(self, chroma, rule_from_layer=0, kind='js'):
         self.base            = StubBase()
         self.bidirectional   = True
         self.rule_from_layer = rule_from_layer
+        self.equiv_loss_kind = kind
         self._chroma_logits_at = chroma
         self.seen_shifts: list[int] = []
         self.equivariance_loss = types.MethodType(
@@ -105,9 +106,11 @@ def main():
     key = torch.zeros(B, dtype=torch.long)
 
     print('\n1. rotation convention')
+    # Thresholds here are sized for the DEFAULT js form, which is bounded above
+    # by ln 2 ~ 0.693 -- not for mse, whose scale is whatever the logits are.
     eq = Stub(pc_oracle).equivariance_loss(x, ps, key)
     check('an exactly equivariant read scores ~0',
-          eq is not None and float(eq) < 1e-9, f'loss={float(eq):.3e}')
+          eq is not None and float(eq) < 1e-6, f'loss={float(eq):.3e}')
 
     # Same read, rotated the WRONG way: if the convention in the method were
     # flipped, THIS is what would score 0 instead.
@@ -116,7 +119,7 @@ def main():
 
     eq_anti = Stub(anti).equivariance_loss(x, ps, key)
     check('a read rotated the wrong way still scores ~0 (rotation is relative)',
-          float(eq_anti) < 1e-9, f'loss={float(eq_anti):.3e}')
+          float(eq_anti) < 1e-6, f'loss={float(eq_anti):.3e}')
 
     # The discriminating case: a read that does NOT commute with transposition.
     g = torch.Generator().manual_seed(1)
@@ -127,7 +130,7 @@ def main():
 
     eq_bad = Stub(non_equivariant).equivariance_loss(x, ps, key)
     check('a non-equivariant read is penalised',
-          float(eq_bad) > 1.0, f'loss={float(eq_bad):.3f}')
+          float(eq_bad) > 0.3, f'loss={float(eq_bad):.3f}')
 
     # A constant read is trivially equivariant only if it is also constant
     # across the 12 dims; a non-uniform constant is NOT, and must be caught --
@@ -138,7 +141,7 @@ def main():
 
     eq_const = Stub(const_nonuniform).equivariance_loss(x, ps, key)
     check('a non-uniform CONSTANT read is penalised (collapse is not a free win)',
-          float(eq_const) > 1.0, f'loss={float(eq_const):.3f}')
+          float(eq_const) > 0.1, f'loss={float(eq_const):.3f}')
 
     def const_uniform(x_proc, layer):
         return torch.zeros(x_proc.shape[0], x_proc.shape[1], N_ROOTS)
@@ -146,6 +149,44 @@ def main():
     eq_zero = Stub(const_uniform).equivariance_loss(x, ps, key)
     check('a ZERO read scores 0 — equivariance alone cannot prevent collapse, '
           'the CE term has to', float(eq_zero) < 1e-9)
+
+    print('\n1b. js vs mse scaling (why the first run did not bind)')
+    # The failure mode measured in the first 8k-step run: squared error on raw
+    # logits is tiny next to an LM loss of ~1.5, so weight 1.0 barely registers
+    # -- and it can be reduced for free by shrinking the logits, with no gain
+    # in equivariance at all. JS compares DISTRIBUTIONS, so scaling is free.
+    def scaled(mult):
+        def f(x_proc, layer):
+            return non_equivariant(x_proc, layer) * mult
+        return f
+
+    mse_1  = float(Stub(scaled(1.0),  kind='mse').equivariance_loss(x, ps, key))
+    mse_01 = float(Stub(scaled(0.1),  kind='mse').equivariance_loss(x, ps, key))
+    check('mse SHRINKS 100x when the logits are scaled down 10x '
+          '(payable without becoming equivariant)',
+          mse_01 < mse_1 / 50, f'{mse_1:.3f} -> {mse_01:.4f}')
+
+    # The claim is NOT that js is monotone in the logit scale -- it is not,
+    # since sharpening pushes agreeing positions to 0 and disagreeing ones to
+    # ln 2 at the same time. The claim is that it stays on ONE scale while mse
+    # moves by orders of magnitude, so a fixed weight keeps meaning the same
+    # thing as training changes the logits' magnitude.
+    js_lo  = float(Stub(scaled(0.1), kind='js').equivariance_loss(x, ps, key))
+    js_1   = float(Stub(scaled(1.0), kind='js').equivariance_loss(x, ps, key))
+    js_10  = float(Stub(scaled(10.0), kind='js').equivariance_loss(x, ps, key))
+    mse_lo = mse_01
+    js_spread  = max(js_lo, js_1, js_10) / max(min(js_lo, js_1, js_10), 1e-12)
+    mse_spread = mse_1 / max(mse_lo, 1e-12)
+    check('js spread across a 100x logit rescale is far below mse\'s',
+          js_spread < 5 and mse_spread > 50,
+          f'js x{js_spread:.1f} ({js_lo:.3f}/{js_1:.3f}/{js_10:.3f})  '
+          f'vs mse x{mse_spread:.0f}')
+    check('js stays on the same scale as a cross-entropy (bounded by ln 2)',
+          0.1 < js_1 <= 0.6932, f'{js_1:.3f}  ln2={0.6931:.4f}')
+
+    js_eq = float(Stub(pc_oracle, kind='js').equivariance_loss(x, ps, key))
+    check('js scores ~0 for an exactly equivariant read', js_eq < 1e-6,
+          f'{js_eq:.3e}')
 
     print('\n2. shift legality (the leak that would void the experiment)')
     # Record the shift actually handed to preprocess.

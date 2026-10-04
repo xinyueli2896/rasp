@@ -373,7 +373,10 @@ class CPYinyangTransformer(nn.Module):
         rule_program:      str  = 'retrieve',
         rule_input:        str  = 'root',
         ar_to_rule_hidden: int  = 0,
+        equiv_loss_kind:   str  = 'js',
     ):
+        assert equiv_loss_kind in ('js', 'mse'), \
+            f"equiv_loss_kind must be js|mse, got {equiv_loss_kind!r}"
         assert rule_input in ('root', 'triad'), \
             f"rule_input must be 'root' or 'triad', got {rule_input!r}"
         assert not (rule_input == 'triad' and rule_program not in ('full', 'mlp_only')), \
@@ -438,6 +441,7 @@ class CPYinyangTransformer(nn.Module):
         self.rule_from_layer   = rule_from_layer
         self.rule_program      = rule_program
         self.rule_input        = rule_input
+        self.equiv_loss_kind   = equiv_loss_kind
         self.proxy_pos_inject  = proxy_pos_inject
         self.proxy_activation  = proxy_activation
         self.proxy_temp        = proxy_temp
@@ -1002,9 +1006,28 @@ class CPYinyangTransformer(nn.Module):
         target = base_logits.gather(
             -1, idx[:, None, :].expand(-1, base_logits.shape[1], -1))
 
-        # Symmetric: no stop-gradient, so the two reads meet in the middle
-        # rather than the shifted one chasing a frozen anchor.
-        per = (shift_logits - target).pow(2).mean((1, 2))               # (B,)
+        # Symmetric in both forms: no stop-gradient, so the two reads meet in
+        # the middle rather than the shifted one chasing a frozen anchor.
+        if self.equiv_loss_kind == 'mse':
+            # Scale-DEPENDENT, and that is a problem in practice: raw logits
+            # put this around 0.05 against an LM loss of ~1.5 and a proxy loss
+            # of ~1.8, so at weight 1.0 it is ~1.5% of the objective and simply
+            # does not bind -- measured, it fell to 0.035 and then drifted back
+            # up to 0.055 while the rest of the loss improved. Shrinking the
+            # logits also reduces it for free. Kept for comparison only.
+            per = (shift_logits - target).pow(2).mean((1, 2))           # (B,)
+        else:
+            # Jensen-Shannon between the two root DISTRIBUTIONS. Measured in
+            # nats, so it is on the same footing as the proxy CE and weight 1.0
+            # means what it says; invariant to a global rescaling of the
+            # logits, so it cannot be paid off by shrinking them. Bounded above
+            # by ln 2, which also keeps it from swamping the LM loss.
+            lp = F.log_softmax(shift_logits, dim=-1)
+            lq = F.log_softmax(target, dim=-1)
+            lm = torch.logaddexp(lp, lq) - math.log(2.0)
+            js = 0.5 * (F.kl_div(lm, lp, log_target=True, reduction='none')
+                        + F.kl_div(lm, lq, log_target=True, reduction='none'))
+            per = js.sum(-1).mean(1)                                    # (B,)
         return (per * live).sum() / live.sum().clamp(min=1.0)
 
     def loss(self, x: torch.Tensor, pitch_shift: torch.Tensor,

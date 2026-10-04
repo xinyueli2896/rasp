@@ -89,6 +89,7 @@ MLP_H="${MLP_H:-0}"
 MAX_STEPS="${MAX_STEPS:-40000}"
 WD="${WD:-}"
 EQUIV_W="${EQUIV_W:-0}"
+EQUIV_KIND="${EQUIV_KIND:-js}"
 
 EXTRA=""; SUF=""
 # rule_heads only applies to the retrieve program: full uses one head
@@ -106,6 +107,10 @@ EXTRA=""; SUF=""
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
 # Train-time only, so it is deliberately absent from COMMON_EVAL.
 [ "$EQUIV_W" != 0 ] && EXTRA="$EXTRA --equiv_loss_weight $EQUIV_W" && SUF="${SUF}_equiv${EQUIV_W}"
+# The first equiv run used the mse form, which did not bind; tag it so the two
+# are not silently compared under one name.
+[ "$EQUIV_W" != 0 ] && [ "$EQUIV_KIND" != js ] \
+    && EXTRA="$EXTRA --equiv_loss_kind $EQUIV_KIND" && SUF="${SUF}_${EQUIV_KIND}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
 # No --paired_chord_seq: the rule model receives no input. --rule_attention
