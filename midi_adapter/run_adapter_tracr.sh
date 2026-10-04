@@ -42,6 +42,9 @@
 #    FROM_LAYER=0 bash midi_adapter/run_adapter_tracr.sh # ONE shared rule signal,
 #                                                        # read before the stack
 #    FROM_LAYER=1 bash midi_adapter/run_adapter_tracr.sh # ONE, after layer 1
+#    PROGRAM=mlp_only PROXY_ACT=hard \
+#      bash midi_adapter/run_adapter_tracr.sh            # no head: the proxy
+#                                                        # estimates the key itself
 #    PROGRAM=full RULE_IN=triad PROXY_ACT=hard \
 #      bash midi_adapter/run_adapter_tracr.sh            # conventional compile,
 #                                                        # chromagram in/out

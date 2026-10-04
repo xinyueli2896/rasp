@@ -731,7 +731,7 @@ def get_args():
                         "adds a wrong note, so pair it with "
                         "--proxy_activation hard.")
     p.add_argument('--rule_program', type=str, default='retrieve',
-                   choices=['retrieve', 'full'],
+                   choices=['retrieve', 'full', 'mlp_only'],
                    help="How much of the rule the compiled model executes. "
                         "'retrieve' (default) compiles only Aggregate -- one "
                         "attention head that fetches the tonic -- and leaves "
@@ -740,6 +740,14 @@ def get_args():
                         "same head plus the MLP that SequenceMap compiles to, "
                         "so the program emits the correct root and the adapter "
                         "only has to perceive the key and render notes. "
+                        "'mlp_only' drops the attention head: the projection "
+                        "estimates the KEY directly from the full causal "
+                        "context and the MLP applies the rule. Aggregate is "
+                        "essential when the key must be found among supplied "
+                        "chords, but with no input it forces the estimate to "
+                        "come from phase-0 positions -- the earliest and least "
+                        "informed, the first having seen no music at all -- "
+                        "while discarding the context-rich later ones. "
                         "d_model 28 -> 40. Requires --rule_attention.")
     p.add_argument('--content_residual', type=str, default='none',
                    choices=['none', 'q', 'k', 'qk'],

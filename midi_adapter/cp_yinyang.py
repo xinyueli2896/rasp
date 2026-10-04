@@ -374,13 +374,13 @@ class CPYinyangTransformer(nn.Module):
     ):
         assert rule_input in ('root', 'triad'), \
             f"rule_input must be 'root' or 'triad', got {rule_input!r}"
-        assert not (rule_input == 'triad' and rule_program != 'full'), \
+        assert not (rule_input == 'triad' and rule_program not in ('full', 'mlp_only')), \
             ("rule_input='triad' needs --rule_program full: the triad survives "
              "the MLP's per-dimension transposition, but the retrieve-only "
              "model has no MLP and would hand the adapter a tonic chromagram "
              "with no chord computed")
-        assert rule_program in ('retrieve', 'full'), \
-            f"rule_program must be 'retrieve' or 'full', got {rule_program!r}"
+        assert rule_program in ('retrieve', 'full', 'mlp_only'), \
+            f"rule_program must be retrieve|full|mlp_only, got {rule_program!r}"
         assert proxy_activation in ('none', 'softmax', 'hard'), \
             f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
         assert not (rule_attention and not bidirectional), \
@@ -459,14 +459,15 @@ class CPYinyangTransformer(nn.Module):
             # retrieves the tonic from phase-0 slots, leaving
             # root = (key + OFFSETS[phase]) % 12 for the adapter to compute.
             # Structurally identical to the integer experiment's seed_broadcast.
-            if rule_program == 'full':
+            if rule_program in ('full', 'mlp_only'):
                 # Conventional TracR compilation: Aggregate -> attention head,
                 # SequenceMap -> MLP. The program emits the correct root, so
                 # the adapter is left with perception and rendering only.
                 # One head, no un-rotation trick — n_phase_heads does not apply.
                 self.rule_model = ChordRaspCompiled(
                     subbeats_per_chord=subbeats_per_chord,
-                    rule_input=rule_input)
+                    rule_input=rule_input,
+                    use_attention=(rule_program == 'full'))
             else:
                 self.rule_model = ChordTracrRuleModel(
                     subbeats_per_chord=subbeats_per_chord,
@@ -783,8 +784,15 @@ class CPYinyangTransformer(nn.Module):
                 phase = phase.expand(B, -1, -1)
             else:
                 phase = proxy[..., N_ROOTS:]
-            proxy = torch.cat(
-                [root, root.new_zeros(B, T, N_ROOTS), phase], dim=-1)
+            if self.rule_program == 'mlp_only':
+                # The projection estimates the KEY itself, using the full
+                # causal context at this position, and writes it where the
+                # attention head would have. Nothing is retrieved.
+                proxy = torch.cat(
+                    [root.new_zeros(B, T, N_ROOTS), root, phase], dim=-1)
+            else:
+                proxy = torch.cat(
+                    [root, root.new_zeros(B, T, N_ROOTS), phase], dim=-1)
             if proxy.shape[-1] < d:
                 # 'full' adds an `out` subspace the MLP writes; start it empty.
                 proxy = F.pad(proxy, (0, d - proxy.shape[-1]))
@@ -819,14 +827,18 @@ class CPYinyangTransformer(nn.Module):
             # Only dims 0-11 are the proxy's responsibility: the key/out
             # regions are written by the frozen program, 24-27 are the clock.
             total = 0.0
+            # mlp_only supervises the KEY the projection emits; the other modes
+            # supervise the chord estimated at this position.
+            tgt_lo = N_ROOTS if self.rule_program == 'mlp_only' else 0
+            target = target[..., tgt_lo:tgt_lo + N_ROOTS]
             if self.rule_input == 'triad':
                 # 3-hot target — argmax would be arbitrary among the three.
-                chroma_t = target[..., :12]
+                chroma_t = target
                 for proxy in self._proxies:
                     total = total + F.binary_cross_entropy_with_logits(
                         proxy[..., :12], chroma_t)
             else:
-                root_t = target[..., :12].argmax(-1)
+                root_t = target.argmax(-1)
                 for proxy in self._proxies:
                     total = total + F.cross_entropy(
                         proxy[..., :12].reshape(-1, 12), root_t.reshape(-1))

@@ -339,8 +339,16 @@ class ChordRaspCompiled(nn.Module):
     R0, K0, P0, O0 = 0, N_ROOTS, N_ROOTS * 2, N_ROOTS * 2 + N_POS
 
     def __init__(self, subbeats_per_chord: int = 8, attn_scale: float = 20.0,
-                 rule_input: str = 'root'):
+                 rule_input: str = 'root', use_attention: bool = True):
         super().__init__()
+        # use_attention=False is the MLP-only program: the proxy writes the KEY
+        # region directly, so there is nothing to retrieve and only the
+        # SequenceMap remains. Aggregate is essential when the key must be
+        # found among supplied chords, but in the no-input variant it forces
+        # the key estimate to come from phase-0 positions -- the earliest and
+        # least-informed in the window, starting with one that has seen no
+        # music at all -- while discarding the context-rich later ones.
+        self.use_attention = use_attention
         assert rule_input in ('root', 'triad'), \
             f"rule_input must be 'root' or 'triad', got {rule_input!r}"
         self.subbeats_per_chord = subbeats_per_chord
@@ -426,18 +434,20 @@ class ChordRaspCompiled(nn.Module):
             key / out subspaces empty.
         Returns (B, T, 40); dims 28-39 carry the rule's answer.
         """
-        T = x.shape[1]
-        Q, K, V = x @ self.W_Q.T, x @ self.W_K.T, x @ self.W_V.T
-        scores  = (Q @ K.transpose(-2, -1)) * self.attn_scale
-        causal  = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        scores  = scores.masked_fill(~causal, float('-inf'))
-        # Tracr BOS: virtual key at 0.5*coldness with a zero value, so an
-        # unmatched query emits the default instead of averaging the prefix.
-        scores  = torch.cat(
-            [scores.new_full(scores.shape[:-1] + (1,), 0.5 * self.attn_scale),
-             scores], dim=-1)
-        attn = F.softmax(scores, dim=-1)[..., 1:]
-        x = x + (attn @ V) @ self.W_O.T                           # -> key
+        if self.use_attention:
+            T = x.shape[1]
+            Q, K, V = x @ self.W_Q.T, x @ self.W_K.T, x @ self.W_V.T
+            scores  = (Q @ K.transpose(-2, -1)) * self.attn_scale
+            causal  = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+            scores  = scores.masked_fill(~causal, float('-inf'))
+            # Tracr BOS: virtual key at 0.5*coldness with a zero value, so an
+            # unmatched query emits the default instead of averaging the prefix.
+            scores  = torch.cat(
+                [scores.new_full(scores.shape[:-1] + (1,), 0.5 * self.attn_scale),
+                 scores], dim=-1)
+            attn = F.softmax(scores, dim=-1)[..., 1:]
+            x = x + (attn @ V) @ self.W_O.T                       # -> key
+        # else: the key region was supplied directly; go straight to the MLP.
         h = F.relu(F.linear(x, self.W_in, self.b_in))             # (B, T, 48)
         return x + h @ self.W_out.T                                # -> out
 

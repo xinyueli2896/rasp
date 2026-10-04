@@ -484,7 +484,7 @@ def main():
                    choices=['root', 'triad'],
                    help='Must match training.')
     p.add_argument('--rule_program', type=str, default='retrieve',
-                   choices=['retrieve', 'full'],
+                   choices=['retrieve', 'full', 'mlp_only'],
                    help='Must match training — it changes the rule model class '
                         'and its width (28 vs 40).')
     p.add_argument('--content_residual', type=str, default='none',
