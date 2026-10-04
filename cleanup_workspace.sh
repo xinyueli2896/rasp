@@ -7,8 +7,7 @@
 #  What it NEVER touches:
 #    * the pretrained base checkpoint
 #    * anything under the data directory
-#    * eval_logs_grid/*.log  (these are results; run_full_eval_grid replays them)
-#    * git-tracked files
+#    * git-tracked files  (there are none under checkpoints/ or the log dirs)
 #
 #  What it offers to remove:
 #    ckpt-extra   checkpoints in a run dir other than its best by_val_loss and
@@ -16,6 +15,11 @@
 #    midi         eval_midi*/ and gen_midi*/ — regenerable from checkpoints
 #    wandb        wandb/ run logs
 #    runs         entire run directories you name in STALE_RUNS
+#    logs         eval_logs_grid/*.log. NOT in the default set, because these
+#                 are results -- but every adapter log predating the sampling
+#                 fix is STALE, and run_full_eval_grid.sh REPLAYS a cached log
+#                 instead of re-running that cell. Leaving them in place keeps
+#                 the old numbers alive. Delete them before re-running the grid.
 #
 #  Usage:
 #    bash cleanup_workspace.sh                    # survey only
@@ -116,6 +120,15 @@ if want midi; then
     for d in eval_midi gen_midi eval_midi_* gen_midi_* decoded_midi; do
         [ -d "$d" ] && { echo "  midi    $d  $(hsize "$d")"; add "$d"; }
     done
+fi
+if want logs; then
+    n=$(ls eval_logs_grid/*.log 2>/dev/null | wc -l)
+    if [ "$n" -gt 0 ]; then
+        echo "  logs    eval_logs_grid/ ($n log files, $(hsize eval_logs_grid))"
+        echo "          -> the grid script replays cached logs; removing these"
+        echo "             forces every cell to actually re-run"
+        while read -r f; do add "$f"; done < <(ls eval_logs_grid/*.log)
+    fi
 fi
 if want wandb; then
     for d in wandb lightning_logs; do

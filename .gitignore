@@ -11,3 +11,12 @@ build/
 .env
 data/
 input/
+
+# generated artefacts — regenerable, keep them out of git status
+eval_logs_grid/
+wandb/
+lightning_logs/
+eval_midi*/
+gen_midi*/
+decoded_midi/
+figures/*.png
