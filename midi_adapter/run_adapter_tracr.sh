@@ -39,6 +39,9 @@
 #    PROXY_W=1.0 bash midi_adapter/run_adapter_tracr.sh  # belt AND braces
 #    NO_POS=1 bash midi_adapter/run_adapter_tracr.sh     # make it learn phase too
 #    HEADS=1  bash midi_adapter/run_adapter_tracr.sh     # single-source ablation
+#    FROM_LAYER=0 MLP_H=256 PROGRAM=full \
+#      bash midi_adapter/run_adapter_tracr.sh            # read BEFORE the stack,
+#                                                        # via an MLP projection
 #    FROM_LAYER=0 bash midi_adapter/run_adapter_tracr.sh # ONE shared rule signal,
 #                                                        # read before the stack
 #    FROM_LAYER=1 bash midi_adapter/run_adapter_tracr.sh # ONE, after layer 1
@@ -74,6 +77,7 @@ else
 fi
 PROGRAM="${PROGRAM:-retrieve}"
 RULE_IN="${RULE_IN:-root}"
+MLP_H="${MLP_H:-0}"
 
 EXTRA=""; SUF=""
 # rule_heads only applies to the retrieve program: full uses one head
@@ -85,6 +89,7 @@ EXTRA=""; SUF=""
 [ "$PROXY_ACT" != none ] && EXTRA="$EXTRA --proxy_activation $PROXY_ACT" && SUF="${SUF}_${PROXY_ACT}"
 [ "$PROGRAM" != retrieve ] && EXTRA="$EXTRA --rule_program $PROGRAM" && SUF="${SUF}_${PROGRAM}"
 [ "$RULE_IN" != root ] && EXTRA="$EXTRA --rule_input $RULE_IN" && SUF="${SUF}_${RULE_IN}"
+[ "$MLP_H" != 0 ] && EXTRA="$EXTRA --ar_to_rule_hidden $MLP_H" && SUF="${SUF}_mlp${MLP_H}"
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
@@ -106,6 +111,7 @@ COMMON_EVAL="--base_ckpt $BASE \
     $( [ "$PROXY_ACT" != none ] && echo "--proxy_activation $PROXY_ACT" ) \
     $( [ "$PROGRAM" != retrieve ] && echo "--rule_program $PROGRAM" ) \
     $( [ "$RULE_IN" != root ] && echo "--rule_input $RULE_IN" ) \
+    $( [ "$MLP_H" != 0 ] && echo "--ar_to_rule_hidden $MLP_H" ) \
     --n_prompt_beats 16 --temperature 0 --save_n_per_key 3"
 [ "$NO_POS" = 1 ] && COMMON_EVAL="$COMMON_EVAL --no_proxy_pos_inject"
 

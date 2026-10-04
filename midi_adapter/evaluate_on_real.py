@@ -491,6 +491,9 @@ def main():
                    choices=['none', 'q', 'k', 'qk'],
                    help='Must match training — it changes which projections '
                         'exist, so a mismatch drops weights silently.')
+    p.add_argument('--ar_to_rule_hidden', type=int, default=0,
+                   help='Must match training — it changes the projection\'s '
+                        'module structure, so a mismatch fails to load.')
     p.add_argument('--rule_from_layer', type=int, default=-1,
                    help='Must match training — it changes how many ar_to_rule '
                         'projections exist, so a mismatch fails to load.')
@@ -580,6 +583,7 @@ def main():
                            rule_from_layer=args.rule_from_layer,
                            rule_program=args.rule_program,
                            rule_input=args.rule_input,
+                           ar_to_rule_hidden=args.ar_to_rule_hidden,
                            proxy_activation=args.proxy_activation,
                            proxy_temp=args.proxy_temp,
                            device=device)

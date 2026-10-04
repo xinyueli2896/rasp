@@ -450,6 +450,8 @@ def main(args):
                        + (f'_h{args.rule_heads}' if args.rule_heads > 1 else '')
                        + (f'_L{args.rule_from_layer}'
                           if args.rule_from_layer >= 0 else '')
+                       + (f'_mlp{args.ar_to_rule_hidden}'
+                          if args.ar_to_rule_hidden > 0 else '')
                        + ('_full' if args.rule_program == 'full' else '')
                        + ('_triad' if args.rule_input == 'triad' else '')
                        + ('' if args.content_residual == 'none'
@@ -508,6 +510,7 @@ def main(args):
             rule_from_layer   = args.rule_from_layer,
             rule_program      = args.rule_program,
             rule_input        = args.rule_input,
+            ar_to_rule_hidden = args.ar_to_rule_hidden,
             proxy_activation  = args.proxy_activation,
             proxy_temp        = args.proxy_temp,
         )
@@ -760,6 +763,13 @@ def get_args():
                         "a query to the wrong one. 'qk' is the legacy "
                         "--qk_content_residual behaviour. Requires "
                         "--positional_qk; must match at eval.")
+    p.add_argument('--ar_to_rule_hidden', type=int, default=0,
+                   help='Hidden width of the AR->rule projection. 0 (default) '
+                        'is a plain Linear(768 -> 12). A positive value makes '
+                        'it Linear-ReLU-Linear, which matters most with '
+                        '--rule_from_layer 0: the pre-stack hidden state has '
+                        'had no self-attention, so naming a chord from it is a '
+                        'nonlinear job. Must match at eval.')
     p.add_argument('--rule_from_layer', type=int, default=-1,
                    help='Where the no-input rule signal is read from. -1 '
                         '(default) = one projection per adapter, each reading '

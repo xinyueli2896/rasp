@@ -371,6 +371,7 @@ class CPYinyangTransformer(nn.Module):
         rule_from_layer:   int  = -1,
         rule_program:      str  = 'retrieve',
         rule_input:        str  = 'root',
+        ar_to_rule_hidden: int  = 0,
     ):
         assert rule_input in ('root', 'triad'), \
             f"rule_input must be 'root' or 'triad', got {rule_input!r}"
@@ -552,10 +553,22 @@ class CPYinyangTransformer(nn.Module):
             # depth, mirroring the explicit-input variant where rule_hidden is
             # built once and broadcast to every adapter.
             n_proj = 1 if rule_from_layer >= 0 else n_adapters
-            self.ar_to_rule = nn.ModuleList([
-                nn.Linear(self.base.hidden_size, proj_out)
-                for _ in range(n_proj)
-            ])
+
+            def _mk_proj():
+                # A single Linear is thin when the signal is read BEFORE the
+                # stack (rule_from_layer=0): no self-attention has run, so
+                # h[t] encodes roughly one subbeat and naming a chord from it
+                # is a genuinely nonlinear job. One hidden layer is usually
+                # enough; 0 keeps the plain Linear.
+                if ar_to_rule_hidden > 0:
+                    return nn.Sequential(
+                        nn.Linear(self.base.hidden_size, ar_to_rule_hidden),
+                        nn.ReLU(),
+                        nn.Linear(ar_to_rule_hidden, proj_out),
+                    )
+                return nn.Linear(self.base.hidden_size, proj_out)
+
+            self.ar_to_rule = nn.ModuleList([_mk_proj() for _ in range(n_proj)])
 
     # ------------------------------------------------------------------
     # Training forward  (full sequence, layer-by-layer injection)
