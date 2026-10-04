@@ -480,6 +480,9 @@ def main():
                         'and ar_to_rule fails to load.')
     p.add_argument('--no_proxy_pos_inject', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--rule_input', type=str, default='root',
+                   choices=['root', 'triad'],
+                   help='Must match training.')
     p.add_argument('--rule_program', type=str, default='retrieve',
                    choices=['retrieve', 'full'],
                    help='Must match training — it changes the rule model class '
@@ -576,6 +579,7 @@ def main():
                            rule_heads=args.rule_heads,
                            rule_from_layer=args.rule_from_layer,
                            rule_program=args.rule_program,
+                           rule_input=args.rule_input,
                            proxy_activation=args.proxy_activation,
                            proxy_temp=args.proxy_temp,
                            device=device)

@@ -370,7 +370,15 @@ class CPYinyangTransformer(nn.Module):
         rule_heads:        int  = 1,
         rule_from_layer:   int  = -1,
         rule_program:      str  = 'retrieve',
+        rule_input:        str  = 'root',
     ):
+        assert rule_input in ('root', 'triad'), \
+            f"rule_input must be 'root' or 'triad', got {rule_input!r}"
+        assert not (rule_input == 'triad' and rule_program != 'full'), \
+            ("rule_input='triad' needs --rule_program full: the triad survives "
+             "the MLP's per-dimension transposition, but the retrieve-only "
+             "model has no MLP and would hand the adapter a tonic chromagram "
+             "with no chord computed")
         assert rule_program in ('retrieve', 'full'), \
             f"rule_program must be 'retrieve' or 'full', got {rule_program!r}"
         assert proxy_activation in ('none', 'softmax', 'hard'), \
@@ -417,6 +425,7 @@ class CPYinyangTransformer(nn.Module):
         #  k  = ONE projection, read after layer k (k <= n_skip)
         self.rule_from_layer   = rule_from_layer
         self.rule_program      = rule_program
+        self.rule_input        = rule_input
         self.proxy_pos_inject  = proxy_pos_inject
         self.proxy_activation  = proxy_activation
         self.proxy_temp        = proxy_temp
@@ -456,7 +465,8 @@ class CPYinyangTransformer(nn.Module):
                 # the adapter is left with perception and rendering only.
                 # One head, no un-rotation trick — n_phase_heads does not apply.
                 self.rule_model = ChordRaspCompiled(
-                    subbeats_per_chord=subbeats_per_chord)
+                    subbeats_per_chord=subbeats_per_chord,
+                    rule_input=rule_input)
             else:
                 self.rule_model = ChordTracrRuleModel(
                     subbeats_per_chord=subbeats_per_chord,
@@ -796,14 +806,20 @@ class CPYinyangTransformer(nn.Module):
                 key.to(device), T, device)
 
         if self.rule_attention:
-            # d_model = 28. Only dims 0-11 are the proxy's responsibility:
-            # 12-23 are written by the frozen head, 24-27 are the injected
-            # clock. Optional here — the head is the intended constraint.
-            root_t = target[..., :12].argmax(-1)
+            # Only dims 0-11 are the proxy's responsibility: the key/out
+            # regions are written by the frozen program, 24-27 are the clock.
             total = 0.0
-            for proxy in self._proxies:
-                total = total + F.cross_entropy(
-                    proxy[..., :12].reshape(-1, 12), root_t.reshape(-1))
+            if self.rule_input == 'triad':
+                # 3-hot target — argmax would be arbitrary among the three.
+                chroma_t = target[..., :12]
+                for proxy in self._proxies:
+                    total = total + F.binary_cross_entropy_with_logits(
+                        proxy[..., :12], chroma_t)
+            else:
+                root_t = target[..., :12].argmax(-1)
+                for proxy in self._proxies:
+                    total = total + F.cross_entropy(
+                        proxy[..., :12].reshape(-1, 12), root_t.reshape(-1))
             return total / len(self._proxies)
 
         # d_model = 16: [12-d triad chromagram | 4-d phase one-hot]

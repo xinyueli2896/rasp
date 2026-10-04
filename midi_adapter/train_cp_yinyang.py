@@ -451,6 +451,7 @@ def main(args):
                        + (f'_L{args.rule_from_layer}'
                           if args.rule_from_layer >= 0 else '')
                        + ('_full' if args.rule_program == 'full' else '')
+                       + ('_triad' if args.rule_input == 'triad' else '')
                        + ('' if args.content_residual == 'none'
                           else f'_cr{args.content_residual}')
                        + ('' if args.proxy_activation == 'none'
@@ -506,6 +507,7 @@ def main(args):
             rule_heads        = args.rule_heads,
             rule_from_layer   = args.rule_from_layer,
             rule_program      = args.rule_program,
+            rule_input        = args.rule_input,
             proxy_activation  = args.proxy_activation,
             proxy_temp        = args.proxy_temp,
         )
@@ -716,6 +718,18 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--rule_input', type=str, default='root',
+                   choices=['root', 'triad'],
+                   help="What dims 0-11 of the rule stream mean. 'root' is a "
+                        "one-hot pitch class. 'triad' is a 12-d major-triad "
+                        "chromagram -- the MLP transposes each active dim by "
+                        "OFFSETS[phase], so a 3-hot tonic triad comes out as "
+                        "the triad of the correct root, and the adapter is "
+                        "handed a chord rather than a root. Requires "
+                        "--rule_program full. Exact only for a CLEAN 3-hot "
+                        "input: a 4-hot chromagram fires a 4th MLP cell and "
+                        "adds a wrong note, so pair it with "
+                        "--proxy_activation hard.")
     p.add_argument('--rule_program', type=str, default='retrieve',
                    choices=['retrieve', 'full'],
                    help="How much of the rule the compiled model executes. "

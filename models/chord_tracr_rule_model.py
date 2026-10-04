@@ -334,17 +334,43 @@ class ChordRaspCompiled(nn.Module):
     """
 
     d_model: int = RASP_D_MODEL
+    CHORD_INTERVALS: tuple = (0, 4, 7)      # major triad
 
     R0, K0, P0, O0 = 0, N_ROOTS, N_ROOTS * 2, N_ROOTS * 2 + N_POS
 
-    def __init__(self, subbeats_per_chord: int = 8, attn_scale: float = 20.0):
+    def __init__(self, subbeats_per_chord: int = 8, attn_scale: float = 20.0,
+                 rule_input: str = 'root'):
         super().__init__()
+        assert rule_input in ('root', 'triad'), \
+            f"rule_input must be 'root' or 'triad', got {rule_input!r}"
         self.subbeats_per_chord = subbeats_per_chord
         self.attn_scale         = attn_scale
+        self.rule_input         = rule_input
         V, P, d = N_ROOTS, N_POS, RASP_D_MODEL
         R0, K0, P0, O0 = self.R0, self.K0, self.P0, self.O0
 
-        W_E = torch.zeros(V, d); W_E[:, R0:R0 + V] = torch.eye(V)
+        # 'root'  : W_E[r] is the one-hot of r — one active dim.
+        # 'triad' : W_E[r] is the major-triad chromagram {r, r+4, r+7} — three.
+        #
+        # Both work end to end, because W_out maps each active key dim i to
+        # (i + OFFSETS[p]) % 12 — a per-dimension transposition. The rule is
+        # itself a transposition, so a 3-hot tonic triad comes out as the
+        # 3-hot triad of the correct root. The program transposes a whole
+        # pitch-class SET, not just a root.
+        #
+        # The cost is that exactness needs a CLEAN categorical input. The MLP
+        # fires one hidden cell per active key dim, so a 4-hot chromagram
+        # produces four transposed notes and the answer is wrong. Measured:
+        # 3-hot exact, 4-hot and beyond not. Pair this with
+        # --proxy_activation hard if the chromagram comes from a learned
+        # projection rather than a lookup.
+        W_E = torch.zeros(V, d)
+        for r in range(V):
+            if rule_input == 'root':
+                W_E[r, R0 + r] = 1.0
+            else:
+                for k in self.CHORD_INTERVALS:
+                    W_E[r, R0 + (r + k) % V] = 1.0
         self.register_buffer('W_E', W_E)
         W_pos = torch.zeros(P, d)
         for j in range(P):
@@ -429,10 +455,11 @@ class ChordRaspCompiled(nn.Module):
         phase = self.phase_at(T, device)
         root  = (key[:, None] + self._offsets.to(device)[phase][None, :]) % N_ROOTS
         h = self.W_E[root] + self.pos_embed(T, device)
-        oh = F.one_hot(key, num_classes=N_ROOTS).to(h.dtype)[:, None, :]
-        h[..., self.K0:self.K0 + N_ROOTS] = oh.expand(-1, T, -1)
-        h[..., self.O0:self.O0 + N_ROOTS] = F.one_hot(
-            root, num_classes=N_ROOTS).to(h.dtype)
+        # key / out carry the SAME encoding the root region uses: a one-hot in
+        # 'root' mode, a triad chromagram in 'triad' mode.
+        enc = self.W_E[:, self.R0:self.R0 + N_ROOTS]        # (12, 12)
+        h[..., self.K0:self.K0 + N_ROOTS] = enc[key][:, None, :].expand(-1, T, -1)
+        h[..., self.O0:self.O0 + N_ROOTS] = enc[root]
         return h
 
     def build_rule_hidden_from_chord_seq(self, chord_seq: torch.Tensor):

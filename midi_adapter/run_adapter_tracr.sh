@@ -42,6 +42,9 @@
 #    FROM_LAYER=0 bash midi_adapter/run_adapter_tracr.sh # ONE shared rule signal,
 #                                                        # read before the stack
 #    FROM_LAYER=1 bash midi_adapter/run_adapter_tracr.sh # ONE, after layer 1
+#    PROGRAM=full RULE_IN=triad PROXY_ACT=hard \
+#      bash midi_adapter/run_adapter_tracr.sh            # conventional compile,
+#                                                        # chromagram in/out
 #    PROGRAM=full bash midi_adapter/run_adapter_tracr.sh # conventional TracR:
 #                                                        # head + MLP, the program
 #                                                        # emits the root itself
@@ -59,13 +62,17 @@ NO_POS="${NO_POS:-0}"
 HEADS="${HEADS:-2}"
 FROM_LAYER="${FROM_LAYER:--1}"
 CR="${CR:-none}"
+PROXY_ACT="${PROXY_ACT:-none}"
 PROGRAM="${PROGRAM:-retrieve}"
+RULE_IN="${RULE_IN:-root}"
 
 EXTRA=""; SUF=""
 [ "$HEADS" != 1 ] && SUF="${SUF}_h${HEADS}"
 [ "$FROM_LAYER" != -1 ] && EXTRA="$EXTRA --rule_from_layer $FROM_LAYER" && SUF="${SUF}_L${FROM_LAYER}"
 [ "$CR" != none ] && EXTRA="$EXTRA --content_residual $CR" && SUF="${SUF}_cr${CR}"
+[ "$PROXY_ACT" != none ] && EXTRA="$EXTRA --proxy_activation $PROXY_ACT" && SUF="${SUF}_${PROXY_ACT}"
 [ "$PROGRAM" != retrieve ] && EXTRA="$EXTRA --rule_program $PROGRAM" && SUF="${SUF}_${PROGRAM}"
+[ "$RULE_IN" != root ] && EXTRA="$EXTRA --rule_input $RULE_IN" && SUF="${SUF}_${RULE_IN}"
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
@@ -84,7 +91,9 @@ COMMON_EVAL="--base_ckpt $BASE \
     --rule_heads $HEADS --chords_per_bar 2 \
     $( [ "$FROM_LAYER" != -1 ] && echo "--rule_from_layer $FROM_LAYER" ) \
     $( [ "$CR" != none ] && echo "--content_residual $CR" ) \
+    $( [ "$PROXY_ACT" != none ] && echo "--proxy_activation $PROXY_ACT" ) \
     $( [ "$PROGRAM" != retrieve ] && echo "--rule_program $PROGRAM" ) \
+    $( [ "$RULE_IN" != root ] && echo "--rule_input $RULE_IN" ) \
     --n_prompt_beats 16 --temperature 0 --save_n_per_key 3"
 [ "$NO_POS" = 1 ] && COMMON_EVAL="$COMMON_EVAL --no_proxy_pos_inject"
 
