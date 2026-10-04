@@ -75,6 +75,13 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     # distinct values the argmax takes at all.
     collapse = [0, 0]
     distinct = [0, 0]
+    # distinct ~ 4 with on-mode ~ 0.5 points at a PHASE LOOKUP: the encoder
+    # emitting one value per bar phase and ignoring the music entirely. That is
+    # the degenerate optimum -- it hands the LM a free 4-phase clock, which
+    # genuinely helps predict notes, without ever reading a chord. Test it:
+    # how much of each phase class sits on that class's own modal argmax?
+    byphase = [0, 0]
+    ph_dist = [0, 0]
 
     for s in range(0, len(windows), batch_size):
         x = windows[s:s + batch_size].to(device).long()
@@ -124,6 +131,15 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             collapse[0] += int(cnt.max()); collapse[1] += int(p.shape[1] - 1)
             distinct[0] += int(len(vals));  distinct[1] += 1
 
+        for b in range(p.shape[0]):
+            for ph in range(N_POS):
+                sel = p[b][phase == ph]
+                if sel.numel() == 0:
+                    continue
+                v, c = torch.unique(sel, return_counts=True)
+                byphase[0] += int(c.max()); byphase[1] += int(sel.numel())
+                ph_dist[0] += int(len(v));  ph_dist[1] += 1
+
         d_pred = (p - p[:, :1]) % N_ROOTS
         d_true = (true_root - true_root[:, :1]) % N_ROOTS
         interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
@@ -143,7 +159,7 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
             for c in range(N_ROOTS):
                 rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
-    return acc, rot, interval, local, dens, collapse, distinct
+    return acc, rot, interval, local, dens, collapse, distinct, byphase, ph_dist
 
 
 def main():
@@ -197,14 +213,15 @@ def main():
 
     print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
           f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}'
-          f'{"local-pc":>9}{"density":>9}{"on-mode":>10}{"distinct":>10}{"n":>7}')
-    print('  ' + '-' * 148)
+          f'{"local-pc":>9}{"density":>9}{"on-mode":>10}{"distinct":>10}'
+          f'{"by-phase":>10}{"ph-dist":>9}{"n":>7}')
+    print('  ' + '-' * 168)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
-        (acc, rot, interval, local, dens, collapse,
-         distinct) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
+        (acc, rot, interval, local, dens, collapse, distinct,
+         byphase, ph_dist) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
         bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
         rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
@@ -215,7 +232,9 @@ def main():
               f'{rp:>10.3f}{bp:>5}{rk:>9.3f}{bk:>5}{iv:>11.3f}'
               f'{local[0]/max(local[1],1):>9.3f}{dens[0]/max(dens[1],1):>9.3f}'
               f'{collapse[0]/max(collapse[1],1):>10.3f}'
-              f'{distinct[0]/max(distinct[1],1):>10.1f}{len(w):>7}')
+              f'{distinct[0]/max(distinct[1],1):>10.1f}'
+              f'{byphase[0]/max(byphase[1],1):>10.3f}'
+              f'{ph_dist[0]/max(ph_dist[1],1):>9.1f}{len(w):>7}')
     # Baselines differ per column and getting this wrong is easy. A CONSTANT
     # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
     # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
@@ -253,6 +272,11 @@ def main():
     print('              it emits one vector regardless of the music, and the')
     print('              program turns that into a fixed per-phase bias -- useful')
     print('              for the LM loss, and reachable without reading anything.')
+    print('  by-phase  = share of each PHASE CLASS on that class\'s modal argmax;')
+    print('              ph-dist = values used within a phase class. by-phase ~1.0')
+    print('              with ph-dist ~1 means the encoder is a PHASE LOOKUP: one')
+    print('              value per bar position, music ignored. That is the same')
+    print('              degenerate clock as collapse, one step less obvious.')
 
 
 if __name__ == '__main__':
