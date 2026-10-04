@@ -341,13 +341,15 @@ class BaseFinetuneWrapper(nn.Module):
 class CPYinyangLightning(L.LightningModule):
 
     def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int,
-                 enc_loss_weight: float = 0.0, proxy_loss_weight: float = 0.0):
+                 enc_loss_weight: float = 0.0, proxy_loss_weight: float = 0.0,
+                 weight_decay: float = 1e-4):
         super().__init__()
         self.model             = model
         self.max_lr            = max_lr
         self.max_steps         = max_steps
         self.enc_loss_weight   = enc_loss_weight
         self.proxy_loss_weight = proxy_loss_weight
+        self.weight_decay      = weight_decay
 
     def forward(self, x):
         return self.model(x)
@@ -426,7 +428,8 @@ class CPYinyangLightning(L.LightningModule):
         # - pct_start=0.02: longer warmup helps when the only trainable modules
         #   are randomly initialized adapters bolted onto a fixed base
         trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(trainable, lr=self.max_lr,
+                                      weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=self.max_lr,
             total_steps=self.max_steps, pct_start=0.02,
@@ -526,7 +529,8 @@ def main(args):
 
     lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps,
                              enc_loss_weight=args.enc_loss_weight,
-                             proxy_loss_weight=args.proxy_loss_weight)
+                             proxy_loss_weight=args.proxy_loss_weight,
+                             weight_decay=args.weight_decay)
 
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
@@ -763,6 +767,9 @@ def get_args():
                         "a query to the wrong one. 'qk' is the legacy "
                         "--qk_content_residual behaviour. Requires "
                         "--positional_qk; must match at eval.")
+    p.add_argument('--weight_decay', type=float, default=1e-4,
+                   help='AdamW weight decay on the trainable set. 1e-4 is light; '
+                        'raise it when the adapter overfits a small dataset.')
     p.add_argument('--ar_to_rule_hidden', type=int, default=0,
                    help='Hidden width of the AR->rule projection. 0 (default) '
                         'is a plain Linear(768 -> 12). A positive value makes '

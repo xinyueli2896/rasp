@@ -78,6 +78,11 @@ fi
 PROGRAM="${PROGRAM:-retrieve}"
 RULE_IN="${RULE_IN:-root}"
 MLP_H="${MLP_H:-0}"
+# val_loss on the direct-only set bottoms around 2k steps, where OneCycleLR
+# (pct_start=0.02 over max_steps) is still at maximum LR. Sizing max_steps to
+# the useful window lets the schedule actually anneal inside it.
+MAX_STEPS="${MAX_STEPS:-40000}"
+WD="${WD:-}"
 
 EXTRA=""; SUF=""
 # rule_heads only applies to the retrieve program: full uses one head
@@ -90,6 +95,8 @@ EXTRA=""; SUF=""
 [ "$PROGRAM" != retrieve ] && EXTRA="$EXTRA --rule_program $PROGRAM" && SUF="${SUF}_${PROGRAM}"
 [ "$RULE_IN" != root ] && EXTRA="$EXTRA --rule_input $RULE_IN" && SUF="${SUF}_${RULE_IN}"
 [ "$MLP_H" != 0 ] && EXTRA="$EXTRA --ar_to_rule_hidden $MLP_H" && SUF="${SUF}_mlp${MLP_H}"
+[ "$MAX_STEPS" != 40000 ] && SUF="${SUF}_s${MAX_STEPS}"
+[ -n "$WD" ] && EXTRA="$EXTRA --weight_decay $WD" && SUF="${SUF}_wd${WD}"
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
@@ -99,7 +106,7 @@ COMMON_TRAIN="--base_ckpt $BASE \
     --approach chord --n_skip 1 --bidirectional --rule_attention --positional_qk \
     --rule_heads $HEADS \
     --chords_per_bar 2 --model_size 1 --adapter_rank 256 --batch_size 8 \
-    --max_steps 40000 $EXTRA"
+    --max_steps $MAX_STEPS $EXTRA"
 
 # --rule_attention MUST be repeated at eval: without it the rule model is
 # rebuilt at width 16 instead of 28 and every ar_to_rule weight fails to load.
