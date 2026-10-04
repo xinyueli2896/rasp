@@ -155,7 +155,17 @@ class ChordTracrRuleModel(nn.Module):
 
     def _head(self, x: torch.Tensor, W_Q: torch.Tensor,
               W_V: torch.Tensor) -> torch.Tensor:
-        """One compiled head: select by phase, aggregate the un-rotated root."""
+        """One compiled head: select by phase, aggregate the un-rotated root.
+
+    Tracr's BOS convention is implemented here as a virtual key whose logit is
+    0.5 * attn_scale and whose value is zero. A query with a MATCHING real key
+    scores 1.0 * attn_scale and dominates it; a query with no match scores 0
+    everywhere and falls to the virtual key, so the head contributes its
+    default (nothing) instead of averaging the whole causal prefix. Without it,
+    head p injects garbage at every position before the first phase-p slot --
+    with n_phase_heads=2 that is a dead tie between the true key and
+    (key - 5) mod 12 over the entire first slot.
+        """
         T = x.shape[1]
         Q = x @ W_Q.T
         K = x @ self.W_K.T
@@ -163,7 +173,11 @@ class ChordTracrRuleModel(nn.Module):
         scores = (Q @ K.transpose(-2, -1)) * self.attn_scale
         causal = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
         scores = scores.masked_fill(~causal, float('-inf'))
-        return (F.softmax(scores, dim=-1) @ V) @ self.W_O.T
+        scores = torch.cat(
+            [scores.new_full(scores.shape[:-1] + (1,), 0.5 * self.attn_scale),
+             scores], dim=-1)
+        attn = F.softmax(scores, dim=-1)[..., 1:]     # BOS carries a zero value
+        return (attn @ V) @ self.W_O.T
 
     def run_attention(self, x: torch.Tensor) -> torch.Tensor:
         """Run the compiled head(s) over an ARBITRARY residual stream.
@@ -391,7 +405,13 @@ class ChordRaspCompiled(nn.Module):
         scores  = (Q @ K.transpose(-2, -1)) * self.attn_scale
         causal  = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
         scores  = scores.masked_fill(~causal, float('-inf'))
-        x = x + (F.softmax(scores, dim=-1) @ V) @ self.W_O.T      # -> key
+        # Tracr BOS: virtual key at 0.5*coldness with a zero value, so an
+        # unmatched query emits the default instead of averaging the prefix.
+        scores  = torch.cat(
+            [scores.new_full(scores.shape[:-1] + (1,), 0.5 * self.attn_scale),
+             scores], dim=-1)
+        attn = F.softmax(scores, dim=-1)[..., 1:]
+        x = x + (attn @ V) @ self.W_O.T                           # -> key
         h = F.relu(F.linear(x, self.W_in, self.b_in))             # (B, T, 48)
         return x + h @ self.W_out.T                                # -> out
 
