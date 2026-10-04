@@ -137,7 +137,11 @@ WHICH="${1:-both}"
 log() { echo -e "\n════════════════════════════════════════════\n▶ $*\n════════════════════════════════════════════"; }
 
 best_ckpt() {
-    ls "checkpoints/$1/"*.by_val_loss.*.ckpt 2>/dev/null | sort -t= -k3 -g | head -1
+    # `|| true`: with `set -o pipefail` this pipeline returns ls's non-zero
+    # status when nothing matches, and `CKPT=$(best_ckpt ...)` adopts it, so
+    # `set -e` would kill the script with NO message at all. Swallow it and let
+    # the caller test for an empty string instead.
+    ls "checkpoints/$1/"*.by_val_loss.*.ckpt 2>/dev/null | sort -t= -k3 -g | head -1 || true
 }
 
 run_one() {     # run_one <tag> <train-data flags...>
@@ -151,6 +155,12 @@ run_one() {     # run_one <tag> <train-data flags...>
     fi
 
     local CKPT; CKPT=$(best_ckpt "$RUN")
+    if [ -z "$CKPT" ]; then
+        log "$RUN — NO CHECKPOINT after training; skipping eval"
+        echo "  training wrote nothing to checkpoints/$RUN/." >&2
+        echo "  Re-run the python command alone to see its error." >&2
+        return 1
+    fi
     log "$RUN — evaluating $CKPT"
     python -m midi_adapter.evaluate_on_real $COMMON_EVAL --adapter_ckpt "$CKPT" \
         --seen_data "$D/val_all_keys_seenkeys.pt" \
