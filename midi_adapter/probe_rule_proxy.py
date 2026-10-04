@@ -68,6 +68,13 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     # the density of that chromagram, which is what a random argmax would score.
     local = [0, 0]
     dens  = [0.0, 0]
+    # interval near 1/T is the fingerprint of a COLLAPSED encoder: position 0
+    # reads the sos vector and every other position reads content, so if the
+    # proxy emits one constant for t>0 only t=0 matches trivially. Measure it:
+    # how much of each window sits on its own modal argmax, and how many
+    # distinct values the argmax takes at all.
+    collapse = [0, 0]
+    distinct = [0, 0]
 
     for s in range(0, len(windows), batch_size):
         x = windows[s:s + batch_size].to(device).long()
@@ -112,6 +119,11 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
         local[0] += int(hit[:, 1:].sum()); local[1] += hit[:, 1:].numel()
         dens[0]  += float(prev[:, 1:].sum() / N_ROOTS); dens[1] += prev[:, 1:].shape[0] * prev[:, 1:].shape[1]
 
+        for b in range(p.shape[0]):
+            vals, cnt = torch.unique(p[b, 1:], return_counts=True)
+            collapse[0] += int(cnt.max()); collapse[1] += int(p.shape[1] - 1)
+            distinct[0] += int(len(vals));  distinct[1] += 1
+
         d_pred = (p - p[:, :1]) % N_ROOTS
         d_true = (true_root - true_root[:, :1]) % N_ROOTS
         interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
@@ -131,7 +143,7 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
             for c in range(N_ROOTS):
                 rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
-    return acc, rot, interval, local, dens
+    return acc, rot, interval, local, dens, collapse, distinct
 
 
 def main():
@@ -185,14 +197,14 @@ def main():
 
     print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
           f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}'
-          f'{"local-pc":>9}{"density":>9}{"n":>7}')
-    print('  ' + '-' * 128)
+          f'{"local-pc":>9}{"density":>9}{"on-mode":>10}{"distinct":>10}{"n":>7}')
+    print('  ' + '-' * 148)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
-        acc, rot, interval, local, dens = probe(model, w, k, a.chords_per_bar,
-                                                 a.batch_size, dev)
+        (acc, rot, interval, local, dens, collapse,
+         distinct) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
         bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
         rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
@@ -201,7 +213,9 @@ def main():
         print(f'  {os.path.basename(path):<34}{f("proxy"):>9}{f("proxy_p0"):>11}'
               f'{f("key"):>9}{f("out"):>9}'
               f'{rp:>10.3f}{bp:>5}{rk:>9.3f}{bk:>5}{iv:>11.3f}'
-              f'{local[0]/max(local[1],1):>9.3f}{dens[0]/max(dens[1],1):>9.3f}{len(w):>7}')
+              f'{local[0]/max(local[1],1):>9.3f}{dens[0]/max(dens[1],1):>9.3f}'
+              f'{collapse[0]/max(collapse[1],1):>10.3f}'
+              f'{distinct[0]/max(distinct[1],1):>10.1f}{len(w):>7}')
     # Baselines differ per column and getting this wrong is easy. A CONSTANT
     # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
     # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
@@ -233,6 +247,12 @@ def main():
     print('              well above density means the encoder is tracking the')
     print('              NOTE under the cursor rather than the chord -- which is')
     print('              all that h[t] contains when read before the stack.')
+    print('  on-mode   = share of each window sitting on its own modal argmax;')
+    print('              distinct = how many argmax values a window uses at all.')
+    print('              on-mode ~1.0 with distinct ~1 is a COLLAPSED encoder:')
+    print('              it emits one vector regardless of the music, and the')
+    print('              program turns that into a fixed per-phase bias -- useful')
+    print('              for the LM loss, and reachable without reading anything.')
 
 
 if __name__ == '__main__':
