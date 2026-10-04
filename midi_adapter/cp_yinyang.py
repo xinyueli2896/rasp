@@ -945,11 +945,19 @@ class CPYinyangTransformer(nn.Module):
                         rule_h = shared_rule
                     else:
                         rule_h = self._rule_proxy(h_out, adapter_idx)
-                    correction = self.yinyang_attn[adapter_idx](
-                        h_out[:, -1:, :], rule_h, sub_offset=i,
+                    # Correct EVERY position, exactly as forward() does.
+                    # Applying it to the last position only is the usual
+                    # incremental-decoding shortcut, but it is invalid here:
+                    # layer j+1's self-attention at position i reads positions
+                    # < i, which would then be uncorrected at sampling while
+                    # they are corrected during training. The mismatch
+                    # compounds over all 12 layers. The base already re-runs
+                    # the full prefix each step (no KV cache in this
+                    # transformers version), so this costs little.
+                    h_out = h_out + self.yinyang_attn[adapter_idx](
+                        h_out, rule_h, sub_offset=0,
                         use_causal=not self.chord_seq_conditioning,
                     )
-                    h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 
             # Sample next subbeat from last global hidden state
             y_next = base.local_sampling(
