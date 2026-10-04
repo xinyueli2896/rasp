@@ -448,6 +448,8 @@ def main(args):
     bidir_suffix    = ('_bidir'
                        + ('_tracr' if args.rule_attention else '')
                        + (f'_h{args.rule_heads}' if args.rule_heads > 1 else '')
+                       + (f'_L{args.rule_from_layer}'
+                          if args.rule_from_layer >= 0 else '')
                        + ('' if args.proxy_activation == 'none'
                           else f'_{args.proxy_activation}')
                        + (f'_proxy{args.proxy_loss_weight:g}'
@@ -498,6 +500,7 @@ def main(args):
             rule_attention    = args.rule_attention,
             proxy_pos_inject  = not args.no_proxy_pos_inject,
             rule_heads        = args.rule_heads,
+            rule_from_layer   = args.rule_from_layer,
             proxy_activation  = args.proxy_activation,
             proxy_temp        = args.proxy_temp,
         )
@@ -708,6 +711,15 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--rule_from_layer', type=int, default=-1,
+                   help='Where the no-input rule signal is read from. -1 '
+                        '(default) = one projection per adapter, each reading '
+                        'its own layer. 0 = ONE projection reading the stream '
+                        'entering the stack, shared by all adapters — the '
+                        'structural match to the explicit-input variant, where '
+                        'rule_hidden is also built once. k = once after layer k '
+                        '(must be <= n_skip so it exists before the first '
+                        'adapter). Requires --bidirectional.')
     p.add_argument('--rule_heads', type=int, default=1, choices=[1, 2, 3, 4],
                    help='Phase heads in the compiled rule model. 1 reads the '
                         'key only off the I chords (one source in a 1-bar '

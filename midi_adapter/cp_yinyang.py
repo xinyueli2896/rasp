@@ -342,6 +342,7 @@ class CPYinyangTransformer(nn.Module):
         proxy_activation:  str  = 'none',
         proxy_temp:        float = 1.0,
         rule_heads:        int  = 1,
+        rule_from_layer:   int  = -1,
     ):
         assert proxy_activation in ('none', 'softmax', 'hard'), \
             f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
@@ -351,6 +352,11 @@ class CPYinyangTransformer(nn.Module):
              "without it")
         assert not (rule_attention and approach != 'chord'), \
             "rule_attention is the chord rule model; use rule_mode for bass"
+        assert rule_from_layer < 0 or bidirectional, \
+            'rule_from_layer only applies to the bidirectional (no-input) variant'
+        assert rule_from_layer <= n_skip, \
+            (f'rule_from_layer={rule_from_layer} fires after the first adapter '
+             f'(layer {n_skip}); the shared rule signal would not exist yet')
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
         assert not (bidirectional and chord_seq_conditioning), \
@@ -377,6 +383,10 @@ class CPYinyangTransformer(nn.Module):
         self.approach         = approach
         self.proxy_supervision = proxy_supervision
         self.rule_attention    = rule_attention
+        # -1  = one projection per adapter, each reading its own layer (default)
+        #  0  = ONE projection, read from the stream entering the stack
+        #  k  = ONE projection, read after layer k (k <= n_skip)
+        self.rule_from_layer   = rule_from_layer
         self.proxy_pos_inject  = proxy_pos_inject
         self.proxy_activation  = proxy_activation
         self.proxy_temp        = proxy_temp
@@ -478,9 +488,13 @@ class CPYinyangTransformer(nn.Module):
             # would smear uniformly over the whole causal prefix.
             proj_out = (self.rule_model.d_model if not rule_attention else
                         (N_ROOTS if proxy_pos_inject else N_ROOTS + N_POS))
+            # One shared projection when the rule signal is read at a single
+            # depth, mirroring the explicit-input variant where rule_hidden is
+            # built once and broadcast to every adapter.
+            n_proj = 1 if rule_from_layer >= 0 else n_adapters
             self.ar_to_rule = nn.ModuleList([
                 nn.Linear(self.base.hidden_size, proj_out)
-                for _ in range(n_adapters)
+                for _ in range(n_proj)
             ])
 
     # ------------------------------------------------------------------
@@ -620,12 +634,25 @@ class CPYinyangTransformer(nn.Module):
         mask = base.buffered_future_mask(h)
 
         self._proxies = []
+        # Single-depth mode: build the rule signal ONCE, before any adapter
+        # fires, and share it. rule_from_layer == 0 reads the stream entering
+        # the stack (already shifted, so position t has seen only tokens < t).
+        shared_rule = None
+        if self.bidirectional and self.rule_from_layer == 0:
+            shared_rule = self._rule_proxy(h, 0)
+
         for i, layer in enumerate(base.model.layer):
             h = layer(h, attention_mask=mask)[0]
+            if self.bidirectional and self.rule_from_layer == i + 1:
+                shared_rule = self._rule_proxy(h, 0)
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
-                rule_h = (self._rule_proxy(h, adapter_idx)
-                          if self.bidirectional else rule_hidden)
+                if not self.bidirectional:
+                    rule_h = rule_hidden
+                elif self.rule_from_layer >= 0:
+                    rule_h = shared_rule
+                else:
+                    rule_h = self._rule_proxy(h, adapter_idx)
                 h = h + self.yinyang_attn[adapter_idx](
                     h, rule_h, sub_offset=0,
                     use_causal=not self.chord_seq_conditioning,
@@ -825,17 +852,25 @@ class CPYinyangTransformer(nn.Module):
             sinusoidal_pos = base.model.embed_positions(h.shape[:-1], 0)[None, None, :, :]
 
             h_out = h
+            shared_rule = None
+            if self.bidirectional and self.rule_from_layer == 0:
+                shared_rule = self._rule_proxy(h_out, 0)
             for j, layer in enumerate(base.model.layer):
                 h_out = layer(h_out, attention_mask=attn_mask, sinusoidal_pos=sinusoidal_pos)[0]
+                if self.bidirectional and self.rule_from_layer == j + 1:
+                    shared_rule = self._rule_proxy(h_out, 0)
 
                 # Inject adapter after every n_skip layers, modifying last position only
                 if (j + 1) % self.n_skip == 0:
                     adapter_idx = (j + 1) // self.n_skip - 1
-                    # Bidirectional: project the full AR sequence to rule space on-the-fly;
-                    # the cross-attention query (last position) can then attend to the full
-                    # AR-derived rule trajectory up to step i.
-                    rule_h = (self._rule_proxy(h_out, adapter_idx)
-                              if self.bidirectional else rule_hidden)
+                    # Bidirectional: project the AR sequence to rule space —
+                    # per-layer by default, or once at rule_from_layer.
+                    if not self.bidirectional:
+                        rule_h = rule_hidden
+                    elif self.rule_from_layer >= 0:
+                        rule_h = shared_rule
+                    else:
+                        rule_h = self._rule_proxy(h_out, adapter_idx)
                     correction = self.yinyang_attn[adapter_idx](
                         h_out[:, -1:, :], rule_h, sub_offset=i,
                         use_causal=not self.chord_seq_conditioning,

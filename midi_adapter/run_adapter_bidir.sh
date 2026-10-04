@@ -40,6 +40,7 @@ RASP_REPO=/l/users/xinyue.li/rasp
 D=/l/users/xinyue.li/data/pop909_ivvi_w1
 BASE=checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt
 PROXY_W="${PROXY_W:-1.0}"
+FROM_LAYER="${FROM_LAYER:--1}"
 
 # NOTE: no --paired_chord_seq. That is the entire point — the rule model gets
 # no input. --positional_qk still applies: with bidirectional, T_k == T_q, so
@@ -48,19 +49,20 @@ COMMON_TRAIN="--base_ckpt $BASE \
     --approach chord --n_skip 1 --bidirectional --positional_qk \
     --proxy_loss_weight $PROXY_W \
     --chords_per_bar 2 --model_size 1 --adapter_rank 256 --batch_size 8 \
-    --max_steps 40000"
+    --max_steps 40000 $FL"
 
 # --bidirectional MUST be repeated at eval or ar_to_rule is never constructed
 # and the checkpoint's weights are silently dropped by the strict=False load.
 COMMON_EVAL="--base_ckpt $BASE \
     --approach chord --n_skip 1 --bidirectional --positional_qk \
     --chords_per_bar 2 \
-    --n_prompt_beats 16 --temperature 0 --save_n_per_key 3"
+    --n_prompt_beats 16 --temperature 0 --save_n_per_key 3 $FL"
 
 cd "$RASP_REPO"
 mkdir -p eval_logs_grid
 WHICH="${1:-both}"
 SUF=""; [ "$PROXY_W" = 0 ] && SUF="_noproxy"
+FL=""; [ "$FROM_LAYER" != -1 ] && FL="--rule_from_layer $FROM_LAYER" && SUF="${SUF}_L${FROM_LAYER}"
 
 log() { echo -e "\n════════════════════════════════════════════\n▶ $*\n════════════════════════════════════════════"; }
 
