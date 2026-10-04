@@ -20,3 +20,8 @@ eval_midi*/
 gen_midi*/
 decoded_midi/
 figures/*.png
+
+# local helper scripts kept out of version control
+preprocess_large_midi_dataset.py
+pretty_midi_fix.py
+settings.py
