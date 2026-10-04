@@ -316,7 +316,21 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                                  qk_content_residual=qk_content_residual)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
-        print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
+        # Hard failure, not a warning. A mistyped path (or a shell glob that
+        # matched nothing and expanded to an empty string) otherwise produces a
+        # complete, plausible-looking table of RANDOM-WEIGHT numbers with one
+        # line of warning scrolled off the top. That has already cost us one
+        # misread measurement. Pass --allow_random to ask for it deliberately.
+        if not os.environ.get('YINYANG_ALLOW_RANDOM'):
+            raise SystemExit(
+                f'adapter ckpt not found: {adapter_ckpt!r}\n'
+                f'  Refusing to report random-weight numbers as a measurement.\n'
+                f'  `bash midi_adapter/probe_run.sh` lists the runs that have a\n'
+                f'  checkpoint and derives the eval flags from the run name.\n'
+                f'  Set YINYANG_ALLOW_RANDOM=1 if you want the untrained '
+                f'baseline on purpose.')
+        print(f'  adapter ckpt not found ({adapter_ckpt}) — RANDOM WEIGHTS, '
+              f'requested via YINYANG_ALLOW_RANDOM')
         return model.to(device).eval()
 
     raw = torch.load(adapter_ckpt, map_location='cpu')
