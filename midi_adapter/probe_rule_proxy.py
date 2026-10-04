@@ -61,6 +61,13 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     # Rotation-invariant: does the proxy get the INTERVALS right, whatever its
     # absolute labelling? This is what "has it learned the rule" really asks.
     interval = [0, 0]
+    # Hypothesis for a BELOW-chance interval: at rule_from_layer 0 no
+    # self-attention has run, so h[t] encodes little beyond subbeat t-1 and the
+    # encoder tracks the NOTE sounding rather than the chord. Test it: how often
+    # is argmax(proxy[t]) a pitch class actually present at t-1? Compare against
+    # the density of that chromagram, which is what a random argmax would score.
+    local = [0, 0]
+    dens  = [0.0, 0]
 
     for s in range(0, len(windows), batch_size):
         x = windows[s:s + batch_size].to(device).long()
@@ -99,6 +106,12 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
         for c in range(N_ROOTS):
             rot['proxy'][c] += int((((p - c) % N_ROOTS) == true_root).sum())
         # intervals: compare each position to position 0 of its own window
+        chroma = model._extract_chromagram(x_proc)          # (B, T, 12)
+        prev   = torch.roll(chroma, 1, dims=1); prev[:, 0] = 0
+        hit    = prev.gather(-1, p.unsqueeze(-1)).squeeze(-1) > 0
+        local[0] += int(hit[:, 1:].sum()); local[1] += hit[:, 1:].numel()
+        dens[0]  += float(prev[:, 1:].sum() / N_ROOTS); dens[1] += prev[:, 1:].shape[0] * prev[:, 1:].shape[1]
+
         d_pred = (p - p[:, :1]) % N_ROOTS
         d_true = (true_root - true_root[:, :1]) % N_ROOTS
         interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
@@ -118,7 +131,7 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
             for c in range(N_ROOTS):
                 rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
-    return acc, rot, interval
+    return acc, rot, interval, local, dens
 
 
 def main():
@@ -171,13 +184,15 @@ def main():
           f'read at layer {model.rule_from_layer}')
 
     print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
-          f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}{"n":>7}')
-    print('  ' + '-' * 110)
+          f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}'
+          f'{"local-pc":>9}{"density":>9}{"n":>7}')
+    print('  ' + '-' * 128)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
-        acc, rot, interval = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
+        acc, rot, interval, local, dens = probe(model, w, k, a.chords_per_bar,
+                                                 a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
         bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
         rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
@@ -185,7 +200,8 @@ def main():
         iv = interval[0] / max(interval[1], 1)
         print(f'  {os.path.basename(path):<34}{f("proxy"):>9}{f("proxy_p0"):>11}'
               f'{f("key"):>9}{f("out"):>9}'
-              f'{rp:>10.3f}{bp:>5}{rk:>9.3f}{bk:>5}{iv:>11.3f}{len(w):>7}')
+              f'{rp:>10.3f}{bp:>5}{rk:>9.3f}{bk:>5}{iv:>11.3f}'
+              f'{local[0]/max(local[1],1):>9.3f}{dens[0]/max(dens[1],1):>9.3f}{len(w):>7}')
     # Baselines differ per column and getting this wrong is easy. A CONSTANT
     # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
     # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
@@ -210,6 +226,13 @@ def main():
     print('  best-rot high, proxy low -> it works, just in a rotated frame')
     print('  interval high, best-rot low -> relative structure without a stable')
     print('                                 frame, i.e. no consistent key')
+    print()
+    print('  local-pc  = is argmax(proxy[t]) a pitch class actually sounding at')
+    print('              t-1?  density = what a RANDOM argmax would score, i.e.')
+    print('              the mean fraction of the 12 classes present. local-pc')
+    print('              well above density means the encoder is tracking the')
+    print('              NOTE under the cursor rather than the chord -- which is')
+    print('              all that h[t] contains when read before the stack.')
 
 
 if __name__ == '__main__':
