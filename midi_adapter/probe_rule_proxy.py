@@ -90,6 +90,15 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     # how much of each phase class sits on that class's own modal argmax?
     byphase = [0, 0]
     ph_dist = [0, 0]
+    # Is the read TRANSPOSITION-EQUIVARIANT? Transpose the window up a
+    # semitone and ask whether the argmax rotates with it. This is the one
+    # column that speaks directly to unseen keys: a read that commutes with
+    # transposition is correct at F#/G# as soon as it is correct anywhere,
+    # whereas one that merely memorised ten key-to-root tables scores chance
+    # here no matter how high `proxy` is. Pure measurement — nothing is
+    # trained, so unlike --equiv_loss_weight the shift needs no seen-key
+    # filter.
+    equiv = [0, 0]
 
     for s in range(0, len(windows), batch_size):
         x = windows[s:s + batch_size].to(device).long()
@@ -154,6 +163,32 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
         sound_base[0] += float(base[:, 1:].sum()); sound_base[1] += base[:, 1:].numel()
         root_heard[0] += int(rt[:, 1:].sum());     root_heard[1] += rt[:, 1:].numel()
 
+        # --- equivariance -------------------------------------------------
+        # Skip windows where +1 would push a note past 127: preprocess() folds
+        # the shift into a token index, so that would corrupt the input rather
+        # than error.
+        pit = x[..., 1::4].long()
+        nt  = (x[..., 0::4] < 127) & (x[..., 1::4] != 255)
+        top = torch.where(nt, pit, torch.zeros_like(pit)).amax((1, 2))
+        okb = top + 1 <= 127
+        if bool(okb.any()):
+            xs      = x[okb]
+            xs_proc = model.base.preprocess(
+                xs, torch.ones(len(xs), dtype=torch.long, device=device))
+            hs, _ = model.base.local_encode(xs_proc)
+            hs = hs.view(len(xs), T, model.base.hidden_size)
+            hs = torch.cat([sos[:len(xs)], hs[:, :-1]], dim=1)
+            if model.rule_from_layer > 0:
+                mask_s = model.base.buffered_future_mask(hs)
+                for i, layer in enumerate(model.base.model.layer):
+                    hs = layer(hs, attention_mask=mask_s)[0]
+                    if i + 1 == model.rule_from_layer:
+                        break
+            p_s = model._activate_root(
+                model.ar_to_rule[idx](hs))[..., :N_ROOTS].argmax(-1)
+            tgt_s = (p[okb] + 1) % N_ROOTS
+            equiv[0] += int((p_s == tgt_s).sum()); equiv[1] += p_s.numel()
+
         d_pred = (p - p[:, :1]) % N_ROOTS
         d_true = (true_root - true_root[:, :1]) % N_ROOTS
         interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
@@ -174,7 +209,7 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             for c in range(N_ROOTS):
                 rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
     return (acc, rot, interval, local, dens, collapse, distinct, byphase,
-            ph_dist, sound_base, root_heard)
+            ph_dist, sound_base, root_heard, equiv)
 
 
 def main():
@@ -229,14 +264,16 @@ def main():
     print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
           f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}'
           f'{"local-pc":>9}{"density":>9}{"on-mode":>10}{"distinct":>10}'
-          f'{"by-phase":>10}{"ph-dist":>9}{"echo-base":>11}{"heard":>9}{"n":>7}')
-    print('  ' + '-' * 168)
+          f'{"by-phase":>10}{"ph-dist":>9}{"echo-base":>11}{"heard":>9}'
+          f'{"equiv":>8}{"n":>7}')
+    print('  ' + '-' * 176)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
         (acc, rot, interval, local, dens, collapse, distinct, byphase, ph_dist,
-         sbase, rheard) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
+         sbase, rheard, equiv) = probe(model, w, k, a.chords_per_bar,
+                                       a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
         bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
         rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
@@ -251,14 +288,16 @@ def main():
               f'{byphase[0]/max(byphase[1],1):>10.3f}'
               f'{ph_dist[0]/max(ph_dist[1],1):>9.1f}'
               f'{sbase[0]/max(sbase[1],1):>11.3f}'
-              f'{rheard[0]/max(rheard[1],1):>9.3f}{len(w):>7}')
+              f'{rheard[0]/max(rheard[1],1):>9.3f}'
+              f'{equiv[0]/max(equiv[1],1):>8.3f}{len(w):>7}')
     # Baselines differ per column and getting this wrong is easy. A CONSTANT
     # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
     # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
     const_iv = sum(1 for o in OFFSETS if o == OFFSETS[0]) / len(OFFSETS)
     print(f'  {"chance (1/12)":<34}{0.0833:>9.3f}{0.0833:>11.3f}'
           f'{0.0833:>9.3f}{0.0833:>9.3f}{0.0833:>10.3f}{"":>5}'
-          f'{0.0833:>9.3f}{"":>5}{"":>11}')
+          f'{0.0833:>9.3f}{"":>5}{"":>11}{"":>9}{"":>9}{"":>10}{"":>10}'
+          f'{"":>10}{"":>9}{"":>11}{"":>9}{0.0833:>8.3f}')
     print(f'  {"constant predictor":<34}{"":>9}{"":>11}{"":>9}{"":>9}'
           f'{"":>10}{"":>5}{"":>9}{"":>5}{const_iv:>11.3f}')
     print()
@@ -300,6 +339,21 @@ def main():
     print('              audible at all. If proxy ~ echo-base the encoder only')
     print('              learned to ECHO a note that is present and gets the root')
     print('              by luck; proxy >> echo-base means it prefers the root.')
+    print('  equiv     = share of positions whose argmax ROTATES BY ONE when the')
+    print('              window is transposed up a semitone. This is the column')
+    print('              that predicts the unseen keys, and it is independent of')
+    print('              proxy: CE on ten keys is fully satisfied by memorising')
+    print('              ten key-to-root tables, which scores 1/12 here, so a')
+    print('              high proxy with equiv ~ 0.083 says the encoder will not')
+    print('              transfer to F#/G# however good the seen-key number looks.')
+    print('              Equivariance is a property of the MAP, so equiv ~ 1.0')
+    print('              means correctness at any one key implies correctness at')
+    print('              all twelve. --equiv_loss_weight trains this directly.')
+    print('              Caveat: it is blind to the absolute frame -- a read that')
+    print('              is off by a constant rotation still scores 1.0, which is')
+    print('              exactly the degree of freedom best-rot measures. Read the')
+    print('              two together: equiv says the structure is right, proxy')
+    print('              (vs best-rot) says the frame is.')
 
 
 if __name__ == '__main__':

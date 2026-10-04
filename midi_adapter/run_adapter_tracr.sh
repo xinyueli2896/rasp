@@ -56,6 +56,11 @@
 #                                                        # emits the root itself
 #    CR=q bash midi_adapter/run_adapter_tracr.sh         # music content in Q,
 #                                                        # keys stay pure addresses
+#    FROM_LAYER=0 PROGRAM=full PROXY_W=1.0 EQUIV_W=1.0 \
+#      bash midi_adapter/run_adapter_tracr.sh            # THE FLAGSHIP no-input
+#                                                        # run: plain Linear read
+#                                                        # + CE + transposition
+#                                                        # equivariance
 # =============================================================================
 
 set -euo pipefail
@@ -83,6 +88,7 @@ MLP_H="${MLP_H:-0}"
 # the useful window lets the schedule actually anneal inside it.
 MAX_STEPS="${MAX_STEPS:-40000}"
 WD="${WD:-}"
+EQUIV_W="${EQUIV_W:-0}"
 
 EXTRA=""; SUF=""
 # rule_heads only applies to the retrieve program: full uses one head
@@ -98,6 +104,8 @@ EXTRA=""; SUF=""
 [ "$MAX_STEPS" != 40000 ] && SUF="${SUF}_s${MAX_STEPS}"
 [ -n "$WD" ] && EXTRA="$EXTRA --weight_decay $WD" && SUF="${SUF}_wd${WD}"
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
+# Train-time only, so it is deliberately absent from COMMON_EVAL.
+[ "$EQUIV_W" != 0 ] && EXTRA="$EXTRA --equiv_loss_weight $EQUIV_W" && SUF="${SUF}_equiv${EQUIV_W}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
 # No --paired_chord_seq: the rule model receives no input. --rule_attention

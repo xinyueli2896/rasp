@@ -342,7 +342,8 @@ class CPYinyangLightning(L.LightningModule):
 
     def __init__(self, model: CPYinyangTransformer, max_lr: float, max_steps: int,
                  enc_loss_weight: float = 0.0, proxy_loss_weight: float = 0.0,
-                 weight_decay: float = 1e-4):
+                 weight_decay: float = 1e-4, equiv_loss_weight: float = 0.0,
+                 unseen_keys: tuple = (6, 8), equiv_shifts: tuple = (-1, 1)):
         super().__init__()
         self.model             = model
         self.max_lr            = max_lr
@@ -350,6 +351,9 @@ class CPYinyangLightning(L.LightningModule):
         self.enc_loss_weight   = enc_loss_weight
         self.proxy_loss_weight = proxy_loss_weight
         self.weight_decay      = weight_decay
+        self.equiv_loss_weight = equiv_loss_weight
+        self.unseen_keys       = tuple(unseen_keys)
+        self.equiv_shifts      = tuple(equiv_shifts)
 
     def forward(self, x):
         return self.model(x)
@@ -405,6 +409,17 @@ class CPYinyangLightning(L.LightningModule):
             loss = loss + self.proxy_loss_weight * proxy_loss
             self.log('proxy_loss', proxy_loss, on_step=True, on_epoch=False)
 
+        # Transposition equivariance on the ar_to_rule chroma read. Shifts are
+        # drawn only between SEEN keys, so no held-out key is ever fed in, and
+        # the shifted copy carries no label of its own.
+        if self.equiv_loss_weight > 0 and key_override is not None:
+            equiv = self.model.equivariance_loss(
+                x, pitch_shift, key_override,
+                unseen_keys=self.unseen_keys, shifts=self.equiv_shifts)
+            if equiv is not None:
+                loss = loss + self.equiv_loss_weight * equiv
+                self.log('equiv_loss', equiv, on_step=True, on_epoch=False)
+
         self.log('train_loss', loss, on_step=True, on_epoch=False)
         scheduler = self.lr_schedulers()
         if scheduler is not None:
@@ -442,6 +457,17 @@ class CPYinyangLightning(L.LightningModule):
 # ---------------------------------------------------------------------------
 
 def main(args):
+    if args.equiv_loss_weight > 0:
+        # The constraint acts on ar_to_rule, which only exists in the
+        # no-rule-input variant, and it reads ONE depth so the shifted pass is
+        # cheap and unambiguous.
+        if not args.bidirectional:
+            raise SystemExit('--equiv_loss_weight requires --bidirectional: '
+                             'there is no ar_to_rule read to constrain without it')
+        if args.rule_from_layer < 0:
+            raise SystemExit('--equiv_loss_weight requires --rule_from_layer >= 0 '
+                             '(0 reads the stream entering the stack, where the '
+                             'shifted pass costs only the local encoder)')
     n_gpus   = max(torch.cuda.device_count(), 1)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
     lora_suffix     = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
@@ -463,6 +489,8 @@ def main(args):
                           else f'_{args.proxy_activation}')
                        + (f'_proxy{args.proxy_loss_weight:g}'
                           if args.proxy_loss_weight > 0 else '')
+                       + (f'_equiv{args.equiv_loss_weight:g}'
+                          if args.equiv_loss_weight > 0 else '')
                        ) if args.bidirectional else ''
     run_name = (
         args.run_name
@@ -530,7 +558,10 @@ def main(args):
     lit = CPYinyangLightning(adapter, max_lr=max_lr, max_steps=args.max_steps,
                              enc_loss_weight=args.enc_loss_weight,
                              proxy_loss_weight=args.proxy_loss_weight,
-                             weight_decay=args.weight_decay)
+                             weight_decay=args.weight_decay,
+                             equiv_loss_weight=args.equiv_loss_weight,
+                             unseen_keys=tuple(args.unseen_keys),
+                             equiv_shifts=tuple(args.equiv_shifts))
 
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
@@ -818,6 +849,30 @@ def get_args():
                         'unconstrained, which lets the adapter collapse into '
                         'plain self-attention. Recommended: 1.0. Supervision '
                         'is train-time only — inference needs no rule input.')
+    p.add_argument('--equiv_loss_weight', type=float, default=0.0,
+                   help='Weight of the transposition-equivariance constraint '
+                        'on the ar_to_rule chroma read: transposing the input '
+                        'by s semitones must rotate the 12 root logits by s. '
+                        'Requires --bidirectional and --rule_from_layer >= 0. '
+                        'This is what --proxy_loss_weight alone cannot give '
+                        'you: CE on ten keys is satisfied by memorising ten '
+                        'key-to-root tables, which says nothing about F#/G#, '
+                        'whereas equivariance is a property of the MAP and so '
+                        'transfers to every key. Shifts are drawn only between '
+                        'SEEN keys (see --unseen_keys), so no held-out key is '
+                        'ever fed in; the group is generated by s=+1, which '
+                        'survives that filter. Train-time only. Recommended: '
+                        '1.0 alongside --proxy_loss_weight 1.0.')
+    p.add_argument('--unseen_keys', type=int, nargs='*', default=[6, 8],
+                   help='Tonics held out of training (default F#=6, G#=8). '
+                        '--equiv_loss_weight never transposes INTO these, which '
+                        'is what keeps the constraint leak-free.')
+    p.add_argument('--equiv_shifts', type=int, nargs='+', default=[-1, 1],
+                   help='Candidate semitone shifts for --equiv_loss_weight. '
+                        '+-1 is enough: the cyclic group is generated by 1, so '
+                        'equivariance under it implies equivariance under all '
+                        '12. Larger shifts are more likely to be rejected for '
+                        'pushing a note out of MIDI range.')
     p.add_argument('--encoder_injected', action='store_true',
                    help='Replace the one-hot W_E pitch-class lookup with a learned encoder; W_pos stays frozen')
     p.add_argument('--encoder_type', type=str, default='embedding',
