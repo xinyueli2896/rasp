@@ -70,7 +70,10 @@ PROGRAM="${PROGRAM:-retrieve}"
 RULE_IN="${RULE_IN:-root}"
 
 EXTRA=""; SUF=""
-[ "$HEADS" != 1 ] && SUF="${SUF}_h${HEADS}"
+# rule_heads only applies to the retrieve program: full uses one head
+# and mlp_only none, so tagging the run _h2 there would be a lie.
+[ "$PROGRAM" = retrieve ] && [ "$HEADS" != 1 ] && SUF="${SUF}_h${HEADS}"
+[ "$PROGRAM" = retrieve ] || HEADS=1
 [ "$FROM_LAYER" != -1 ] && EXTRA="$EXTRA --rule_from_layer $FROM_LAYER" && SUF="${SUF}_L${FROM_LAYER}"
 [ "$CR" != none ] && EXTRA="$EXTRA --content_residual $CR" && SUF="${SUF}_cr${CR}"
 [ "$PROXY_ACT" != none ] && EXTRA="$EXTRA --proxy_activation $PROXY_ACT" && SUF="${SUF}_${PROXY_ACT}"
