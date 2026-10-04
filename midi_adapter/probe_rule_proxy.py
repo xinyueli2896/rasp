@@ -52,6 +52,15 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     has_out = hasattr(rm, 'O0')
     acc = {k: [0, 0] for k in
            ('proxy', 'proxy_p0', 'key', 'out')}          # [hits, n]
+    # The 12 dims carry no intrinsic labelling. The program applies a CYCLIC
+    # SHIFT, so an encoding of root + c for any fixed c is equally valid: the
+    # shift still composes correctly and v_proj decodes by subtracting c.
+    # Scoring only c = 0 would call a perfectly good encoder chance-level, so
+    # tally every rotation and report the best.
+    rot = {k: np.zeros(N_ROOTS, dtype=np.int64) for k in ('proxy', 'key')}
+    # Rotation-invariant: does the proxy get the INTERVALS right, whatever its
+    # absolute labelling? This is what "has it learned the rule" really asks.
+    interval = [0, 0]
 
     for s in range(0, len(windows), batch_size):
         x = windows[s:s + batch_size].to(device).long()
@@ -87,6 +96,12 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
 
         p = est.argmax(-1)
         acc['proxy'][0] += int((p == true_root).sum()); acc['proxy'][1] += p.numel()
+        for c in range(N_ROOTS):
+            rot['proxy'][c] += int((((p - c) % N_ROOTS) == true_root).sum())
+        # intervals: compare each position to position 0 of its own window
+        d_pred = (p - p[:, :1]) % N_ROOTS
+        d_true = (true_root - true_root[:, :1]) % N_ROOTS
+        interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
         m = (phase == 0)[None, :].expand(B, -1)
         acc['proxy_p0'][0] += int((p[m] == true_root[m]).sum())
         acc['proxy_p0'][1] += int(m.sum())
@@ -96,10 +111,14 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             oo = r[..., rm.O0:rm.O0 + N_ROOTS].argmax(-1)
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
             acc['out'][0] += int((oo == true_root).sum());  acc['out'][1] += oo.numel()
+            for c in range(N_ROOTS):
+                rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
         else:                                            # retrieve program
             kk = r[..., N_ROOTS:2 * N_ROOTS].argmax(-1)
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
-    return acc
+            for c in range(N_ROOTS):
+                rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
+    return acc, rot, interval
 
 
 def main():
@@ -151,23 +170,46 @@ def main():
           f'{type(model.ar_to_rule[0]).__name__}  '
           f'read at layer {model.rule_from_layer}')
 
-    print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}'
-          f'{"key":>9}{"out":>9}{"n win":>8}')
-    print('  ' + '-' * 80)
+    print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
+          f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}{"n":>7}')
+    print('  ' + '-' * 110)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
-        acc = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
+        acc, rot, interval = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
+        bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
+        rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
+        rk = rot['key'][bk]   / max(acc['key'][1], 1)
+        iv = interval[0] / max(interval[1], 1)
         print(f'  {os.path.basename(path):<34}{f("proxy"):>9}{f("proxy_p0"):>11}'
-              f'{f("key"):>9}{f("out"):>9}{len(w):>8}')
+              f'{f("key"):>9}{f("out"):>9}'
+              f'{rp:>10.3f}{bp:>5}{rk:>9.3f}{bk:>5}{iv:>11.3f}{len(w):>7}')
+    # Baselines differ per column and getting this wrong is easy. A CONSTANT
+    # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
+    # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
+    const_iv = sum(1 for o in OFFSETS if o == OFFSETS[0]) / len(OFFSETS)
     print(f'  {"chance (1/12)":<34}{0.0833:>9.3f}{0.0833:>11.3f}'
-          f'{0.0833:>9.3f}{0.0833:>9.3f}')
-    print('\n  proxy at chance  -> the encoder cannot name chords; the adapter '
-          'cannot fix that')
-    print('  proxy good, key poor -> the retrieval step is the problem '
-          '(try --rule_program mlp_only)')
+          f'{0.0833:>9.3f}{0.0833:>9.3f}{0.0833:>10.3f}{"":>5}'
+          f'{0.0833:>9.3f}{"":>5}{"":>11}')
+    print(f'  {"constant predictor":<34}{"":>9}{"":>11}{"":>9}{"":>9}'
+          f'{"":>10}{"":>5}{"":>9}{"":>5}{const_iv:>11.3f}')
+    print()
+    print('  best-rot  = accuracy under the most favourable global rotation c.')
+    print('              The program applies a cyclic shift, so root + c is an')
+    print('              equally valid encoding and c is unidentifiable from the')
+    print('              LM loss alone. If best-rot >> proxy, the encoder works')
+    print('              in a rotated frame and only the LABELLING is arbitrary.')
+    print('  interval  = does the proxy get root[t] - root[0] right? Fully')
+    print('              rotation-invariant: this is "has it learned the rule".')
+    print(f'              BEAT {const_iv:.3f}, not 1/12 — a constant predictor')
+    print('              already gets every phase whose offset equals phase 0.')
+    print()
+    print('  all three at chance   -> the encoder learned nothing')
+    print('  best-rot high, proxy low -> it works, just in a rotated frame')
+    print('  interval high, best-rot low -> relative structure without a stable')
+    print('                                 frame, i.e. no consistent key')
 
 
 if __name__ == '__main__':
