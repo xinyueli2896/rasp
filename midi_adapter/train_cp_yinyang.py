@@ -450,6 +450,8 @@ def main(args):
                        + (f'_h{args.rule_heads}' if args.rule_heads > 1 else '')
                        + (f'_L{args.rule_from_layer}'
                           if args.rule_from_layer >= 0 else '')
+                       + ('' if args.content_residual == 'none'
+                          else f'_cr{args.content_residual}')
                        + ('' if args.proxy_activation == 'none'
                           else f'_{args.proxy_activation}')
                        + (f'_proxy{args.proxy_loss_weight:g}'
@@ -496,6 +498,7 @@ def main(args):
             chord_seq_conditioning = args.paired_chord_seq,
             positional_qk     = args.positional_qk,
             qk_content_residual = args.qk_content_residual,
+            content_residual  = args.content_residual,
             proxy_supervision = args.proxy_loss_weight > 0,
             rule_attention    = args.rule_attention,
             proxy_pos_inject  = not args.no_proxy_pos_inject,
@@ -711,6 +714,17 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--content_residual', type=str, default='none',
+                   choices=['none', 'q', 'k', 'qk'],
+                   help="Which side of the positional Q/K gets a zero-init "
+                        "learned content term. 'q' lets the MUSIC shape what it "
+                        "asks for (anticipation, adaptive strength) while the "
+                        "keys stay pure addresses — the recommended setting. "
+                        "'k' adds rule content to the keys, which makes two "
+                        "slots carrying the same chord look alike and can pull "
+                        "a query to the wrong one. 'qk' is the legacy "
+                        "--qk_content_residual behaviour. Requires "
+                        "--positional_qk; must match at eval.")
     p.add_argument('--rule_from_layer', type=int, default=-1,
                    help='Where the no-input rule signal is read from. -1 '
                         '(default) = one projection per adapter, each reading '

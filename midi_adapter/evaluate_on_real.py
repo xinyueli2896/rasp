@@ -480,6 +480,10 @@ def main():
                         'and ar_to_rule fails to load.')
     p.add_argument('--no_proxy_pos_inject', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--content_residual', type=str, default='none',
+                   choices=['none', 'q', 'k', 'qk'],
+                   help='Must match training — it changes which projections '
+                        'exist, so a mismatch drops weights silently.')
     p.add_argument('--rule_from_layer', type=int, default=-1,
                    help='Must match training — it changes how many ar_to_rule '
                         'projections exist, so a mismatch fails to load.')
@@ -562,6 +566,7 @@ def main():
                            lora_rank=args.lora_rank,
                            positional_qk=args.positional_qk,
                            qk_content_residual=args.qk_content_residual,
+                           content_residual=args.content_residual,
                            rule_attention=args.rule_attention,
                            proxy_pos_inject=not args.no_proxy_pos_inject,
                            rule_heads=args.rule_heads,

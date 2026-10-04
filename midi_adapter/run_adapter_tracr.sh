@@ -42,6 +42,8 @@
 #    FROM_LAYER=0 bash midi_adapter/run_adapter_tracr.sh # ONE shared rule signal,
 #                                                        # read before the stack
 #    FROM_LAYER=1 bash midi_adapter/run_adapter_tracr.sh # ONE, after layer 1
+#    CR=q bash midi_adapter/run_adapter_tracr.sh         # music content in Q,
+#                                                        # keys stay pure addresses
 # =============================================================================
 
 set -euo pipefail
@@ -53,10 +55,12 @@ PROXY_W="${PROXY_W:-0}"
 NO_POS="${NO_POS:-0}"
 HEADS="${HEADS:-2}"
 FROM_LAYER="${FROM_LAYER:--1}"
+CR="${CR:-none}"
 
 EXTRA=""; SUF=""
 [ "$HEADS" != 1 ] && SUF="${SUF}_h${HEADS}"
 [ "$FROM_LAYER" != -1 ] && EXTRA="$EXTRA --rule_from_layer $FROM_LAYER" && SUF="${SUF}_L${FROM_LAYER}"
+[ "$CR" != none ] && EXTRA="$EXTRA --content_residual $CR" && SUF="${SUF}_cr${CR}"
 [ "$PROXY_W" != 0 ] && EXTRA="$EXTRA --proxy_loss_weight $PROXY_W" && SUF="${SUF}_proxy${PROXY_W}"
 [ "$NO_POS" = 1 ]   && EXTRA="$EXTRA --no_proxy_pos_inject"        && SUF="${SUF}_nopos"
 
@@ -74,6 +78,7 @@ COMMON_EVAL="--base_ckpt $BASE \
     --approach chord --n_skip 1 --bidirectional --rule_attention --positional_qk \
     --rule_heads $HEADS --chords_per_bar 2 \
     $( [ "$FROM_LAYER" != -1 ] && echo "--rule_from_layer $FROM_LAYER" ) \
+    $( [ "$CR" != none ] && echo "--content_residual $CR" ) \
     --n_prompt_beats 16 --temperature 0 --save_n_per_key 3"
 [ "$NO_POS" = 1 ] && COMMON_EVAL="$COMMON_EVAL --no_proxy_pos_inject"
 

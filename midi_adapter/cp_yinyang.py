@@ -183,6 +183,7 @@ class CPYinyangCrossAttention(nn.Module):
         positional_qk: bool = False,
         key_stride:    int  = 1,
         qk_content_residual: bool = False,
+        content_residual: str = 'none',
     ):
         super().__init__()
         assert embed_dim % n_heads == 0
@@ -195,10 +196,18 @@ class CPYinyangCrossAttention(nn.Module):
         # they are ZERO-initialised and ADDED to the scaled positional Q/K, so
         # the module starts exactly at the pure-positional routing and learns
         # content-based deviations only where they help.
-        self.qk_content_residual = positional_qk and qk_content_residual
+        # Which side gets a learned content term added on top of the
+        # positional Q/K. --qk_content_residual is the legacy alias for 'qk'.
+        if qk_content_residual and content_residual == 'none':
+            content_residual = 'qk'
+        self.content_residual    = content_residual if positional_qk else 'qk'
+        self.qk_content_residual = positional_qk and content_residual != 'none'
+        self.q_content = (not positional_qk) or 'q' in self.content_residual
+        self.k_content = (not positional_qk) or 'k' in self.content_residual
 
-        if (not positional_qk) or self.qk_content_residual:
+        if self.q_content:
             self.q_proj = nn.Linear(d_model,      embed_dim)
+        if self.k_content:
             self.k_proj = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
@@ -230,14 +239,19 @@ class CPYinyangCrossAttention(nn.Module):
         mods = [self.v_proj, self.out_proj]
         if not positional_qk:
             mods += [self.q_proj, self.k_proj]
+        elif self.q_content or self.k_content:
+            mods += ([self.q_proj] if self.q_content else []) + \
+                    ([self.k_proj] if self.k_content else [])
         for m in mods:
             nn.init.xavier_uniform_(m.weight)
             nn.init.zeros_(m.bias)
         if self.qk_content_residual:
-            # Zero start: Q = pe*SCALE + 0, K = pe*SCALE + 0. Gradients still
-            # flow (each projection's grad passes through the other side's
-            # non-zero positional term), so both can learn away from zero.
-            for m in (self.q_proj, self.k_proj):
+            # Zero start: Q = pe*SCALE + 0 (and/or K). Gradients still flow —
+            # each projection's grad passes through the OTHER side's non-zero
+            # positional term — so a content term can learn away from zero even
+            # when only one side has one.
+            for m in ([self.q_proj] if self.q_content else []) + \
+                     ([self.k_proj] if self.k_content else []):
                 nn.init.zeros_(m.weight)
                 nn.init.zeros_(m.bias)
 
@@ -271,11 +285,20 @@ class CPYinyangCrossAttention(nn.Module):
             k_pe  = self._pe_at(k_pos).to(q_pe.dtype)
             Q = q_pe * self.PE_SCALE
             K = k_pe * self.PE_SCALE
-            if self.qk_content_residual:
-                # Zero-initialised, so this starts as a no-op and the routing
-                # is the pure-positional one; training can add content-driven
-                # deviations (anticipation, adaptive strength) on top.
+            # Zero-initialised, so these start as no-ops and the routing is
+            # the pure-positional one; training adds content-driven deviations
+            # (anticipation, adaptive strength) on top.
+            #
+            # Q and K are deliberately separable. K's job is to ADVERTISE AN
+            # ADDRESS — "I am rule position c". Adding rule content there makes
+            # two slots carrying the same chord look alike, so a query can be
+            # pulled to the wrong one; the routing stops being positional in
+            # exactly the way the design relies on. Q's job is to ASK, and what
+            # the music needs legitimately varies, so content there buys
+            # anticipation and adaptive strength at no cost to alignment.
+            if self.q_content:
                 Q = Q + self.q_proj(ar_hidden)
+            if self.k_content:
                 K = K + self.k_proj(rule_hidden)
             Q = Q.expand(B, -1, -1) if Q.shape[0] == 1 else Q
             K = K.expand(B, -1, -1) if K.shape[0] == 1 else K
@@ -336,6 +359,7 @@ class CPYinyangTransformer(nn.Module):
         chord_seq_conditioning: bool = False,
         positional_qk:    bool = False,
         qk_content_residual: bool = False,
+        content_residual:  str  = 'none',
         proxy_supervision: bool = False,
         rule_attention:    bool = False,
         proxy_pos_inject:  bool = True,
@@ -448,6 +472,7 @@ class CPYinyangTransformer(nn.Module):
                 positional_qk = positional_qk,
                 key_stride    = key_stride,
                 qk_content_residual = qk_content_residual,
+                content_residual    = content_residual,
             )
             for _ in range(n_adapters)
         ])
