@@ -68,6 +68,14 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
     # the density of that chromagram, which is what a random argmax would score.
     local = [0, 0]
     dens  = [0.0, 0]
+    # proxy ~ 0.34 is close to 1/3, which is what "name ANY sounding pitch
+    # class at random" scores when a triad is sounding. If the encoder merely
+    # learned to echo a note that is present, it gets the root by luck at
+    # 1/|pcs|. Compute that baseline exactly, per position, so the comparison
+    # is not eyeballed: sound_base = mean over t of 1/|pcs(t-1)| when the true
+    # root is among them, else 0.
+    sound_base = [0.0, 0]
+    root_heard = [0, 0]
     # interval near 1/T is the fingerprint of a COLLAPSED encoder: position 0
     # reads the sos vector and every other position reads content, so if the
     # proxy emits one constant for t>0 only t=0 matches trivially. Measure it:
@@ -140,6 +148,12 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
                 byphase[0] += int(c.max()); byphase[1] += int(sel.numel())
                 ph_dist[0] += int(len(v));  ph_dist[1] += 1
 
+        npc  = prev.sum(-1).clamp(min=1)                       # |pcs| at t-1
+        rt   = prev.gather(-1, true_root.unsqueeze(-1)).squeeze(-1) > 0
+        base = torch.where(rt, 1.0 / npc, torch.zeros_like(npc))
+        sound_base[0] += float(base[:, 1:].sum()); sound_base[1] += base[:, 1:].numel()
+        root_heard[0] += int(rt[:, 1:].sum());     root_heard[1] += rt[:, 1:].numel()
+
         d_pred = (p - p[:, :1]) % N_ROOTS
         d_true = (true_root - true_root[:, :1]) % N_ROOTS
         interval[0] += int((d_pred == d_true).sum()); interval[1] += d_pred.numel()
@@ -159,7 +173,8 @@ def probe(model, windows, keys, chords_per_bar, batch_size, device):
             acc['key'][0] += int((kk == k[:, None]).sum()); acc['key'][1] += kk.numel()
             for c in range(N_ROOTS):
                 rot['key'][c] += int((((kk - c) % N_ROOTS) == k[:, None]).sum())
-    return acc, rot, interval, local, dens, collapse, distinct, byphase, ph_dist
+    return (acc, rot, interval, local, dens, collapse, distinct, byphase,
+            ph_dist, sound_base, root_heard)
 
 
 def main():
@@ -214,14 +229,14 @@ def main():
     print(f'\n  {"dataset":<34}{"proxy":>9}{"proxy@p0":>11}{"key":>9}{"out":>9}'
           f'{"best-rot":>10}{"c":>5}{"key-rot":>9}{"c":>5}{"interval":>11}'
           f'{"local-pc":>9}{"density":>9}{"on-mode":>10}{"distinct":>10}'
-          f'{"by-phase":>10}{"ph-dist":>9}{"n":>7}')
+          f'{"by-phase":>10}{"ph-dist":>9}{"echo-base":>11}{"heard":>9}{"n":>7}')
     print('  ' + '-' * 168)
     for path in a.data:
         w, k, _ = _load_windows(path, a.window_len)
         if a.max_windows:
             w, k = w[:a.max_windows], k[:a.max_windows]
-        (acc, rot, interval, local, dens, collapse, distinct,
-         byphase, ph_dist) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
+        (acc, rot, interval, local, dens, collapse, distinct, byphase, ph_dist,
+         sbase, rheard) = probe(model, w, k, a.chords_per_bar, a.batch_size, dev)
         f = lambda n: (f'{acc[n][0]/acc[n][1]:.3f}' if acc[n][1] else '—')
         bp = int(rot['proxy'].argmax()); bk = int(rot['key'].argmax())
         rp = rot['proxy'][bp] / max(acc['proxy'][1], 1)
@@ -234,7 +249,9 @@ def main():
               f'{collapse[0]/max(collapse[1],1):>10.3f}'
               f'{distinct[0]/max(distinct[1],1):>10.1f}'
               f'{byphase[0]/max(byphase[1],1):>10.3f}'
-              f'{ph_dist[0]/max(ph_dist[1],1):>9.1f}{len(w):>7}')
+              f'{ph_dist[0]/max(ph_dist[1],1):>9.1f}'
+              f'{sbase[0]/max(sbase[1],1):>11.3f}'
+              f'{rheard[0]/max(rheard[1],1):>9.3f}{len(w):>7}')
     # Baselines differ per column and getting this wrong is easy. A CONSTANT
     # predictor already scores every position where OFFSETS[phase] == OFFSETS[0],
     # which is 2 of 4 phases, so the interval column must beat 0.5, not 1/12.
@@ -277,6 +294,12 @@ def main():
     print('              with ph-dist ~1 means the encoder is a PHASE LOOKUP: one')
     print('              value per bar position, music ignored. That is the same')
     print('              degenerate clock as collapse, one step less obvious.')
+    print('  echo-base = what "name any SOUNDING pitch class at random" scores,')
+    print('              computed exactly per position as 1/|pcs| when the true')
+    print('              root is audible, else 0. heard = how often the root is')
+    print('              audible at all. If proxy ~ echo-base the encoder only')
+    print('              learned to ECHO a note that is present and gets the root')
+    print('              by luck; proxy >> echo-base means it prefers the root.')
 
 
 if __name__ == '__main__':
