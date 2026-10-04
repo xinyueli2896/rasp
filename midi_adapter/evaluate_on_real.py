@@ -480,6 +480,10 @@ def main():
                         'and ar_to_rule fails to load.')
     p.add_argument('--no_proxy_pos_inject', action='store_true',
                    help='Must match the flag used during training.')
+    p.add_argument('--rule_program', type=str, default='retrieve',
+                   choices=['retrieve', 'full'],
+                   help='Must match training — it changes the rule model class '
+                        'and its width (28 vs 40).')
     p.add_argument('--content_residual', type=str, default='none',
                    choices=['none', 'q', 'k', 'qk'],
                    help='Must match training — it changes which projections '
@@ -571,6 +575,7 @@ def main():
                            proxy_pos_inject=not args.no_proxy_pos_inject,
                            rule_heads=args.rule_heads,
                            rule_from_layer=args.rule_from_layer,
+                           rule_program=args.rule_program,
                            proxy_activation=args.proxy_activation,
                            proxy_temp=args.proxy_temp,
                            device=device)

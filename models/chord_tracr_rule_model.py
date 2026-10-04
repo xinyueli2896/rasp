@@ -279,3 +279,151 @@ if __name__ == '__main__':
     # Analytic target must match what the head produces.
     tgt = m.build_rule_hidden_analytic(key, T, 'cpu')
     print('analytic == compiled:', bool(torch.allclose(tgt, h, atol=1e-5)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Conventional TracR compilation of the full rule — attention + MLP
+# ═══════════════════════════════════════════════════════════════════════════
+
+RASP_D_MODEL = N_ROOTS * 2 + N_POS + N_ROOTS      # 40
+
+
+class ChordRaspCompiled(nn.Module):
+    """The I-IV-V-I rule compiled the ordinary TracR way: no hand-placed
+    shortcuts, every matrix a plain read of one named variable.
+
+    RASP program
+    ------------
+        lookup = Select(phase, phase, lambda k, q: k == 0)
+        key    = Aggregate(lookup, root)                       -> attention
+        out    = SequenceMap(lambda k, p: (k + OFFSETS[p]) % 12,
+                             key, phase)                       -> MLP
+
+    `Aggregate` compiles to an attention head; `SequenceMap` is an elementwise
+    function of two variables at the same position and compiles to an MLP —
+    never to attention. ChordTracrRuleModel implements only the first line and
+    leaves the arithmetic to the adapter; this class compiles BOTH, so the
+    program emits the correct root itself.
+
+    Residual stream, d_model = 40, one disjoint subspace per RASP variable:
+        0-11   root            the observed/estimated chord root
+        12-23  key             written by the attention sublayer
+        24-27  phase           the bar-phase clock
+        28-39  out             written by the MLP sublayer = the rule's answer
+
+    MLP construction is the standard categorical SequenceMap:
+        h[i,j] = ReLU(key_i + phase_j - 1)      one unit per (key, phase) pair,
+                                                 1 exactly when both match
+        out    = sum_ij h[i,j] * onehot((i + OFFSETS[j]) % 12)
+
+    Zero trainable parameters.
+    """
+
+    d_model: int = RASP_D_MODEL
+
+    R0, K0, P0, O0 = 0, N_ROOTS, N_ROOTS * 2, N_ROOTS * 2 + N_POS
+
+    def __init__(self, subbeats_per_chord: int = 8, attn_scale: float = 20.0):
+        super().__init__()
+        self.subbeats_per_chord = subbeats_per_chord
+        self.attn_scale         = attn_scale
+        V, P, d = N_ROOTS, N_POS, RASP_D_MODEL
+        R0, K0, P0, O0 = self.R0, self.K0, self.P0, self.O0
+
+        W_E = torch.zeros(V, d); W_E[:, R0:R0 + V] = torch.eye(V)
+        self.register_buffer('W_E', W_E)
+        W_pos = torch.zeros(P, d)
+        for j in range(P):
+            W_pos[j, P0 + j] = 1.0
+        self.register_buffer('W_pos', W_pos)
+
+        # ── attention sublayer: Select(phase, phase, k == 0) ──────────────
+        W_Q = torch.zeros(d, d)
+        for j in range(P):
+            W_Q[P0 + 0, P0 + j] = 1.0       # query-side variable: phase
+        W_K = torch.zeros(d, d)
+        for j in range(P):
+            W_K[P0 + j, P0 + j] = 1.0       # key-side variable: phase
+        W_V = torch.zeros(d, d)
+        for i in range(V):
+            W_V[K0 + i, R0 + i] = 1.0       # value variable: root -> key slot
+        W_O = torch.zeros(d, d)
+        for i in range(V):
+            W_O[K0 + i, K0 + i] = 1.0
+        for n, m in (('W_Q', W_Q), ('W_K', W_K), ('W_V', W_V), ('W_O', W_O)):
+            self.register_buffer(n, m)
+
+        # ── MLP sublayer: SequenceMap over (key, phase) ───────────────────
+        H = V * P
+        W_in = torch.zeros(H, d)
+        b_in = torch.full((H,), -1.0)
+        for i in range(V):
+            for j in range(P):
+                W_in[i * P + j, K0 + i] = 1.0
+                W_in[i * P + j, P0 + j] = 1.0
+        W_out = torch.zeros(d, H)
+        for i in range(V):
+            for j in range(P):
+                W_out[O0 + (i + OFFSETS[j]) % V, i * P + j] = 1.0
+        for n, m in (('W_in', W_in), ('b_in', b_in), ('W_out', W_out)):
+            self.register_buffer(n, m)
+
+        self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
+
+    # ------------------------------------------------------------------
+
+    def phase_at(self, T: int, device) -> torch.Tensor:
+        t = torch.arange(T, device=device)
+        return (t // self.subbeats_per_chord) % N_POS
+
+    def pos_embed(self, T: int, device) -> torch.Tensor:
+        return self.W_pos[self.phase_at(T, device)].unsqueeze(0)
+
+    def run_attention(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the whole compiled program: attention sublayer, then MLP.
+
+        x : (B, T, 40) with the root and phase subspaces populated and the
+            key / out subspaces empty.
+        Returns (B, T, 40); dims 28-39 carry the rule's answer.
+        """
+        T = x.shape[1]
+        Q, K, V = x @ self.W_Q.T, x @ self.W_K.T, x @ self.W_V.T
+        scores  = (Q @ K.transpose(-2, -1)) * self.attn_scale
+        causal  = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
+        scores  = scores.masked_fill(~causal, float('-inf'))
+        x = x + (F.softmax(scores, dim=-1) @ V) @ self.W_O.T      # -> key
+        h = F.relu(F.linear(x, self.W_in, self.b_in))             # (B, T, 48)
+        return x + h @ self.W_out.T                                # -> out
+
+    def _stream_from_roots(self, roots: torch.Tensor) -> torch.Tensor:
+        return self.W_E[roots] + self.pos_embed(roots.shape[1], roots.device)
+
+    def forward(self, roots: torch.Tensor, return_hidden: bool = False):
+        h_out  = self.run_attention(self._stream_from_roots(roots))
+        logits = h_out[:, :, self.O0:self.O0 + N_ROOTS]
+        return (logits, h_out) if return_hidden else logits
+
+    def build_rule_hidden_analytic(self, key: torch.Tensor, T: int,
+                                   device) -> torch.Tensor:
+        key   = key.to(device)
+        phase = self.phase_at(T, device)
+        root  = (key[:, None] + self._offsets.to(device)[phase][None, :]) % N_ROOTS
+        h = self.W_E[root] + self.pos_embed(T, device)
+        oh = F.one_hot(key, num_classes=N_ROOTS).to(h.dtype)[:, None, :]
+        h[..., self.K0:self.K0 + N_ROOTS] = oh.expand(-1, T, -1)
+        h[..., self.O0:self.O0 + N_ROOTS] = F.one_hot(
+            root, num_classes=N_ROOTS).to(h.dtype)
+        return h
+
+    def build_rule_hidden_from_chord_seq(self, chord_seq: torch.Tensor):
+        saved, self.subbeats_per_chord = self.subbeats_per_chord, 1
+        try:
+            return self.run_attention(self._stream_from_roots(chord_seq))
+        finally:
+            self.subbeats_per_chord = saved
+
+    def parameters(self, recurse=True):
+        return iter([])
+
+    def named_parameters(self, prefix='', recurse=True, remove_duplicate=True):
+        return iter([])

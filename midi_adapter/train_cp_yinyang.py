@@ -450,6 +450,7 @@ def main(args):
                        + (f'_h{args.rule_heads}' if args.rule_heads > 1 else '')
                        + (f'_L{args.rule_from_layer}'
                           if args.rule_from_layer >= 0 else '')
+                       + ('_full' if args.rule_program == 'full' else '')
                        + ('' if args.content_residual == 'none'
                           else f'_cr{args.content_residual}')
                        + ('' if args.proxy_activation == 'none'
@@ -504,6 +505,7 @@ def main(args):
             proxy_pos_inject  = not args.no_proxy_pos_inject,
             rule_heads        = args.rule_heads,
             rule_from_layer   = args.rule_from_layer,
+            rule_program      = args.rule_program,
             proxy_activation  = args.proxy_activation,
             proxy_temp        = args.proxy_temp,
         )
@@ -714,6 +716,17 @@ def get_args():
                    help='With --rule_attention, do NOT add the frozen phase '
                         'encoding to the proxy — make ar_to_rule recover bar '
                         'phase from the base hidden states on its own.')
+    p.add_argument('--rule_program', type=str, default='retrieve',
+                   choices=['retrieve', 'full'],
+                   help="How much of the rule the compiled model executes. "
+                        "'retrieve' (default) compiles only Aggregate -- one "
+                        "attention head that fetches the tonic -- and leaves "
+                        "root = (key + OFFSETS[phase]) %% 12 to the adapter. "
+                        "'full' is the conventional TracR compilation: the "
+                        "same head plus the MLP that SequenceMap compiles to, "
+                        "so the program emits the correct root and the adapter "
+                        "only has to perceive the key and render notes. "
+                        "d_model 28 -> 40. Requires --rule_attention.")
     p.add_argument('--content_residual', type=str, default='none',
                    choices=['none', 'q', 'k', 'qk'],
                    help="Which side of the positional Q/K gets a zero-init "

@@ -45,7 +45,9 @@ import torch.nn.functional as F
 from models.bass_tracr_rule_model import (
     BassTracrRuleModel, CPChordRuleModel, ChordSeqRuleModel, TRACR_D_MODEL,
 )
-from models.chord_tracr_rule_model import ChordTracrRuleModel, N_ROOTS, N_POS
+from models.chord_tracr_rule_model import (
+    ChordTracrRuleModel, ChordRaspCompiled, N_ROOTS, N_POS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +369,10 @@ class CPYinyangTransformer(nn.Module):
         proxy_temp:        float = 1.0,
         rule_heads:        int  = 1,
         rule_from_layer:   int  = -1,
+        rule_program:      str  = 'retrieve',
     ):
+        assert rule_program in ('retrieve', 'full'), \
+            f"rule_program must be 'retrieve' or 'full', got {rule_program!r}"
         assert proxy_activation in ('none', 'softmax', 'hard'), \
             f"proxy_activation must be none|softmax|hard, got {proxy_activation!r}"
         assert not (rule_attention and not bidirectional), \
@@ -411,6 +416,7 @@ class CPYinyangTransformer(nn.Module):
         #  0  = ONE projection, read from the stream entering the stack
         #  k  = ONE projection, read after layer k (k <= n_skip)
         self.rule_from_layer   = rule_from_layer
+        self.rule_program      = rule_program
         self.proxy_pos_inject  = proxy_pos_inject
         self.proxy_activation  = proxy_activation
         self.proxy_temp        = proxy_temp
@@ -444,9 +450,17 @@ class CPYinyangTransformer(nn.Module):
             # retrieves the tonic from phase-0 slots, leaving
             # root = (key + OFFSETS[phase]) % 12 for the adapter to compute.
             # Structurally identical to the integer experiment's seed_broadcast.
-            self.rule_model = ChordTracrRuleModel(
-                subbeats_per_chord=subbeats_per_chord,
-                n_phase_heads=rule_heads)
+            if rule_program == 'full':
+                # Conventional TracR compilation: Aggregate -> attention head,
+                # SequenceMap -> MLP. The program emits the correct root, so
+                # the adapter is left with perception and rendering only.
+                # One head, no un-rotation trick — n_phase_heads does not apply.
+                self.rule_model = ChordRaspCompiled(
+                    subbeats_per_chord=subbeats_per_chord)
+            else:
+                self.rule_model = ChordTracrRuleModel(
+                    subbeats_per_chord=subbeats_per_chord,
+                    n_phase_heads=rule_heads)
         elif chord_seq_conditioning:
             assert approach == 'chord', 'chord_seq_conditioning requires approach=chord'
             assert not encoder_injected, \
@@ -737,14 +751,23 @@ class CPYinyangTransformer(nn.Module):
             # The tonic slot is left at zero so the frozen head is the only
             # thing that can fill it.
             B, T = proxy.shape[0], proxy.shape[1]
+            d    = self.rule_model.d_model          # 28 retrieve, 40 full
             root = self._activate_root(proxy[..., :N_ROOTS])
             if self.proxy_pos_inject:
+                # The phase subspace sits at 24:28 in BOTH layouts. Slicing
+                # [-N_POS:] would land on 36:39 at width 40 — inside the `out`
+                # region, which is all zeros.
+                pstart = N_ROOTS * 2
                 phase = self.rule_model.pos_embed(
-                    T, h.device).to(proxy.dtype)[..., -N_POS:].expand(B, -1, -1)
+                    T, h.device).to(proxy.dtype)[..., pstart:pstart + N_POS]
+                phase = phase.expand(B, -1, -1)
             else:
                 phase = proxy[..., N_ROOTS:]
             proxy = torch.cat(
                 [root, root.new_zeros(B, T, N_ROOTS), phase], dim=-1)
+            if proxy.shape[-1] < d:
+                # 'full' adds an `out` subspace the MLP writes; start it empty.
+                proxy = F.pad(proxy, (0, d - proxy.shape[-1]))
             proxy = self.rule_model.run_attention(proxy)
         return proxy
 
