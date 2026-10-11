@@ -1,0 +1,25 @@
+# Needed ONLY to recompile a Tracr rule model from its RASP program:
+#
+#   python -m models.integer_rule_model --build --max_seq_len 32
+#
+# You do not need any of this to train, evaluate, or run the test suite. The
+# compiled weights are committed under models/compiled_rules/ (~160 KB each),
+# and models/test_integer_rule_model.py reports SKIP for the one tracr-only
+# section and runs the other 31 checks from those files.
+#
+# Recompile only when the RASP program, the vocab, or max_seq_len changes.
+# max_seq_len matters more than it looks: Tracr encodes `indices` as a one-hot
+# over absolute position, so d_model grows with it (59 at T=16, 75 at T=32)
+# and the model refuses to run on a longer sequence than it was built for.
+#
+#   pip install -r requirements-compile.txt
+#
+# verified: jax 0.10.2, jaxlib 0.10.2, dm-haiku 0.0.17, chex 0.1.92,
+#           einops 0.8.2, tracr 1.0.0 (Python 3.11)
+
+jax
+jaxlib
+dm-haiku
+chex
+einops
+tracr @ git+https://github.com/google-deepmind/tracr.git

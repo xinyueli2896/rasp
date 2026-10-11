@@ -1,10 +1,35 @@
-torch>=2.0.0
-numpy>=1.24.0
+# Core — everything needed to TRAIN and EVALUATE.
+#
+# Versions after the comment are what this repo is currently verified against
+# (Python 3.11). The floors are what the code actually requires; the exact
+# pins are a fallback if a newer release breaks something.
 
-# Optional: only needed for LoRA training (--use_lora flag)
+torch>=2.0.0                 # verified: 2.14.1+cu130
+numpy>=1.24.0                # verified: 2.4.6
+pytorch_lightning>=2.0.0     # verified: 2.6.6   (NOT the `lightning` package —
+                             #   every module does `import pytorch_lightning as L`)
+transformers>=4.30.0         # verified: 5.18.0
+pretty_midi>=0.2.10          # verified: 0.2.11.post0
+wandb                        # pytorch_lightning.loggers.WandbLogger is imported
+                             #   unconditionally by the trainers; set
+                             #   --wandb_project '' to disable logging, but the
+                             #   import still has to resolve.
+
+# transformers pin note: cp_transformer.py imports
+#   from transformers.models.roformer.modeling_roformer import
+#       RoFormerModel, RoFormerConfig, RoFormerEncoder
+# RoFormerEncoder is not part of the documented public API, so a major
+# transformers bump is the most likely thing to break this repo. It works on
+# 5.18.0. If it ever fails, that import is the first place to look.
+
+# ── Optional: AccoMontage orchestration (midi_adapter/batch_orchestrate.py) ──
+# Only for regenerating the chord experiment's orchestrated data. That script
+# also needs the Structured-Arrangement-Code repo on sys.path, which the
+# pipeline runs in a SEPARATE conda env called `sarr`.
+# scipy>=1.10
+
+# ── Optional: LoRA (--lora_rank > 0) ────────────────────────────────────────
 # peft>=0.9.0
 
-# Optional — needed only to COMPILE the rule models (models/tracr_to_torch.py).
-# Using the cached .pt in checkpoints/rule_models/ needs none of these.
-#   pip install jax jaxlib dm-haiku chex einops
-#   pip install git+https://github.com/google-deepmind/tracr.git
+# ── Optional: compiling rule models — see requirements-compile.txt ──────────
+# Not needed to USE them: models/compiled_rules/*.pt is committed.
