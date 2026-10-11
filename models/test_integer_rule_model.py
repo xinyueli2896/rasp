@@ -11,8 +11,9 @@ not have, so none of them should be taken on trust:
   3. CONTEXT-FREE  the output depends on (token[0], position) and nothing else
   4. GRADIENT FLOW frozen to the optimizer, differentiable to the input
 
-Sections 1 and 3b need `tracr`+`jax`; everything else runs from the cached
-.pt and is skipped cleanly if the cache is missing.
+Only section 1 needs `tracr`+`jax`, and it SKIPs without them. Everything
+else runs from the committed weights in models/compiled_rules/, so a plain
+checkout can verify the model it is about to train against.
 
   python -m models.test_integer_rule_model
   python -m models.test_integer_rule_model --max_seq_len 16

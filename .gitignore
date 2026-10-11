@@ -25,3 +25,10 @@ figures/*.png
 preprocess_large_midi_dataset.py
 pretty_midi_fix.py
 settings.py
+
+# Compiled Tracr rule models are COMMITTED: they are ~160 KB each and
+# regenerating them needs tracr+jax, which nothing else in this repo
+# requires. Keeping them here makes the rule model usable from a
+# plain `git pull`.
+!models/compiled_rules/
+!models/compiled_rules/*.pt

@@ -50,14 +50,19 @@ exact on rule-following input; pick deliberately.
 
 BUILD vs LOAD
 -------------
-Compiling needs `tracr` + `jax`; using the result does not. Build once, cache,
-then load anywhere:
+Compiling needs `tracr` + `jax`; using the result does not, and the compiled
+weights are COMMITTED (models/compiled_rules/, ~160 KB each), so a plain
+`git pull` is enough to use the rule model. Nothing else in this repo needs
+jax, and making every user install it to run a 160 KB lookup would be the
+wrong trade.
 
-    python -m models.integer_rule_model --build --max_seq_len 32
-    # -> checkpoints/rule_models/integer_v12_T32_first.pt
+Rebuild only when the program, the vocab or max_seq_len changes:
+
+    python -m models.integer_rule_model --build --max_seq_len 32   # needs tracr
+    # -> models/compiled_rules/integer_v12_T32_first.pt
 
     from models.integer_rule_model import IntegerRuleModel
-    rule = IntegerRuleModel.load('checkpoints/rule_models/integer_v12_T32_first.pt')
+    rule = IntegerRuleModel.load('models/compiled_rules/integer_v12_T32_first.pt')
 """
 from __future__ import annotations
 
@@ -74,7 +79,9 @@ from rasp_program.next_token_rule import (
     OFFSETS, PERIOD, VOCAB_SIZE, compile_program,
 )
 
-DEFAULT_CACHE = 'checkpoints/rule_models'
+# Committed to the repo (see .gitignore): compiling needs tracr+jax,
+# loading needs neither, so the artifact ships rather than the toolchain.
+DEFAULT_CACHE = 'models/compiled_rules'
 
 
 def cache_path(max_seq_len: int, vocab_size: int = VOCAB_SIZE,
