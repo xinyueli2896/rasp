@@ -325,12 +325,26 @@ def build(ar_ckpt: str, rule_ckpt: str | None = None, n_skip: int = 1,
 
     blob = torch.load(ar_ckpt, map_location='cpu', weights_only=False)
     a = blob['args']
+    # Take the vocabulary from the CHECKPOINT, not from a default. Hardcoding
+    # 12 here meant a V=24 AR failed deep inside load_state_dict with a bare
+    # "size mismatch for tok_emb.weight" and no hint that the vocabulary was
+    # the issue. `.get` keeps checkpoints written before --vocab_size existed
+    # loadable.
+    V = int(a.get('vocab_size', 12))
     ar = AutoregressiveTransformer(
-        vocab_size=12, max_seq_len=max_seq_len or (4 * a['n_cycles'] + 8),
+        vocab_size=V, max_seq_len=max_seq_len or (4 * a['n_cycles'] + 8),
         d_model=a['d_model'], n_layers=a['n_layers'], n_heads=a['n_heads'])
     ar.load_state_dict(blob['state_dict'])
 
-    rule = IntegerRuleModel.load(rule_ckpt or cache_path(32))
+    # Same for the rule model: cache_path's default is V=12, so a V=24 run
+    # would otherwise silently pair a 24-token AR with a 12-token program.
+    rule = IntegerRuleModel.load(rule_ckpt or cache_path(32, V))
+    if rule.vocab_size != V:
+        raise ValueError(
+            f'vocabulary mismatch: the AR checkpoint is V={V} but the rule '
+            f'model is V={rule.vocab_size}. Compile the matching one with '
+            f'`python -m models.integer_rule_model --build --max_seq_len 32 '
+            f'--vocab_size {V}`, or pass --rule_ckpt explicitly.')
     m = IntegerRuleAdapter(ar, rule, n_skip=n_skip, embed_dim=embed_dim,
                            n_heads=n_heads, rule_slice=rule_slice,
                            train_ar=train_ar, lora_rank=lora_rank,

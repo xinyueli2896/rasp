@@ -178,7 +178,8 @@ def main():
         blob = torch.load(a.ar_ckpt, map_location='cpu', weights_only=False)
         ab = blob['args']
         model = AutoregressiveTransformer(
-            vocab_size=a.vocab_size, max_seq_len=4 * a.n_cycles + 8,
+            vocab_size=int(ab.get('vocab_size', a.vocab_size)),
+            max_seq_len=4 * a.n_cycles + 8,
             d_model=ab['d_model'], n_layers=ab['n_layers'],
             n_heads=ab['n_heads']).to(dev)
         model.load_state_dict(blob['state_dict'])
@@ -195,7 +196,8 @@ def main():
         else:
             from models.integer_adapter import IntegerRuleAdapter
             from models.integer_rule_model import IntegerRuleModel, cache_path
-            rule = IntegerRuleModel.load(a.rule_ckpt or cache_path(32))
+            rule = IntegerRuleModel.load(
+                a.rule_ckpt or cache_path(32, a.vocab_size))
             model = IntegerRuleAdapter(
                 ar, rule, n_skip=a.n_skip, embed_dim=a.embed_dim,
                 n_heads=a.n_heads, rule_slice=a.rule_slice,
