@@ -41,3 +41,6 @@ settings.py
 # Slurm opens --output before the script runs and fails if it is absent.
 slurm_logs/*
 !slurm_logs/.gitkeep
+
+# per-job training logs from run_seeds.sh
+run_logs/
