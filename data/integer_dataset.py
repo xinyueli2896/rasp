@@ -89,26 +89,41 @@ SEEN     = [x for x in range(VOCAB_SIZE) if x not in UNSEEN]
 # The two training stages draw from DIFFERENT pools, so all four evaluation
 # cells are populated:
 #
-#   A \ B  {5, 9}                   pretrain-only  -> forgetting
-#   B \ A  {1, 2, 3, 4, 7, 10, 11}  finetune-only  -> rule installation
-#   A n B  {0}                       both           -> control, ~1.0
-#   none   {6, 8}                    unseen         -> generalisation
+#   A \ B  {5, 9}         pretrain-only  -> forgetting
+#   B \ A  {0, 7, 10, 11} finetune-only  -> rule installation
+#   A n B  {1, 2, 3, 4}   both           -> control, ~1.0
+#   none   {6, 8}         unseen         -> generalisation
 #
-# These are exactly the pools data/dataset.py has always used, so results
-# here stay comparable with the earlier integer runs.
+# A is chosen so that EACH POOL SEPARATELY covers every token the unseen
+# starters must emit, not merely their union. That matters because two
+# different models get scored on the unseen cell:
 #
-# Why A is only 3 of 12. The rule is translation-equivariant in x, so every
-# starter is structurally identical and only the COUNT matters. Give the AR
-# too many and it learns the rule outright, generalises to all twelve by
-# itself, and there is nothing left for the adapter to demonstrate. The V=24
-# report used 6 of 24 and its pretrain baseline still scored 0.000 on the
-# unseen cell; 3 of 12 is a comparable fraction, but worth checking rather
-# than assuming -- see `ar_baseline_is_informative` below.
+#   the AR alone, trained on A only
+#   the adapter,  trained on B over a base frozen from A
 #
-# The cost of this shape is that A n B is a single starter, 31 predictions.
-# It is only a control that should read ~1.0, so thin is tolerable. For a
-# two-starter control without disturbing A \ B, use --pretrain 0 2 5 9.
-PRETRAIN_STARTERS = [0, 5, 9]                        # A
+# If a needed token appeared only in B, the AR's failure on {6, 8} would be
+# partly lexical -- it had never emitted that symbol -- and the baseline
+# would not be measuring rule application at all. `validate_split` enforces
+# per-pool coverage for exactly this reason.
+#
+# The constraint is tight. {6, 8} require tokens {1, 3, 6, 8, 11}, and
+# starter 1 is the ONLY seen starter that produces token 1, so A must
+# contain it; A also needs a source for 3 (from 3 or 10) and for 11 (from 4
+# or 11). With A \ B pinned to {5, 9} and 2 included, the smallest valid A
+# is six starters, and there are four such sets. This is one of them; the
+# others are [1,2,3,5,9,11], [1,2,4,5,9,10] and [1,2,5,9,10,11], all with
+# the same cell sizes.
+#
+# NOTE this departs from data/dataset.py's historical A = {0, 5, 9}, which
+# covers NONE of {1, 3, 6, 8, 11}. Earlier integer results are therefore
+# not directly comparable on the unseen cell.
+#
+# A is now 6 of 12. The rule is translation-equivariant in x, so only the
+# COUNT matters, and at half the vocabulary the AR may learn the rule
+# outright and generalise unaided -- which would leave the adapter nothing
+# to demonstrate. Check it before trusting any adapter number; see
+# `ar_baseline_is_informative` below.
+PRETRAIN_STARTERS = [1, 2, 3, 4, 5, 9]               # A
 ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10, 11]       # B
 
 # 4 cycles * 8 = 32 tokens. Teacher forcing drops one, so the AR sees 31 and
@@ -146,22 +161,31 @@ def validate_split(pretrain=None, adapter=None, unseen=None,
             f'without them answers a different question than the four-way '
             f'partition claims to.')
 
-    cov = set()
-    for x in seen:
-        cov |= set(sequence([x], T)[0].tolist())
+    toks = lambda xs: set().union(
+        *[set(sequence([x], T)[0].tolist()) for x in xs]) if xs else set()
+    need = toks(unseen)
+    cov  = {'A (pretrain)': toks(A), 'B (adapter)': toks(B), 'A u B': toks(seen)}
 
-    novel = {u: sorted(set(sequence([u], T)[0].tolist()) - cov) for u in unseen}
-    bad   = {u: v for u, v in novel.items() if v}
-    if bad:
+    # Per-pool, not just the union. Two models are scored on the unseen cell:
+    # the AR trained on A alone, and the adapter trained on B over a base
+    # frozen from A. A token present only in B would make the AR's failure on
+    # the unseen starters partly LEXICAL -- it had never emitted that symbol --
+    # so the baseline would not be measuring rule application.
+    short = {k: sorted(need - v) for k, v in cov.items()
+             if k != 'A u B' and not need <= v}
+    if short:
+        detail = '; '.join(f'{k} is missing {v}' for k, v in short.items())
         raise ValueError(
-            f'holdout is not purely structural: starter(s) {sorted(bad)} must '
-            f'emit token(s) never produced by any TRAINED starter: {bad}. Pick '
-            f'a different holdout, or the unseen number conflates "cannot '
-            f'apply the rule" with "has never emitted this symbol".')
+            f'holdout is not purely structural for every pool: {detail}. The '
+            f'unseen starters need tokens {sorted(need)}. A model trained on '
+            f'a pool that never emits one of those would fail on {unseen} for '
+            f'a lexical reason, not because it cannot apply the rule. Add a '
+            f'starter that produces the missing token(s) to that pool.')
 
     return dict(pretrain=A, adapter=B, cells=cells,
+                coverage={k: sorted(v) for k, v in cov.items()},
+                unseen_needs=sorted(need),
                 seen=seen, unseen=unseen, seq_len=T,
-                token_coverage=sorted(cov),
                 n_predictions={k: len(v) * (T - 1) for k, v in cells.items()})
 
 
@@ -267,11 +291,14 @@ def _main():
     tot = sum(len(v) for v in c.values())
     print(f'  {"":<9}{"":<16}{"":<26}{tot:>3}  (of {VOCAB_SIZE} starters)')
 
-    print(f'\nholdout is structural, not lexical:')
-    print(f'  tokens covered by trained starters: {info["token_coverage"]}')
+    print(f'\nholdout is structural for EVERY pool, not just their union')
+    print(f'  unseen starters need tokens {info["unseen_needs"]}')
     for u in info['unseen']:
-        need = sorted(set(sequence([u], T)[0].tolist()))
-        print(f'    unseen {u:2d} needs {need} -- all covered')
+        print(f'    {u:2d} -> {sorted(set(sequence([u], T)[0].tolist()))}')
+    for k, v in info['coverage'].items():
+        miss = sorted(set(info['unseen_needs']) - set(v))
+        print(f'  {k:<14} covers {v}'
+              + ('' if not miss else f'   MISSING {miss}'))
 
     print(f'\nbefore trusting any adapter number, check the AR baseline:')
     print(f'  the AR trains on A ({len(info["pretrain"])} of {VOCAB_SIZE} '
