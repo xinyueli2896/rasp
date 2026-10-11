@@ -1,5 +1,21 @@
 # Running this repo on a Slurm cluster
 
+## First: find out what your cluster allows
+
+The `#SBATCH` defaults in `verify.sbatch` are a placeholder. Partition names,
+account strings, QOS requirements and gres syntax differ at every site, so
+ask the scheduler rather than guessing:
+
+```bash
+bash slurm/discover.sh          # pure sinfo/sacctmgr queries, login-safe
+```
+
+It prints the partitions, per-partition time limits, GPU types and counts,
+your accounts and QOS limits, and says which of `SB_PARTITION`,
+`SB_ACCOUNT`, `SB_GRES`, `SB_QOS` to set from them. Watch `MaxWall` in
+particular: if it is shorter than a training run, checkpoint-and-requeue
+stops being optional (see Preemption below).
+
 Nothing heavier than `pip install` belongs on a login node. `setup_env.sh`
 enforces that: on a machine where `sbatch` exists and `$SLURM_JOB_ID` is
 unset, it installs and then **submits** the verification instead of running
