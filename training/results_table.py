@@ -29,14 +29,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.integer_dataset import validate_split  # noqa: E402
 from training.pretrain_integer import CELLS      # noqa: E402
 
+# (glob, tag, description, always_show)
+# always_show=False rows appear only when they actually match something, so
+# the table is not padded with rows that will never exist.
 ROWS = [
-    ('ar_integer_seed*.pt',                 'Pre',  'AR alone, trained on pool A'),
-    ('integer_finetune_*seed*.pt',          'FT',   'AR continued on B, no adapter'),
-    ('integer_adapter-frozen_*seed*.pt',    'YY',   'adapter, AR frozen'),
-    ('integer_adapter-lora*_*seed*.pt',     'YY+L', 'adapter + LoRA on the AR'),
-    ('integer_adapter-trainar_*seed*.pt',   'YY+T', 'adapter + AR fully trainable'),
-    # pre-rename checkpoints, so an older sweep is not silently dropped
-    ('integer_adapter_*seed*.pt',           'YY?',  'adapter (legacy name)'),
+    ('ar_integer_seed*.pt',               'Pre',  'AR alone, trained on pool A',   True),
+    ('integer_finetune_*seed*.pt',        'FT',   'AR continued on B, no adapter', True),
+    ('integer_adapter-frozen_*seed*.pt',  'YY',   'adapter, AR frozen',            True),
+    ('integer_adapter-lora*_*seed*.pt',   'YY+L', 'adapter + LoRA on the AR',      True),
+    ('integer_adapter-trainar_*seed*.pt', 'YY+T', 'adapter + AR fully trainable',  True),
+    # Checkpoints written before the variant suffix existed, when every
+    # adapter run was `integer_adapter_<slice>_seed<N>.pt` regardless of
+    # whether the AR was frozen. Listed separately rather than folded into
+    # YY because which variant produced them is no longer recoverable from
+    # the filename. The globs do not overlap -- this one needs an UNDERSCORE
+    # after "adapter" where the others have a hyphen.
+    ('integer_adapter_*seed*.pt',         'YY?',  'adapter, variant unknown '
+                                                  '(pre-rename checkpoint)',       False),
 ]
 
 
@@ -62,20 +71,21 @@ def main():
         print(f'  {k:<14} {ref["cells"][k]}')
     print()
 
-    hdr = f'{"":<5}{"model":<34}' + ''.join(f'{k:>18}' for k in CELLS) + f'{"n":>4}'
+    hdr = f'{"":<5}{"model":<40}' + ''.join(f'{k:>18}' for k in CELLS) + f'{"n":>4}'
     print(hdr); print('-' * len(hdr))
 
     table = {}
-    for pattern, tag, desc in ROWS:
+    for pattern, tag, desc, always in ROWS:
         runs = collect(pattern, a.ckpt_dir)
         if not runs:
-            print(f'{tag:<5}{desc:<34}' + f'{"(no checkpoints)":>18}')
+            if always:
+                print(f'{tag:<5}{desc:<40}' + f'{"(no checkpoints)":>18}')
             continue
 
         stale = [os.path.basename(p) for p, b in runs
                  if b.get('split', {}).get('cells') != ref['cells']]
         if stale:
-            print(f'{tag:<5}{desc:<34}  REFUSED: trained under a different '
+            print(f'{tag:<5}{desc:<40}  REFUSED: trained under a different '
                   f'split: {stale}')
             print(f'       re-run them, or the row averages incomparable '
                   f'numbers')
@@ -88,7 +98,7 @@ def main():
             v = vals[k]
             cells += (f'{v.mean():>11.3f}       ' if len(v) == 1
                       else f'{v.mean():>11.3f}+-{v.std(ddof=1):<5.3f}')
-        print(f'{tag:<5}{desc:<34}{cells}{len(runs):>4}')
+        print(f'{tag:<5}{desc:<40}{cells}{len(runs):>4}')
 
     print(f'\n  RFA: generate 31 tokens from the one-token prompt [x], greedy. '
           f'chance = {1/12:.3f}')
@@ -108,7 +118,7 @@ def main():
         print(' & '.join(['', 'Model'] + [c.replace('_', '-') for c in CELLS])
               + ' \\\\')
         print('\\midrule')
-        for pattern, tag, desc in ROWS:
+        for pattern, tag, desc, _ in ROWS:
             if tag not in table:
                 continue
             cs = []
