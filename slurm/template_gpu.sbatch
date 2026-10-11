@@ -23,15 +23,14 @@
 # =============================================================================
 #SBATCH --job-name=rasp-gpu
 #SBATCH --output=slurm_logs/%x-%j.out
-#SBATCH --error=slurm_logs/%x-%j.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --gres=gpu:1
 #SBATCH --partition=long
 #SBATCH --qos=gpu-12
 #SBATCH --time=12:00:00
-#SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1

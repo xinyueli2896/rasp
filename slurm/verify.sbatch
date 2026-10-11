@@ -24,13 +24,14 @@
 # =============================================================================
 #SBATCH --job-name=rasp-verify
 #SBATCH --output=slurm_logs/verify-%j.out
-#SBATCH --error=slurm_logs/verify-%j.out
-#SBATCH --time=00:20:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 #SBATCH --gres=gpu:1
 #SBATCH --partition=cscc-gpu-p
 #SBATCH --qos=gpu-debug-qos
+#SBATCH --time=00:20:00
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1

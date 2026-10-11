@@ -12,8 +12,9 @@
 #    2  wall time within the partition's cap
 #    3  GPU count within the partition's cap, and >= 1 on a GPU partition
 #    4  CPU cores <= 512 on cscc-cpu-p
-#    5  no --exclusive (needs written approval)
-#    6  no --mail-type / --mail-user (unavailable on DANA)
+#    5  ONLY the directives the DANA example uses. --error in particular is
+#       not among them; Slurm merges stderr into --output without it.
+#    6  no --exclusive, no --mail-type / --mail-user
 #    7  --output directory must exist in a fresh clone: Slurm opens it
 #       BEFORE the script runs, so an in-script mkdir is too late
 #    8  no process may set CUDA_VISIBLE_DEVICES
@@ -91,7 +92,19 @@ for f in slurm/*.sbatch; do
         bad "cpus-per-task=$CPUS exceeds the 512-core cap"
     fi
 
-    # 5-6. forbidden / unavailable flags
+    # 5. only the directives the DANA example uses
+    LEGAL=" job-name output nodes ntasks cpus-per-task mem gres partition qos time "
+    offenders=""
+    while read -r k; do
+        [[ "$LEGAL" == *" $k "* ]] || offenders="$offenders --$k"
+    done < <(grep -oP '(?<=^#SBATCH )--\K[a-z-]+' "$f")
+    if [ -z "$offenders" ]; then
+        ok "only the documented directives"
+    else
+        bad "non-standard directive(s):$offenders"
+    fi
+
+    # 6. forbidden / unavailable flags (also caught above, named explicitly)
     for flag in exclusive mail-type mail-user; do
         grep -q "^#SBATCH --$flag" "$f" && bad "--$flag must not be used"
     done

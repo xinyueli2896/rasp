@@ -28,14 +28,13 @@
 # =============================================================================
 #SBATCH --job-name=rule-model-test
 #SBATCH --output=slurm_logs/%x-%j.out
-#SBATCH --error=slurm_logs/%x-%j.out
-#SBATCH --partition=cscc-cpu-p
-#SBATCH --qos=cscc-cpu-qos
-#SBATCH --time=00:20:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
+#SBATCH --partition=cscc-cpu-p
+#SBATCH --qos=cscc-cpu-qos
+#SBATCH --time=00:20:00
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
