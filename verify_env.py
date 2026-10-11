@@ -67,6 +67,13 @@ def main() -> int:
     if usersite and os.path.isdir(usersite):
         print(f'  user   {usersite}  (shadows the env for all python'
               f'{sys.version_info.major}.{sys.version_info.minor})')
+    if (conda or in_env) and usersite:
+        import torch as _t
+        if '/.local/' in (getattr(_t, '__file__', '') or ''):
+            ok('packages are in the ENV, not user site-packages', False,
+               f'torch comes from {usersite}, but {conda or sys.prefix} is '
+               f'active. Install with PYTHONNOUSERSITE=1 python -m pip ...',
+               warn_only=True)
     print('\n1. core packages')
     for mod, why in [('torch', 'everything'),
                      ('numpy', 'everything'),

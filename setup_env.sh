@@ -89,12 +89,30 @@ if [ "$DO_INSTALL" = 1 ]; then
     fi
 
     say "installing core requirements"
+    # PYTHONNOUSERSITE keeps pip out of ~/.local. Without it, pip falls back
+    # to a user install whenever the env's site-packages looks unwritable,
+    # and those packages then shadow the env for EVERY python of that minor
+    # version. `python -m pip` (not bare `pip`) guarantees the pip that
+    # belongs to the interpreter we just activated.
+    export PYTHONNOUSERSITE=1
     # Plain PyPI gives the CUDA build of torch. Do NOT point at the CPU index
     # unless you mean it: it installs cleanly and then trains far slower. If
     # this cluster needs a specific CUDA build, install torch by hand first
     # and then run `bash setup_env.sh --verify`.
     $RUN python -m pip install --upgrade pip || exit 1
     $RUN python -m pip install -r "$REPO/requirements.txt" || exit 1
+
+    # Confirm the packages actually landed in the env rather than ~/.local.
+    $RUN python - <<'CHK'
+import sys, torch, os
+loc = torch.__file__
+if '/.local/' in loc:
+    print(f'\n  WARNING: torch resolved to {loc}')
+    print(f'  That is user site-packages, not the env at {sys.prefix}.')
+    print('  Re-run with:  PYTHONNOUSERSITE=1 python -m pip install -r requirements.txt')
+else:
+    print(f'  installed into {sys.prefix}  (python {sys.version.split()[0]})')
+CHK
 
     if [ "$DO_COMPILE" = 1 ]; then
         say "installing the rule-COMPILING extras (tracr + jax)"
