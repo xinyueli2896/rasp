@@ -124,13 +124,60 @@ class RuleCrossAttention(nn.Module):
         return self.out_proj(out) * self.gate
 
 
+class LoRALinear(nn.Module):
+    """Frozen Linear + trainable low-rank update:  y = W0 x + b + (alpha/r) B A x.
+
+    Self-contained rather than `peft`, which is an optional dependency the
+    rest of this repo does not need for a 30-line update.
+
+    B is zero-initialised, so at step 0 the module is EXACTLY the frozen
+    layer and the AR starts from its pretrained behaviour rather than a
+    perturbation of it. That matters for the forgetting comparison: any
+    drift on pretrain_only has to come from training, not from init.
+    """
+
+    def __init__(self, base: nn.Linear, rank: int, alpha: float | None = None):
+        super().__init__()
+        self.base = base
+        for q in self.base.parameters():
+            q.requires_grad_(False)
+        self.A = nn.Parameter(torch.zeros(rank, base.in_features))
+        self.B = nn.Parameter(torch.zeros(base.out_features, rank))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.scale = (alpha if alpha is not None else rank) / rank
+
+    def forward(self, x):
+        return self.base(x) + F.linear(F.linear(x, self.A), self.B) * self.scale
+
+
+def apply_lora(ar: AutoregressiveTransformer, rank: int,
+               alpha: float | None = None,
+               targets: tuple[str, ...] = ('attn.qkv', 'attn.proj')) -> int:
+    """Wrap the targeted Linears in LoRALinear. Returns the trainable count.
+
+    Defaults to the attention projections only, which is the usual choice and
+    keeps the update small relative to the adapter it is being compared with.
+    Pass targets=('attn.qkv', 'attn.proj', 'ffn.0', 'ffn.2') for everything.
+    """
+    n = 0
+    for name, mod in list(ar.named_modules()):
+        for child, sub in list(mod.named_children()):
+            full = f'{name}.{child}' if name else child
+            if isinstance(sub, nn.Linear) and any(t in full for t in targets):
+                lora = LoRALinear(sub, rank, alpha)
+                setattr(mod, child, lora)
+                n += lora.A.numel() + lora.B.numel()
+    return n
+
+
 class IntegerRuleAdapter(nn.Module):
     """Frozen AR, frozen compiled rule model, trainable cross-attention."""
 
     def __init__(self, ar: AutoregressiveTransformer, rule: IntegerRuleModel,
                  n_skip: int = 1, embed_dim: int = 64, n_heads: int = 4,
                  dropout: float = 0.1, rule_slice: str = 'program',
-                 train_ar: bool = False):
+                 train_ar: bool = False, lora_rank: int = 0,
+                 lora_alpha: float | None = None):
         super().__init__()
         if rule_slice not in SLICES:
             raise ValueError(f'rule_slice must be one of {list(SLICES)}')
@@ -148,9 +195,16 @@ class IntegerRuleAdapter(nn.Module):
                                dropout, ar.max_seq_len)
             for _ in range(n_ad)])
 
-        self.train_ar = train_ar
+        if train_ar and lora_rank:
+            raise ValueError('train_ar and lora_rank are alternatives: one '
+                             'trains every AR weight, the other a low-rank '
+                             'update to some of them.')
+        self.train_ar, self.lora_rank = train_ar, lora_rank
         for q in self.ar.parameters():
             q.requires_grad_(train_ar)
+        if lora_rank:
+            # after the blanket freeze, so only the A/B factors are trainable
+            apply_lora(self.ar, lora_rank, lora_alpha)
         # rule is frozen by construction: its weights are buffers and its
         # parameters() is empty, so there is nothing to switch off here.
 
@@ -191,7 +245,8 @@ class IntegerRuleAdapter(nn.Module):
 
 def build(ar_ckpt: str, rule_ckpt: str | None = None, n_skip: int = 1,
           embed_dim: int = 64, n_heads: int = 4, rule_slice: str = 'program',
-          train_ar: bool = False, max_seq_len: int | None = None,
+          train_ar: bool = False, lora_rank: int = 0,
+          lora_alpha: float | None = None, max_seq_len: int | None = None,
           device='cpu') -> IntegerRuleAdapter:
     """Load the pretrained AR and the compiled rule model, and bolt them together."""
     from models.integer_rule_model import cache_path
@@ -206,5 +261,6 @@ def build(ar_ckpt: str, rule_ckpt: str | None = None, n_skip: int = 1,
     rule = IntegerRuleModel.load(rule_ckpt or cache_path(32))
     m = IntegerRuleAdapter(ar, rule, n_skip=n_skip, embed_dim=embed_dim,
                            n_heads=n_heads, rule_slice=rule_slice,
-                           train_ar=train_ar)
+                           train_ar=train_ar, lora_rank=lora_rank,
+                           lora_alpha=lora_alpha)
     return m.to(device)

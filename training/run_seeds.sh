@@ -2,15 +2,17 @@
 # =============================================================================
 #  Seed sweep for the integer experiment.
 #
-#    bash training/run_seeds.sh                 # all three rows, seeds 0-4
+#    bash training/run_seeds.sh                 # every row, seeds 0-4
 #    bash training/run_seeds.sh finetune        # just the FT row
-#    bash training/run_seeds.sh pretrain finetune
+#    bash training/run_seeds.sh adapter lora trainar
 #    SEEDS="0 1 2" bash training/run_seeds.sh finetune
 #
 #  Rows:
-#    pretrain   AR on pool A                       -> the baseline
-#    finetune   AR continued on pool B, no adapter -> forgetting control
-#    adapter    cross-attention over the frozen AR -> the proposed model
+#    pretrain   AR on pool A                        -> the baseline
+#    finetune   AR continued on pool B, no adapter  -> forgetting control
+#    adapter    cross-attention, AR FROZEN          -> the proposed model
+#    lora       cross-attention + LoRA on the AR    -> partly trainable
+#    trainar    cross-attention + AR fully trainable
 #
 #  WHY EACH FT SEED NEEDS ITS OWN AR
 #  ---------------------------------
@@ -28,7 +30,8 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 SEEDS="${SEEDS:-0 1 2 3 4}"
-ROWS=("$@"); [ ${#ROWS[@]} -eq 0 ] && ROWS=(pretrain finetune adapter)
+ROWS=("$@"); [ ${#ROWS[@]} -eq 0 ] && ROWS=(pretrain finetune adapter lora trainar)
+LORA_RANK="${LORA_RANK:-16}" 
 want() { for r in "${ROWS[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
 
 for s in $SEEDS; do
@@ -39,7 +42,7 @@ for s in $SEEDS; do
         python -m training.pretrain_integer --seed "$s" || exit 1
     fi
 
-    if want finetune || want adapter; then
+    if want finetune || want adapter || want lora || want trainar; then
         if [ ! -f "$AR" ]; then
             echo "missing $AR -- run the pretrain row for seed $s first:" >&2
             echo "  python -m training.pretrain_integer --seed $s" >&2
@@ -54,9 +57,21 @@ for s in $SEEDS; do
     fi
 
     if want adapter; then
-        echo; echo "══ seed $s: adapter over the frozen AR ══"
+        echo; echo "══ seed $s: adapter, AR frozen ══"
         python -m training.finetune_adapter_integer --mode adapter \
             --seed "$s" --ar_ckpt "$AR" || exit 1
+    fi
+
+    if want lora; then
+        echo; echo "══ seed $s: adapter + LoRA r=$LORA_RANK on the AR ══"
+        python -m training.finetune_adapter_integer --mode adapter \
+            --lora_rank "$LORA_RANK" --seed "$s" --ar_ckpt "$AR" || exit 1
+    fi
+
+    if want trainar; then
+        echo; echo "══ seed $s: adapter + AR fully trainable ══"
+        python -m training.finetune_adapter_integer --mode adapter \
+            --train_ar --seed "$s" --ar_ckpt "$AR" || exit 1
     fi
 done
 

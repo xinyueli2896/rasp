@@ -30,9 +30,13 @@ from data.integer_dataset import validate_split  # noqa: E402
 from training.pretrain_integer import CELLS      # noqa: E402
 
 ROWS = [
-    ('ar_integer_seed*.pt',            'Pre', 'AR alone, trained on pool A'),
-    ('integer_finetune_*seed*.pt',     'FT',  'AR continued on B, no adapter'),
-    ('integer_adapter_*seed*.pt',      'YY',  'adapter over the frozen AR'),
+    ('ar_integer_seed*.pt',                 'Pre',  'AR alone, trained on pool A'),
+    ('integer_finetune_*seed*.pt',          'FT',   'AR continued on B, no adapter'),
+    ('integer_adapter-frozen_*seed*.pt',    'YY',   'adapter, AR frozen'),
+    ('integer_adapter-lora*_*seed*.pt',     'YY+L', 'adapter + LoRA on the AR'),
+    ('integer_adapter-trainar_*seed*.pt',   'YY+T', 'adapter + AR fully trainable'),
+    # pre-rename checkpoints, so an older sweep is not silently dropped
+    ('integer_adapter_*seed*.pt',           'YY?',  'adapter (legacy name)'),
 ]
 
 

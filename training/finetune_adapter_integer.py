@@ -63,6 +63,18 @@ def main():
     p.add_argument('--rule_ckpt', type=str, default=None)
     p.add_argument('--rule_slice', choices=list(SLICES), default='program')
     p.add_argument('--n_skip', type=int, default=1)
+    p.add_argument('--train_ar', action='store_true',
+                   help='Adapter mode only: also train every AR weight. The '
+                        'adapter then has no structural protection against '
+                        'forgetting, so pretrain_only becomes an empirical '
+                        'question rather than a guarantee.')
+    p.add_argument('--lora_rank', type=int, default=0,
+                   help='Adapter mode only: LoRA rank on the AR attention '
+                        'projections (0 = off). Mutually exclusive with '
+                        '--train_ar. B is zero-initialised, so the AR starts '
+                        'at exactly its pretrained behaviour.')
+    p.add_argument('--lora_alpha', type=float, default=None,
+                   help='LoRA scale; defaults to lora_rank (scale = 1).')
     p.add_argument('--embed_dim', type=int, default=64)
     p.add_argument('--n_heads', type=int, default=4)
     p.add_argument('--epochs', type=int, default=200)
@@ -89,8 +101,12 @@ def main():
     if a.mode == 'adapter':
         model = build(a.ar_ckpt, a.rule_ckpt, n_skip=a.n_skip,
                       embed_dim=a.embed_dim, n_heads=a.n_heads,
-                      rule_slice=a.rule_slice,
+                      rule_slice=a.rule_slice, train_ar=a.train_ar,
+                      lora_rank=a.lora_rank, lora_alpha=a.lora_alpha,
                       max_seq_len=4 * a.n_cycles + 8, device=dev)
+        variant = ('trainar' if a.train_ar else
+                   f'lora{a.lora_rank}' if a.lora_rank else 'frozen')
+        print(f'AR       : {variant}')
         print(f'rule_slice: {a.rule_slice} -> {SLICES[a.rule_slice]}  '
               f'({model.rule_dims.numel()} dims)')
         print(f'adapters : {len(model.adapters)} x embed_dim {a.embed_dim}, '
@@ -155,7 +171,9 @@ def main():
     print('  cannot alter the frozen AR weights at all.')
     print('  unseen is the headline. Neither pool contains {6, 8}.')
 
-    name = a.ckpt_name or f'integer_{a.mode}_{a.rule_slice}_seed{a.seed}.pt'
+    tag  = (a.mode if a.mode != 'adapter'
+            else f'adapter-{"trainar" if a.train_ar else f"lora{a.lora_rank}" if a.lora_rank else "frozen"}')
+    name = a.ckpt_name or f'integer_{tag}_{a.rule_slice}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)
     path = os.path.join(a.ckpt_dir, name)
     torch.save({'state_dict': model.state_dict(), 'args': vars(a),
