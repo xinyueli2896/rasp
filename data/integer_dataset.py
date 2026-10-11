@@ -89,21 +89,27 @@ SEEN     = [x for x in range(VOCAB_SIZE) if x not in UNSEEN]
 # The two training stages draw from DIFFERENT pools, so all four evaluation
 # cells are populated:
 #
-#   A \ B  {5, 9, 11}        pretrain-only  -> catastrophic forgetting
-#   B \ A  {1, 3, 4, 7, 10}  finetune-only  -> rule installation
-#   A n B  {0, 2}            both           -> control, should stay ~1.0
-#   none   {6, 8}            unseen         -> generalisation (the headline)
+#   A \ B  {5, 9}                   pretrain-only  -> forgetting
+#   B \ A  {1, 2, 3, 4, 7, 10, 11}  finetune-only  -> rule installation
+#   A n B  {0}                       both           -> control, ~1.0
+#   none   {6, 8}                    unseen         -> generalisation
 #
-# Why A is small (5 of 12). The rule is translation-equivariant in x, so
-# every starter is structurally identical and only the COUNT matters. Give
-# the AR too many and it learns the rule outright, generalises to all twelve
-# by itself, and there is nothing left for the adapter to demonstrate. The
-# V=24 report used 6 of 24 and its pretrain baseline still scored 0.000 on
-# the unseen cell; 5 of 12 is a far higher fraction, so this is the number
-# to check empirically before trusting any adapter result. See
-# `ar_baseline_is_informative` below.
-PRETRAIN_STARTERS = [0, 2, 5, 9, 11]                 # A
-ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10]           # B
+# These are exactly the pools data/dataset.py has always used, so results
+# here stay comparable with the earlier integer runs.
+#
+# Why A is only 3 of 12. The rule is translation-equivariant in x, so every
+# starter is structurally identical and only the COUNT matters. Give the AR
+# too many and it learns the rule outright, generalises to all twelve by
+# itself, and there is nothing left for the adapter to demonstrate. The V=24
+# report used 6 of 24 and its pretrain baseline still scored 0.000 on the
+# unseen cell; 3 of 12 is a comparable fraction, but worth checking rather
+# than assuming -- see `ar_baseline_is_informative` below.
+#
+# The cost of this shape is that A n B is a single starter, 31 predictions.
+# It is only a control that should read ~1.0, so thin is tolerable. For a
+# two-starter control without disturbing A \ B, use --pretrain 0 2 5 9.
+PRETRAIN_STARTERS = [0, 5, 9]                        # A
+ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10, 11]       # B
 
 # 4 cycles * 8 = 32 tokens. Teacher forcing drops one, so the AR sees 31 and
 # the rule model is fed 31 + BOS = 32, which is exactly the length its
