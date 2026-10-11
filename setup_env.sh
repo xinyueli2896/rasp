@@ -24,7 +24,9 @@
 #    bash setup_env.sh --compile       # also install tracr/jax (rule compiling)
 #    bash setup_env.sh --venv          # python -m venv instead of conda
 #    bash setup_env.sh --local         # run verification HERE, not via sbatch
-#                                      #   (use only inside salloc/srun --pty)
+#                                      #   (only inside `srun --pty`; MBZUAI
+#                                      #    policy says not to use salloc as
+#                                      #    the standard way to run work)
 #    bash setup_env.sh --no-verify     # install only
 #
 #    ENV_NAME=rasp  SB_PARTITION=gpu  SB_ACCOUNT=myproj  SB_GRES=gpu:1 \
@@ -114,6 +116,9 @@ if [ "$ON_SLURM_LOGIN" = 1 ] && [ "$FORCE_LOCAL" = 0 ]; then
     [ -n "${SB_PARTITION:-}" ] && SB_ARGS+=(--partition="$SB_PARTITION")
     [ -n "${SB_ACCOUNT:-}" ]   && SB_ARGS+=(--account="$SB_ACCOUNT")
     [ -n "${SB_GRES:-}" ]      && SB_ARGS+=(--gres="$SB_GRES")
+    # verify.sbatch already sets --qos=gpu-debug-qos, which is what DANA
+    # policy requires for environment/GPU verification. SB_QOS overrides it
+    # only if your site names it differently.
     [ -n "${SB_QOS:-}" ]       && SB_ARGS+=(--qos="$SB_QOS")
 
     out=$(ENV_NAME="$ENV_NAME" sbatch "${SB_ARGS[@]}" slurm/verify.sbatch 2>&1)
@@ -137,8 +142,10 @@ fi
 
 say "verifying here"
 if [ "$ON_SLURM_LOGIN" = 1 ]; then
-    echo "   (--local on a Slurm login node — make sure you are inside an"
-    echo "    allocation, e.g. salloc or srun --pty)"
+    echo "   (--local on a Slurm login node — only do this inside an"
+    echo "    interactive job: srun --qos=gpu-debug-qos --gres=gpu:1 --pty bash"
+    echo "    Running it on the login node itself can get the process killed"
+    echo "    and your SSH session closed.)"
 fi
 $RUN python "$REPO/verify_env.py"
 rc=$?

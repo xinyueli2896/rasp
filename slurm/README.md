@@ -1,118 +1,147 @@
-# Running this repo on a Slurm cluster
+# Running this repo on MBZUAI DANA (Slurm)
 
-## First: find out what your cluster allows
+Written against the MBZUAI HPC policy page
+(`hpc.mbzuai.ac.ae/wiki/policies.html`). Where that page and this file
+disagree, the page wins — check it, because policy changes.
 
-The `#SBATCH` defaults in `verify.sbatch` are a placeholder. Partition names,
-account strings, QOS requirements and gres syntax differ at every site, so
-ask the scheduler rather than guessing:
+## The rules this repo has to respect
+
+| policy | what it means here |
+|---|---|
+| **No compute on login nodes.** Background monitoring terminates compute processes outside Slurm and may close the SSH session. | `setup_env.sh` submits verification instead of running it. |
+| Login node slice: **8 cores, 1000 tasks, 16 GB soft / 32 GB hard**. | Enough for the rule-model tests and the data config. Not for `verify_env.py` (112M model) or anything that loads a dataset. |
+| **`sbatch` for batch, `srun` for interactive. Do not use `salloc` as the standard method.** | Use `srun --pty` when you need a shell. Earlier revisions of this file suggested `salloc`; that was wrong. |
+| Interactive/debugging must use **`--qos=gpu-debug-qos`**, for environment testing, dependency validation, GPU verification and short experiments. | `verify.sbatch` sets exactly this — it is a GPU-verification job. Training must use a production QoS instead. |
+| **No idle/reservation jobs** (`sleep`), close unused sessions. | Do not hold a debug shell open between runs. |
+| **Never touch `CUDA_VISIBLE_DEVICES`** or reach for GPUs Slurm did not give you. Violations can end in account revocation. | Nothing in this repo sets it. `devices=-1` means "all GPUs Slurm assigned", which is the correct way to ask. `verify.sbatch` only *prints* the variable. |
+| **No `--exclusive`** without written approval. | Not used anywhere here. |
+| DANA GPU: up to **8 concurrent jobs**, up to **12 concurrent GPUs**. | A seed sweep must not fan out past this. 5 seeds x 1 GPU is fine. |
+| Remove obsolete checkpoints and failed-experiment output. | `cleanup_workspace.sh` in the repo root; this workspace hit 124 G once. |
+
+## ⚠️ Lustre small-files, and why it applies to the chord pipeline
+
+The policy asks you to contact `hpc.admins@mbzuai.ac.ae` **before** large-scale
+processing of very many small files on `/l/`, because of metadata load.
+
+`run_pipeline_pop909_w1_orch.sh` is exactly that workload. It writes, all
+under `/l/users/<you>/data/pop909_ivvi_w1/`:
+
+- `snippets/` — one `.mid` per matched 4-bar window
+- `snippets_perkey/` — **×12**, one per transposed key
+- `orch_perkey/` — one folder per snippet, several `arrangement_band-*.mid` each
+
+That is tens of thousands of small files before a single tensor is written.
+Mail the HPC team first, and consider the mitigations the policy suggests —
+aggregation, archive formats, or staging the intermediates on node-local
+scratch (`$TMPDIR`) and only writing the final `.pt` files to `/l/`.
+
+The `.pt` datasets and checkpoints are large and few, which is the pattern
+Lustre wants. It is the MIDI intermediates that are the problem.
+
+## Setup
 
 ```bash
-bash slurm/discover.sh          # pure sinfo/sacctmgr queries, login-safe
+bash slurm/discover.sh          # pure sinfo/sacctmgr, login-safe
 ```
 
-It prints the partitions, per-partition time limits, GPU types and counts,
-your accounts and QOS limits, and says which of `SB_PARTITION`,
-`SB_ACCOUNT`, `SB_GRES`, `SB_QOS` to set from them. Watch `MaxWall` in
-particular: if it is shorter than a training run, checkpoint-and-requeue
-stops being optional (see Preemption below).
-
-Nothing heavier than `pip install` belongs on a login node. `setup_env.sh`
-enforces that: on a machine where `sbatch` exists and `$SLURM_JOB_ID` is
-unset, it installs and then **submits** the verification instead of running
-it, because `verify_env.py` builds the 112M CP transformer.
+The policy page does **not** name the GPU partitions, wall-time limits, or
+this site's `gres` syntax, so ask the scheduler. Then:
 
 ```bash
-bash setup_env.sh                 # install on the login node, submit verify
+SB_PARTITION=<from discover>  SB_ACCOUNT=<from discover>  SB_GRES=gpu:1 \
+    bash setup_env.sh
 squeue -u "$USER"
-cat slurm_logs/verify-<jobid>.out # expect: environment OK
+cat slurm_logs/verify-<jobid>.out       # expect: environment OK
 ```
 
-Override the resources to match your cluster:
+`setup_env.sh` installs on the login node (pip is IO, not compute) and
+submits `slurm/verify.sbatch`, which requests `--qos=gpu-debug-qos`.
+
+For an interactive shell, `srun` — not `salloc`:
 
 ```bash
-SB_PARTITION=gpu SB_ACCOUNT=myproj SB_GRES=gpu:a100:1 bash setup_env.sh
+srun --qos=gpu-debug-qos --gres=gpu:1 --time=00:30:00 --pty bash
 ```
-
-`--local` runs verification in place — only do that inside an interactive
-allocation (`salloc` / `srun --pty`), never on the login node.
-
----
 
 ## Four things that bite specifically under Slurm
 
 ### 1. wandb, on a node with no outbound network
 
 The trainers import `WandbLogger` unconditionally, so **wandb must be
-installed even when you disable it**. Disabling the logger is separate from
-the import:
+installed even when you disable it**. Disabling is separate from the import:
 
 ```bash
---wandb_project ''        # no WandbLogger at all; TensorBoard still logs
+--wandb_project ''        # no WandbLogger; TensorBoard still logs
 ```
 
-If you do want wandb and the compute nodes have no internet — common — run
-offline and sync afterwards from the login node:
+If you want wandb and compute nodes have no internet, run offline and sync
+from the login node afterwards (syncing is file IO, so it is login-safe):
 
 ```bash
-export WANDB_MODE=offline     # in the job script
-wandb sync wandb/offline-run-*  # later, from a node with network
+export WANDB_MODE=offline       # in the job script
+wandb sync wandb/offline-run-*  # later
 ```
 
 Without this a job can hang on a connection retry rather than fail outright.
 
 ### 2. Multi-GPU needs `srun`, not bare `python`
 
-Both trainers use `devices=-1` and switch to `DDPStrategy` when more than one
-GPU is visible. Lightning detects Slurm from the environment, and the two
-launch styles are not interchangeable:
+Both trainers use `devices=-1` and switch to `DDPStrategy` above one GPU.
+Lightning reads Slurm from the environment, and the launch styles are not
+interchangeable:
 
 ```bash
-# WRONG for multi-GPU: one process sees N GPUs, Lightning expects N tasks
+# WRONG: one process sees N GPUs, Lightning expects N tasks
 #SBATCH --gres=gpu:4
 python -m midi_adapter.train_cp_yinyang ...
 
-# RIGHT: one task per GPU, srun launches them
+# RIGHT: one task per GPU
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=4
 srun python -m midi_adapter.train_cp_yinyang ...
 ```
 
-Single GPU (`--gres=gpu:1`, one task) is unaffected — plain `python` is fine.
+Single GPU with one task is unaffected. Stay within the 12-GPU cap.
 
-### 3. Preemption and requeue
+### 3. Wall time, preemption and requeue
 
-Lightning's `SLURMEnvironment` auto-requeues on `SIGUSR1` by default. On a
-preemptible partition that is usually what you want, but it only helps if the
-run can resume, so pass `--resume_ckpt` and give the scheduler a signal
-window:
+Check `MaxWall` from `discover.sh` against the runs you intend:
+
+| run | steps |
+|---|---|
+| chord adapter (`run_adapter_tracr.sh`) | 40,000 (8,000 for the short variants) |
+| CP base pretrain (`pretrain_cp_bass.py`) | 200,000 |
+
+If a run does not fit one job, checkpoint-and-requeue is mandatory, not
+optional. Lightning's `SLURMEnvironment` auto-requeues on `SIGUSR1`, which
+only helps if the job can resume:
 
 ```bash
 #SBATCH --signal=SIGUSR1@90
+python -m midi_adapter.train_cp_yinyang ... --resume_ckpt <path>
 ```
 
-If you would rather a preempted job just die, set
-`SLURM_EXPORT_ENV` aside and disable it in code — but note that
-`train_cp_yinyang.py` does not currently construct `SLURMEnvironment`
-explicitly, so it takes Lightning's default.
+### 4. Checkpoints must land on shared storage
 
-### 4. Checkpoints and logs go to shared storage
+`--ckpt_dir` is relative to the submit directory. If that resolves to
+node-local disk the checkpoints vanish with the job. Point it at `/l/`
+explicitly — and then prune, per the data-management policy.
 
-`--ckpt_dir` defaults to `checkpoints/` relative to the submit directory. If
-that lands on a node-local disk, the files vanish when the job ends. Point it
-at project/scratch space explicitly, and remember the checkpoints are large —
-`cleanup_workspace.sh` exists because this got to 124 G once.
+## What is safe on a login node
 
----
+Within the 8-core / 16 GB slice, these are seconds and touch no dataset:
 
-## What does NOT need a GPU
+```bash
+python -m models.test_integer_rule_model --max_seq_len 32
+python -m data.integer_dataset
+python -m models.integer_rule_model --build --max_seq_len 32   # Tracr, CPU
+bash slurm/discover.sh
+wandb sync wandb/offline-run-*
+```
 
-These are small enough for a login node, or for `--cpus-per-task=2`:
+`verify_env.py --quick` skips the 112M forward pass and would fit the slice
+too — but it then stops checking the thing most likely to be broken, so
+prefer the job.
 
-| | why |
-|---|---|
-| `python -m models.test_integer_rule_model` | 75-dim model, 32 checks, seconds |
-| `python -m data.integer_dataset` | prints the split, no tensors of size |
-| `python -m models.integer_rule_model --build` | Tracr compile, CPU-only, needs `requirements-compile.txt` |
-
-`verify_env.py --quick` skips the 112M forward pass and is also login-safe,
-but it then stops checking the thing most likely to be broken.
+Everything else — any training, any evaluation, anything that loads a `.pt`
+dataset, the orchestration pipeline — goes through `sbatch` or `srun`.

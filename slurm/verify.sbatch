@@ -9,9 +9,14 @@
 #    # or with your cluster's settings:
 #    SB_PARTITION=gpu SB_ACCOUNT=myproj sbatch slurm/verify.sbatch
 #
-#  Edit the #SBATCH lines below to match your cluster -- partition names,
-#  account strings and GPU gres syntax differ everywhere, so nothing here can
-#  be right by default.
+#  MBZUAI DANA policy: interactive and debugging workloads -- environment
+#  testing, dependency validation, GPU verification -- must use
+#  --qos=gpu-debug-qos. That is precisely what this job is, so it is set
+#  below. Production training must NOT use this QoS.
+#
+#  Partition, account and gres syntax are site-specific and are NOT in the
+#  policy page, so pass them via SB_PARTITION / SB_ACCOUNT / SB_GRES (see
+#  slurm/discover.sh) rather than hardcoding a guess here.
 # =============================================================================
 #SBATCH --job-name=rasp-verify
 #SBATCH --output=slurm_logs/verify-%j.out
@@ -20,6 +25,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
+#SBATCH --qos=gpu-debug-qos
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
@@ -28,7 +34,9 @@ ENV_NAME="${ENV_NAME:-rasp}"
 
 echo "node      : $(hostname)"
 echo "job       : ${SLURM_JOB_ID:-<none>}"
-echo "gpus      : ${CUDA_VISIBLE_DEVICES:-<none>}"
+# Printed only. Policy forbids SETTING this or otherwise reaching for GPUs
+# Slurm did not allocate; nothing in this repo does.
+echo "gpus      : ${CUDA_VISIBLE_DEVICES:-<none>}  (read-only)"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || \
     echo "nvidia-smi unavailable"
 echo
