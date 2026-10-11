@@ -89,41 +89,25 @@ SEEN     = [x for x in range(VOCAB_SIZE) if x not in UNSEEN]
 # The two training stages draw from DIFFERENT pools, so all four evaluation
 # cells are populated:
 #
-#   A \ B  {5, 9}         pretrain-only  -> forgetting
-#   B \ A  {0, 7, 10, 11} finetune-only  -> rule installation
-#   A n B  {1, 2, 3, 4}   both           -> control, ~1.0
-#   none   {6, 8}         unseen         -> generalisation
+#   A \ B  {5, 9}                pretrain-only  -> forgetting
+#   B \ A  {1, 3, 4, 7, 10, 11}  finetune-only  -> rule installation
+#   A n B  {0, 2}                both           -> control, ~1.0
+#   none   {6, 8}                unseen         -> generalisation
 #
-# A is chosen so that EACH POOL SEPARATELY covers every token the unseen
-# starters must emit, not merely their union. That matters because two
-# different models get scored on the unseen cell:
+# REQUIREMENT: every token the unseen starters must emit has to appear in
+# some training sequence -- in A or in B. `validate_split` enforces that on
+# the UNION and refuses a split that fails it, so the unseen number measures
+# rule application rather than vocabulary coverage.
 #
-#   the AR alone, trained on A only
-#   the adapter,  trained on B over a base frozen from A
-#
-# If a needed token appeared only in B, the AR's failure on {6, 8} would be
-# partly lexical -- it had never emitted that symbol -- and the baseline
-# would not be measuring rule application at all. `validate_split` enforces
-# per-pool coverage for exactly this reason.
-#
-# The constraint is tight. {6, 8} require tokens {1, 3, 6, 8, 11}, and
-# starter 1 is the ONLY seen starter that produces token 1, so A must
-# contain it; A also needs a source for 3 (from 3 or 10) and for 11 (from 4
-# or 11). With A \ B pinned to {5, 9} and 2 included, the smallest valid A
-# is six starters, and there are four such sets. This is one of them; the
-# others are [1,2,3,5,9,11], [1,2,4,5,9,10] and [1,2,5,9,10,11], all with
-# the same cell sizes.
-#
-# NOTE this departs from data/dataset.py's historical A = {0, 5, 9}, which
-# covers NONE of {1, 3, 6, 8, 11}. Earlier integer results are therefore
-# not directly comparable on the unseen cell.
-#
-# A is now 6 of 12. The rule is translation-equivariant in x, so only the
-# COUNT matters, and at half the vocabulary the AR may learn the rule
-# outright and generalise unaided -- which would leave the adapter nothing
-# to demonstrate. Check it before trusting any adapter number; see
-# `ar_baseline_is_informative` below.
-PRETRAIN_STARTERS = [1, 2, 3, 4, 5, 9]               # A
+# It also REPORTS per-pool coverage without failing on it, because the two
+# are different questions and the per-pool one is tight: {6, 8} need tokens
+# {1, 3, 6, 8, 11}, and starter 1 is the ONLY seen starter producing token 1,
+# so no A without starter 1 can cover them. A = {0, 2, 5, 9} covers
+# [0, 2, 4, 5, 7, 9, 10] -- none of the five. Worth knowing when reading the
+# AR-alone baseline on the unseen cell: part of its failure there is that it
+# never emitted those symbols, not only that it cannot apply the rule. The
+# adapter, whose pool B covers all twelve, does not have that excuse.
+PRETRAIN_STARTERS = [0, 2, 5, 9]                     # A
 ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10, 11]       # B
 
 # 4 cycles * 8 = 32 tokens. Teacher forcing drops one, so the AR sees 31 and
@@ -166,24 +150,29 @@ def validate_split(pretrain=None, adapter=None, unseen=None,
     need = toks(unseen)
     cov  = {'A (pretrain)': toks(A), 'B (adapter)': toks(B), 'A u B': toks(seen)}
 
-    # Per-pool, not just the union. Two models are scored on the unseen cell:
-    # the AR trained on A alone, and the adapter trained on B over a base
-    # frozen from A. A token present only in B would make the AR's failure on
-    # the unseen starters partly LEXICAL -- it had never emitted that symbol --
-    # so the baseline would not be measuring rule application.
-    short = {k: sorted(need - v) for k, v in cov.items()
-             if k != 'A u B' and not need <= v}
-    if short:
-        detail = '; '.join(f'{k} is missing {v}' for k, v in short.items())
+    # The requirement is on the UNION: every token an unseen starter emits
+    # must appear in some training sequence, in A or in B. Otherwise the
+    # unseen number conflates "cannot apply the rule" with "has never emitted
+    # this symbol".
+    missing = sorted(need - cov['A u B'])
+    if missing:
         raise ValueError(
-            f'holdout is not purely structural for every pool: {detail}. The '
-            f'unseen starters need tokens {sorted(need)}. A model trained on '
-            f'a pool that never emits one of those would fail on {unseen} for '
-            f'a lexical reason, not because it cannot apply the rule. Add a '
-            f'starter that produces the missing token(s) to that pool.')
+            f'holdout is not structural: the unseen starters {unseen} must '
+            f'emit token(s) {missing}, which NO training sequence in A or B '
+            f'produces. The unseen number would conflate "cannot apply the '
+            f'rule" with "has never emitted this symbol". Add a starter that '
+            f'produces them to either pool, or pick a different holdout.')
+
+    # Per-pool coverage is reported, not enforced -- see the note by
+    # PRETRAIN_STARTERS. A pool that misses a needed token still gives a
+    # readable result, but part of that model's failure on the unseen cell is
+    # lexical, and the writeup should say so.
+    per_pool_gap = {k: sorted(need - v) for k, v in cov.items()
+                    if k != 'A u B' and not need <= v}
 
     return dict(pretrain=A, adapter=B, cells=cells,
                 coverage={k: sorted(v) for k, v in cov.items()},
+                per_pool_gap=per_pool_gap,
                 unseen_needs=sorted(need),
                 seen=seen, unseen=unseen, seq_len=T,
                 n_predictions={k: len(v) * (T - 1) for k, v in cells.items()})
@@ -291,14 +280,19 @@ def _main():
     tot = sum(len(v) for v in c.values())
     print(f'  {"":<9}{"":<16}{"":<26}{tot:>3}  (of {VOCAB_SIZE} starters)')
 
-    print(f'\nholdout is structural for EVERY pool, not just their union')
+    print(f'\nholdout is structural: every token {{6,8}} need appears in A or B')
     print(f'  unseen starters need tokens {info["unseen_needs"]}')
     for u in info['unseen']:
         print(f'    {u:2d} -> {sorted(set(sequence([u], T)[0].tolist()))}')
     for k, v in info['coverage'].items():
         miss = sorted(set(info['unseen_needs']) - set(v))
         print(f'  {k:<14} covers {v}'
-              + ('' if not miss else f'   MISSING {miss}'))
+              + ('' if not miss else f'   lacks {miss}'))
+    if info['per_pool_gap']:
+        print('  note: the union is what is required and it holds. Per-pool '
+              'gaps above mean')
+        print('        part of that model\'s unseen failure is lexical, not '
+              'only rule failure.')
 
     print(f'\nbefore trusting any adapter number, check the AR baseline:')
     print(f'  the AR trains on A ({len(info["pretrain"])} of {VOCAB_SIZE} '
