@@ -38,16 +38,37 @@ scratch (`$TMPDIR`) and only writing the final `.pt` files to `/l/`.
 The `.pt` datasets and checkpoints are large and few, which is the pattern
 Lustre wants. It is the MIDI intermediates that are the problem.
 
-## DANA partitions
+## Partition and QoS are PAIRED — mismatching them gets the job rejected
 
-| partition | type | nodes | notes |
+| workload | partition | QoS | limits |
 |---|---|---|---|
-| `long` | GPU | 39 | **default partition**; what the job scripts here request |
-| `cscc-gpu-p` | GPU | 16 | fall back if `long` is saturated |
-| `cscc-cpu-p` | CPU | 16 | CPU-only — data prep, not training |
+| large / general GPU | `long` | `gpu-12` | **12 GPUs, 8 jobs, 72 h** |
+| standard GPU | `cscc-gpu-p` | `cscc-gpu-qos` | 4 GPUs/account, 2 node-jobs, 24 h |
+| interactive / debugging | `cscc-gpu-p` | `gpu-debug-qos` | short work only |
+| CPU only | `cscc-cpu-p` | `cscc-cpu-qos` | 512 cores, 2 jobs, 72 h |
 
-55 GPU nodes, 16 CPU nodes, 71 total. The `cscc` prefix is a legacy SLURM
-identifier only; all three are DANA.
+Minimum GPU request on either GPU partition is 1. `long` has 39 nodes,
+`cscc-gpu-p` 16, `cscc-cpu-p` 16 (71 total). The `cscc` prefix is a legacy
+SLURM identifier; all three are DANA.
+
+Don't memorise the pairing — `slurm/submit.sh` applies it and refuses
+anything over a cap:
+
+```bash
+bash slurm/submit.sh -- python -m midi_adapter.train_cp_yinyang ...  # long/gpu-12
+bash slurm/submit.sh --debug -- python verify_env.py          # cscc-gpu-p/debug
+bash slurm/submit.sh --cpu --cpus 32 -- python -m midi_adapter.filter_nottingham ...
+bash slurm/submit.sh --dry --gpus 4 -- python -m ...          # print, don't submit
+
+# REFUSING: 16 GPUs exceeds the 12-GPU cap on long/gpu-12
+# REFUSING: 48:00:00 exceeds the 24h limit on cscc-gpu-p/cscc-gpu-qos
+```
+
+It also sets `WANDB_MODE=offline`, picks the example configs' CPU/RAM shapes
+(8 cpu / 64 G for one GPU, 16 cpu / 230 G for four), and switches to `srun`
+with `--ntasks-per-node=N` when you ask for more than one GPU.
+
+`--mail-type` / `--mail-user` are unavailable on DANA and are not used.
 
 ## Setup
 
@@ -123,16 +144,16 @@ Single GPU with one task is unaffected. Stay within the 12-GPU cap.
 
 ### 3. Wall time, preemption and requeue
 
-The partition is called `long`, but that is a name, not a guarantee — check
-the real `MaxWall` from `discover.sh` against the runs you intend:
+**MaxWall is 72 h on `long`, 24 h on `cscc-gpu-p`.** Against the runs here:
 
 | run | steps |
 |---|---|
 | chord adapter (`run_adapter_tracr.sh`) | 40,000 (8,000 for the short variants) |
 | CP base pretrain (`pretrain_cp_bass.py`) | 200,000 |
 
-If a run does not fit one job, checkpoint-and-requeue is mandatory, not
-optional. Lightning's `SLURMEnvironment` auto-requeues on `SIGUSR1`, which
+72 h is generous for the adapter runs. The 200k-step CP base pretrain is
+the one at risk, and if it does not fit, checkpoint-and-requeue is
+mandatory rather than optional. Lightning's `SLURMEnvironment` auto-requeues on `SIGUSR1`, which
 only helps if the job can resume:
 
 ```bash

@@ -14,21 +14,22 @@
 #  --qos=gpu-debug-qos. That is precisely what this job is, so it is set
 #  below. Production training must NOT use this QoS.
 #
-#  DANA has three partitions:
-#      long         GPU, 39 nodes, the DEFAULT partition  <- used here
-#      cscc-gpu-p   GPU, 16 nodes  (fall back if `long` is saturated)
-#      cscc-cpu-p   CPU, 16 nodes  (no GPU, so not for this job)
-#  Account and the exact gres syntax are not documented; override with
-#  SB_ACCOUNT / SB_GRES. `slurm/discover.sh` prints what this site accepts.
+#  Partition and QoS are PAIRED on DANA -- gpu-debug-qos belongs to
+#  cscc-gpu-p, not to `long`. The documented matrix:
+#      cscc-gpu-p + cscc-gpu-qos   standard GPU work
+#      cscc-gpu-p + gpu-debug-qos  interactive / debugging   <- this job
+#      long       + gpu-12         large & general GPU work
+#      cscc-cpu-p + cscc-cpu-qos   CPU-only work
+#  Pairing them wrongly gets the job rejected.
 # =============================================================================
 #SBATCH --job-name=rasp-verify
 #SBATCH --output=slurm_logs/verify-%j.out
 #SBATCH --error=slurm_logs/verify-%j.out
 #SBATCH --time=00:20:00
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=40G
 #SBATCH --gres=gpu:1
-#SBATCH --partition=long
+#SBATCH --partition=cscc-gpu-p
 #SBATCH --qos=gpu-debug-qos
 
 set -uo pipefail
