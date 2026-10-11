@@ -200,6 +200,54 @@ def main():
           pred[-1] == next_token([3], L)[0, -1],
           f'{pred[-1]} == {next_token([3], L)[0, -1]}')
 
+    # PREFIX CONSISTENCY -- the real content of "behaves like an AR hidden
+    # state". It is not enough that hidden[q] encodes token q+1; hidden[q]
+    # must also be the SAME whether the model has seen only tokens 0..q or
+    # the whole sequence. Without this, teacher-forced training and
+    # step-by-step generation inject different rule signals at the same
+    # position, and the adapter is trained on something it never sees at
+    # inference. Tracr compiles causal=False, so this is the property that
+    # justifies IntegerRuleModel defaulting to causal=True.
+    full = torch.as_tensor(sequence([9], 8))
+    h_full, _ = m.from_tokens(full)
+    pfx = {}
+    for causal in (True, False):
+        worst_pfx = pfx[causal] = max(
+            float((m.from_tokens(full[:, :L], causal=causal)[0][0, :L]
+                   - h_full[0, :L]).abs().max())
+            for L in range(1, 9))
+        # BOTH seed modes are prefix-consistent, including 'every_cycle'.
+        # That is worth being explicit about, because it is easy to reason --
+        # wrongly -- that because 'every_cycle' reads positions 0, 4, 8...,
+        # appending token 4 must change hidden[2]. It cannot: the causal mask
+        # blocks every key k > q, so a longer sequence adds keys that position
+        # q never sees. Context-dependence (which EARLIER tokens matter) and
+        # prefix-consistency (whether LATER tokens matter) are different
+        # properties, and only the first distinguishes the two modes.
+        if causal:
+            check('prefix-consistent at causal=True (EXACT, both seed modes)',
+                  worst_pfx < 1e-9, f'max|prefix - full| = {worst_pfx:.3e}')
+        else:
+            # Without the mask the selector can match keys beyond q, so the
+            # softmax tail over future positions leaks into earlier states.
+            # The leak scales with how many keys the selector matches: ~1e-7
+            # for 'first' (one key) and ~1e-4 for 'every_cycle' (T/4 keys).
+            # Small either way, but nonzero and mode-dependent -- which is
+            # exactly why IntegerRuleModel defaults to causal=True rather
+            # than inheriting Tracr's causal=False.
+            check('causal=False leaks, and leaks more when more keys match',
+                  0 < worst_pfx < 1e-3,
+                  f'max|prefix - full| = {worst_pfx:.3e} '
+                  f'({"one key" if a.seed_mode == "first" else "T/4 keys"})')
+
+    # Closing the loop: generate from a one-token prompt by feeding the
+    # model's own output back, which is how it will actually be driven.
+    ctx = [9]
+    for _ in range(7):
+        ctx.append(int(m.from_tokens(torch.tensor([ctx]))[1].argmax(-1)[0, -1]))
+    check('incremental generation from a 1-token prompt reproduces the rule',
+          ctx == full[0].tolist(), f'{ctx}')
+
     # -- 5. frozen but differentiable -------------------------------------
     print('\n5. frozen to the optimizer, differentiable to the input')
     check('parameters() is empty', len(list(m.parameters())) == 0)
