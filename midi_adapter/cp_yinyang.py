@@ -620,10 +620,27 @@ class CPYinyangTransformer(nn.Module):
         Bass approach  : encodes cur_pc[t] = (key + OFFSETS[t%4]) % 12
         Chord approach : encodes observed chromagram from all voices
 
-        Returns encoder(input) zero-padded to d_model, plus frozen W_pos[t%4].
+        The encoder output replaces the rule model's W_E lookup in the ROOT
+        subspace (dims 0-11); everything downstream of that stays frozen. Two
+        things this has to get right, both of which it previously did not:
+
+        Phase granularity. The phase must come from the rule model, which owns
+        the slot width. Hardcoding t % 4 is correct only for the bass model
+        (one root per beat); at chord granularity a slot spans
+        subbeats_per_chord beats, so t % 4 cycles 8x too fast at
+        chords_per_bar=2 and the phase subspace is wrong at nearly every
+        position.
+
+        The frozen head. For a rule model with compiled attention, returning
+        encoder + W_pos skips W_Q/W_K/W_V/W_O entirely, so the tonic subspace
+        (dims 12-23) stays identically zero and the key is never retrieved --
+        the adapter is handed a rule signal with the retrieval removed. The
+        tonic slot is left at zero here so the frozen head is the only thing
+        that can fill it, mirroring the bidirectional proxy path.
         """
-        t_idx   = torch.arange(x_proc.shape[1], device=x_proc.device)
-        d       = self.rule_model.d_model
+        B, T   = x_proc.shape[0], x_proc.shape[1]
+        device = x_proc.device
+        d      = self.rule_model.d_model
 
         if self.approach == 'chord':
             chroma = self._extract_chromagram(x_proc)            # (B, T, 12)
@@ -632,9 +649,27 @@ class CPYinyangTransformer(nn.Module):
             cur_pc = self._cur_pc(x_proc)                        # (B, T)
             enc    = self.rule_input_encoder(cur_pc)             # (B, T, 12)
 
-        h       = F.pad(enc, (0, d - enc.shape[-1]))             # (B, T, d_model)
-        pos_emb = self.rule_model.W_pos[t_idx % 4]              # (T, d_model)
-        return h + pos_emb.unsqueeze(0)
+        # --- phase, at whatever granularity this rule model uses -----------
+        rm = self.rule_model
+        if hasattr(rm, 'pos_embed'):
+            # ChordTracrRuleModel / ChordRaspCompiled: (1, T, d), chord slots.
+            pos_emb = rm.pos_embed(T, device).to(enc.dtype)
+        elif hasattr(rm, '_bar_phase'):
+            # CPChordRuleModel: bar-level phase, no pos_embed helper.
+            phase   = rm._bar_phase(torch.arange(T, device=device))
+            pos_emb = rm.W_pos[phase].unsqueeze(0).to(enc.dtype)
+        else:
+            # BassTracrRuleModel: one root per beat, so t % 4 is the phase.
+            t_idx   = torch.arange(T, device=device)
+            pos_emb = rm.W_pos[t_idx % N_POS].unsqueeze(0).to(enc.dtype)
+
+        # --- frozen compiled head, where the rule model has one ------------
+        if hasattr(rm, 'run_attention'):
+            h = torch.cat([enc, torch.zeros_like(enc)], dim=-1)  # tonic slot = 0
+            h = F.pad(h, (0, d - h.shape[-1])) + pos_emb
+            return rm.run_attention(h)
+
+        return F.pad(enc, (0, d - enc.shape[-1])) + pos_emb
 
     def get_encoder_logits(self, x_proc: torch.Tensor):
         """Raw encoder output and its paired ground-truth target.
