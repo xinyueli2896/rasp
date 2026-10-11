@@ -59,6 +59,23 @@ LOGDIR="${LOGDIR:-run_logs}"
 DRY="${DRY:-0}"
 PIPELINE="${PIPELINE:-0}"
 
+# ── split / vocabulary, for running an experiment other than the default ──
+# These are passed verbatim to both trainers, and the checkpoint infix is
+# rebuilt here exactly as the trainers build it, so the chain's --ar_ckpt
+# points at the file its own pretrain step just wrote.
+VOCAB="${VOCAB:-}"; PRETRAIN="${PRETRAIN:-}"; ADAPTER_POOL="${ADAPTER_POOL:-}"
+UNSEEN="${UNSEEN:-}"; SPLIT_TAG="${SPLIT_TAG:-}"
+SF=""
+[ -n "$VOCAB" ]        && SF="$SF --vocab_size $VOCAB"
+[ -n "$PRETRAIN" ]     && SF="$SF --pretrain $PRETRAIN"
+[ -n "$ADAPTER_POOL" ] && SF="$SF --adapter_pool $ADAPTER_POOL"
+[ -n "$UNSEEN" ]       && SF="$SF --unseen $UNSEEN"
+[ -n "$SPLIT_TAG" ]    && SF="$SF --split_tag $SPLIT_TAG"
+SFX=""
+[ -n "$VOCAB" ] && [ "$VOCAB" != 12 ] && SFX="_v$VOCAB"
+[ -n "$SPLIT_TAG" ] && SFX="${SFX}_${SPLIT_TAG}"
+[ -n "$SF" ] && echo "split flags:$SF   checkpoint infix: '${SFX}'"
+
 # GPUs: honour $GPUS, else every visible device, else CPU.
 if [ -n "${GPUS:-}" ]; then
     read -r -a GPU <<<"$GPUS"
@@ -119,18 +136,18 @@ if [ "$PIPELINE" = 1 ]; then
     pids=(); names=(); i=0
     for s in $SEEDS; do
         g="${GPU[$((i % ${#GPU[@]}))]}"; dev="$(dev_of "$g")"; i=$((i+1))
-        AR="checkpoints/ar_integer_seed${s}.pt"
-        B="python -m training.finetune_adapter_integer --seed $s --ar_ckpt $AR"
+        AR="checkpoints/ar_integer${SFX}_seed${s}.pt"
+        B="python -m training.finetune_adapter_integer --seed $s --ar_ckpt $AR $SF"
         chain=()
-        want pretrain && chain+=("python -m training.pretrain_integer --seed $s")
+        want pretrain && chain+=("python -m training.pretrain_integer --seed $s $SF")
         want finetune && chain+=("$B --mode finetune")
         want adapter  && chain+=("$B --mode adapter")
         want lora     && chain+=("$B --mode adapter --lora_rank $LORA_RANK")
         want trainar  && chain+=("$B --mode adapter --train_ar")
         want enc      && chain+=("$B --mode adapter --rule_input encoder")
         want encsup   && chain+=("$B --mode adapter --rule_input encoder --proxy_loss_weight $PROXY_W")
-        want scratch  && chain+=("python -m training.finetune_adapter_integer --seed $s --mode scratch")
-        want joint    && chain+=("python -m training.finetune_adapter_integer --seed $s --mode joint_scratch")
+        want scratch  && chain+=("python -m training.finetune_adapter_integer --seed $s --mode scratch $SF")
+        want joint    && chain+=("python -m training.finetune_adapter_integer --seed $s --mode joint_scratch $SF")
         [ ${#chain[@]} -eq 0 ] && continue
         printf '  seed %-3s %-9s %d step(s) -> %s/chain_seed%s.log\n' \
                "$s" "$dev" "${#chain[@]}" "$LOGDIR" "$s"
@@ -161,7 +178,7 @@ fi
 P1=()
 if want pretrain; then
     for s in $SEEDS; do
-        P1+=("pretrain_seed${s}	python -m training.pretrain_integer --seed $s")
+        P1+=("pretrain_seed${s}	python -m training.pretrain_integer --seed $s $SF")
     done
 fi
 run_phase "phase 1  AR pretrain" "${P1[@]}" || exit 1
@@ -169,15 +186,15 @@ run_phase "phase 1  AR pretrain" "${P1[@]}" || exit 1
 # ── phase 2: everything that reads an AR checkpoint ──────────────────────
 P2=()
 for s in $SEEDS; do
-    AR="checkpoints/ar_integer_seed${s}.pt"
+    AR="checkpoints/ar_integer${SFX}_seed${s}.pt"
     if want finetune || want adapter || want lora || want trainar; then
         if [ "$DRY" != 1 ] && [ ! -f "$AR" ]; then
             echo "missing $AR -- run the pretrain row for seed $s first:" >&2
-            echo "  SEEDS=$s bash training/run_seeds.sh pretrain" >&2
+            echo "  SEEDS=$s bash training/run_seeds.sh pretrain  (with the same split vars)" >&2
             exit 1
         fi
     fi
-    B="python -m training.finetune_adapter_integer --seed $s --ar_ckpt $AR"
+    B="python -m training.finetune_adapter_integer --seed $s --ar_ckpt $AR $SF"
     want finetune && P2+=("finetune_seed${s}	$B --mode finetune")
     want adapter  && P2+=("adapter_frozen_seed${s}	$B --mode adapter")
     want lora     && P2+=("adapter_lora${LORA_RANK}_seed${s}	$B --mode adapter --lora_rank $LORA_RANK")
@@ -185,7 +202,7 @@ for s in $SEEDS; do
     want enc      && P2+=("adapter_enc_seed${s}	$B --mode adapter --rule_input encoder")
     want encsup   && P2+=("adapter_encsup_seed${s}	$B --mode adapter --rule_input encoder --proxy_loss_weight $PROXY_W")
     # scratch runs need no AR checkpoint: they build one.
-    S="python -m training.finetune_adapter_integer --seed $s"
+    S="python -m training.finetune_adapter_integer --seed $s $SF"
     want scratch  && P2+=("scratch_seed${s}	$S --mode scratch")
     want joint    && P2+=("joint_scratch_seed${s}	$S --mode joint_scratch")
 done
