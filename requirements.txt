@@ -1,14 +1,17 @@
 # Core — everything needed to TRAIN and EVALUATE.
 #
-# Versions after the comment are what this repo is currently verified against
-# (Python 3.11). The floors are what the code actually requires; the exact
-# pins are a fallback if a newer release breaks something.
+# Versions after the comment are what this repo has been run against. The
+# floors are what the code actually requires.
+#
+# Python 3.10 and 3.11 both work. Every module carries
+# `from __future__ import annotations` and nothing uses 3.11-only syntax, so
+# an existing 3.10 environment does NOT need rebuilding.
 
-torch>=2.0.0                 # verified: 2.14.1+cu130
-numpy>=1.24.0                # verified: 2.4.6
+torch>=2.0.0                 # verified: 2.13.0, 2.14.1+cu130
+numpy>=1.24.0                # verified: 2.2.6, 2.4.6
 pytorch_lightning>=2.0.0     # verified: 2.6.6   (NOT the `lightning` package —
                              #   every module does `import pytorch_lightning as L`)
-transformers>=4.30.0         # verified: 5.18.0
+transformers>=4.30.0         # verified: 4.49.0, 5.18.0
 pretty_midi>=0.2.10          # verified: 0.2.11.post0
 wandb                        # pytorch_lightning.loggers.WandbLogger is imported
                              #   unconditionally by the trainers; set

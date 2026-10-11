@@ -50,7 +50,23 @@ def main() -> int:
 
     print(f'python {sys.version.split()[0]}   repo {ROOT}')
 
-    # -- 1. core packages --------------------------------------------------
+    # -- 0. is the interpreter the one you think? -------------------------
+    # `pip install` saying "Defaulting to user installation because normal
+    # site-packages is not writeable" while a conda env is active means the
+    # packages are going to ~/.local, not the env. They may still import --
+    # but they shadow the env for EVERY python of that minor version, so a
+    # later `conda activate other_env` silently inherits them.
+    print('\n0. interpreter and where packages come from')
+    import site
+    print(f'  exe    {sys.executable}')
+    print(f'  prefix {sys.prefix}')
+    in_env = sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+    conda  = os.environ.get('CONDA_DEFAULT_ENV')
+    usersite = site.getusersitepackages() if site.ENABLE_USER_SITE else None
+    print(f'  env    {"conda:" + conda if conda else ("venv" if in_env else "system python")}')
+    if usersite and os.path.isdir(usersite):
+        print(f'  user   {usersite}  (shadows the env for all python'
+              f'{sys.version_info.major}.{sys.version_info.minor})')
     print('\n1. core packages')
     for mod, why in [('torch', 'everything'),
                      ('numpy', 'everything'),
@@ -60,7 +76,9 @@ def main() -> int:
                      ('wandb', 'imported unconditionally by the trainers')]:
         try:
             m = importlib.import_module(mod)
-            ok(f'{mod:20s} {getattr(m, "__version__", "?")}', True, why)
+            loc = getattr(m, '__file__', '') or ''
+            tag = ' [user-site]' if '/.local/' in loc else ''
+            ok(f'{mod:20s} {getattr(m, "__version__", "?")}{tag}', True, why)
         except ImportError as e:
             ok(f'{mod:20s} MISSING', False, f'{why} — {e}')
 
