@@ -120,6 +120,9 @@ def main():
                    help='Override pool B.')
     p.add_argument('--unseen', type=int, nargs='+', default=None,
                    help='Override the holdout.')
+    p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE,
+                   help='Must match a compiled rule model in '
+                        'models/compiled_rules/ (v12 and v24 are committed).')
     p.add_argument('--split_tag', type=str, default='',
                    help='Short label folded into the checkpoint name so a '
                         'sweep over splits does not overwrite itself.')
@@ -133,7 +136,7 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     dev = torch.device(a.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     info = validate_split(a.pretrain, a.adapter_pool, a.unseen,
-                          n_cycles=a.n_cycles)
+                          n_cycles=a.n_cycles, vocab_size=a.vocab_size)
     cells = info['cells']
 
     print(f'device   : {dev}   mode: {a.mode}')
@@ -175,7 +178,7 @@ def main():
         blob = torch.load(a.ar_ckpt, map_location='cpu', weights_only=False)
         ab = blob['args']
         model = AutoregressiveTransformer(
-            vocab_size=VOCAB_SIZE, max_seq_len=4 * a.n_cycles + 8,
+            vocab_size=a.vocab_size, max_seq_len=4 * a.n_cycles + 8,
             d_model=ab['d_model'], n_layers=ab['n_layers'],
             n_heads=ab['n_heads']).to(dev)
         model.load_state_dict(blob['state_dict'])
@@ -183,7 +186,7 @@ def main():
               f'(ALL of the AR -- this is the forgetting control)')
     else:
         ar = AutoregressiveTransformer(
-            vocab_size=VOCAB_SIZE, max_seq_len=4 * a.n_cycles + 8,
+            vocab_size=a.vocab_size, max_seq_len=4 * a.n_cycles + 8,
             d_model=a.d_model, n_layers=a.n_layers, n_heads=a.ar_n_heads)
         if a.mode == 'scratch':
             model = ar.to(dev)
@@ -216,7 +219,8 @@ def main():
                                       n_repeats=a.n_repeats,
                                       pretrain=a.pretrain,
                                       adapter=a.adapter_pool,
-                                      unseen=a.unseen)
+                                      unseen=a.unseen,
+                                      vocab_size=a.vocab_size)
     params = [q for q in model.parameters() if q.requires_grad]
     crit, opt = nn.CrossEntropyLoss(), optim.AdamW(
         params, lr=a.lr, weight_decay=a.weight_decay)
@@ -228,7 +232,7 @@ def main():
         for x, y in train_loader:
             x, y = x.to(dev), y.to(dev)
             logits = model(x)
-            loss = crit(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1))
+            loss = crit(logits.reshape(-1, a.vocab_size), y.reshape(-1))
             if a.proxy_loss_weight > 0 and hasattr(model, 'encoder_loss'):
                 el = model.encoder_loss(x)
                 if el is not None:
@@ -270,7 +274,8 @@ def main():
         tag += f'-enc{a.encoder_hidden or "lin"}'
         if a.proxy_loss_weight > 0:
             tag += f'-sup{a.proxy_loss_weight:g}'
-    sfx  = f'_{a.split_tag}' if a.split_tag else ''
+    sfx  = (f'_v{a.vocab_size}' if a.vocab_size != VOCAB_SIZE else '')
+    sfx += f'_{a.split_tag}' if a.split_tag else ''
     name = a.ckpt_name or f'integer_{tag}{sfx}_{a.rule_slice}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)
     path = os.path.join(a.ckpt_dir, name)

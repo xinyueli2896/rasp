@@ -109,6 +109,9 @@ def main():
                    help='Override pool B.')
     p.add_argument('--unseen', type=int, nargs='+', default=None,
                    help='Override the holdout.')
+    p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE,
+                   help='Must match a compiled rule model in '
+                        'models/compiled_rules/ (v12 and v24 are committed).')
     p.add_argument('--split_tag', type=str, default='',
                    help='Short label folded into the checkpoint name so a '
                         'sweep over splits does not overwrite itself.')
@@ -124,7 +127,7 @@ def main():
     dev = torch.device(a.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
     info = validate_split(a.pretrain, a.adapter_pool, a.unseen,
-                          n_cycles=a.n_cycles)
+                          n_cycles=a.n_cycles, vocab_size=a.vocab_size)
     cells = info['cells']
     print(f'device       : {dev}')
     print(f'A  pretrain  : {info["pretrain"]}')
@@ -138,10 +141,10 @@ def main():
     train_loader, _ = get_dataloaders(
         'pretrain', batch_size=a.batch_size, n_cycles=a.n_cycles,
         n_repeats=a.n_repeats, pretrain=a.pretrain, adapter=a.adapter_pool,
-        unseen=a.unseen)
+        unseen=a.unseen, vocab_size=a.vocab_size)
 
     model = AutoregressiveTransformer(
-        vocab_size=VOCAB_SIZE, max_seq_len=4 * a.n_cycles + 8,
+        vocab_size=a.vocab_size, max_seq_len=4 * a.n_cycles + 8,
         d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads).to(dev)
     n_par = sum(q.numel() for q in model.parameters())
     print(f'model        : d_model={a.d_model} layers={a.n_layers} '
@@ -157,7 +160,7 @@ def main():
         for x, y in train_loader:
             x, y = x.to(dev), y.to(dev)
             logits = model(x)
-            loss = crit(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1))
+            loss = crit(logits.reshape(-1, a.vocab_size), y.reshape(-1))
             optim_.zero_grad(); loss.backward(); optim_.step()
             tot  += loss.item() * y.numel()
             hits += int((logits.argmax(-1) == y).sum()); n += y.numel()
@@ -181,7 +184,8 @@ def main():
 
     print(f'\n{ar_baseline_is_informative(acc)}')
 
-    sfx  = f'_{a.split_tag}' if a.split_tag else ''
+    sfx  = (f'_v{a.vocab_size}' if a.vocab_size != VOCAB_SIZE else '')
+    sfx += f'_{a.split_tag}' if a.split_tag else ''
     name = a.ckpt_name or f'ar_integer{sfx}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)
     path = os.path.join(a.ckpt_dir, name)

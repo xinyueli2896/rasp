@@ -52,6 +52,14 @@ def main():
                    choices=['first', 'every_cycle'])
     a = p.parse_args()
     V, T = a.vocab_size, a.max_seq_len
+    # Bind the oracles to the vocabulary being tested. Without this they
+    # default to the module's VOCAB_SIZE and silently generate mod-12
+    # sequences while the model under test is mod-24 -- four checks failed
+    # that way, all of them the test's fault rather than the model's.
+    global sequence, next_token
+    _seq, _nxt = sequence, next_token
+    sequence   = lambda xs, L, **kw: _seq(xs, L, vocab_size=V, **kw)
+    next_token = lambda xs, L, **kw: _nxt(xs, L, vocab_size=V, **kw)
 
     try:
         import tracr  # noqa: F401

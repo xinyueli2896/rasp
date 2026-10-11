@@ -128,13 +128,19 @@ SEQ_LEN  = PERIOD * N_CYCLES
 
 
 def validate_split(pretrain=None, adapter=None, unseen=None,
-                   n_cycles: int = N_CYCLES) -> dict:
+                   n_cycles: int = N_CYCLES,
+                   vocab_size: int = VOCAB_SIZE) -> dict:
     """Check the four-way split. Raises if it is malformed or leaky."""
     A      = list(PRETRAIN_STARTERS if pretrain is None else pretrain)
     B      = list(ADAPTER_STARTERS  if adapter  is None else adapter)
     unseen = list(UNSEEN if unseen is None else unseen)
     T      = PERIOD * n_cycles
     seen   = sorted(set(A) | set(B))
+    V      = vocab_size
+    oob = [x for x in A + B + unseen if not 0 <= x < V]
+    if oob:
+        raise ValueError(f'starter(s) {sorted(set(oob))} outside the vocabulary '
+                         f'[0, {V}). Pass --vocab_size to match the split.')
 
     leak = set(unseen) & set(seen)
     if leak:
@@ -155,7 +161,7 @@ def validate_split(pretrain=None, adapter=None, unseen=None,
             f'partition claims to.')
 
     toks = lambda xs: set().union(
-        *[set(sequence([x], T)[0].tolist()) for x in xs]) if xs else set()
+        *[set(sequence([x], T, V)[0].tolist()) for x in xs]) if xs else set()
     need = toks(unseen)
     cov  = {'A (pretrain)': toks(A), 'B (adapter)': toks(B), 'A u B': toks(seen)}
 
@@ -179,7 +185,7 @@ def validate_split(pretrain=None, adapter=None, unseen=None,
     per_pool_gap = {k: sorted(need - v) for k, v in cov.items()
                     if k != 'A u B' and not need <= v}
 
-    return dict(pretrain=A, adapter=B, cells=cells,
+    return dict(pretrain=A, adapter=B, cells=cells, vocab_size=V,
                 coverage={k: sorted(v) for k, v in cov.items()},
                 per_pool_gap=per_pool_gap,
                 unseen_needs=sorted(need),
@@ -196,9 +202,11 @@ class IntegerRuleDataset(Dataset):
     like data augmentation.
     """
 
-    def __init__(self, starters, n_cycles: int = N_CYCLES, n_repeats: int = 1):
+    def __init__(self, starters, n_cycles: int = N_CYCLES, n_repeats: int = 1,
+                 vocab_size: int = VOCAB_SIZE):
         self.starters = list(starters)
-        seqs = torch.as_tensor(sequence(self.starters, PERIOD * n_cycles))
+        seqs = torch.as_tensor(
+            sequence(self.starters, PERIOD * n_cycles, vocab_size))
         if n_repeats > 1:
             seqs = seqs.repeat(n_repeats, 1)
         self.inputs  = seqs[:, :-1].contiguous().long()
@@ -213,7 +221,8 @@ class IntegerRuleDataset(Dataset):
 
 def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
                     n_cycles: int = N_CYCLES, n_repeats: int = 200,
-                    pretrain=None, adapter=None, unseen=None):
+                    pretrain=None, adapter=None, unseen=None,
+                    vocab_size: int = VOCAB_SIZE):
     """-> (train_loader, eval_loaders) with one eval loader PER CELL.
 
     stage picks which pool to train on: 'pretrain' trains on A, 'adapter'
@@ -223,7 +232,7 @@ def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
     if stage not in ('pretrain', 'adapter', 'union'):
         raise ValueError(
             f"stage must be 'pretrain', 'adapter' or 'union', got {stage!r}")
-    info = validate_split(pretrain, adapter, unseen, n_cycles)
+    info = validate_split(pretrain, adapter, unseen, n_cycles, vocab_size)
 
     # 'union' = A u B, for single-stage runs that train from scratch. Note
     # this collapses the evaluation partition: pretrain_only, finetune_only
@@ -232,8 +241,8 @@ def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
     # runs, but for this stage they are three in-distribution subsets.
     pool = {'pretrain': info['pretrain'], 'adapter': info['adapter'],
             'union': info['seen']}[stage]
-    train = IntegerRuleDataset(pool, n_cycles, n_repeats)
-    evals = {k: IntegerRuleDataset(v, n_cycles, 1)
+    train = IntegerRuleDataset(pool, n_cycles, n_repeats, vocab_size)
+    evals = {k: IntegerRuleDataset(v, n_cycles, 1, vocab_size)
              for k, v in info['cells'].items()}
     return (
         DataLoader(train, batch_size=batch_size, shuffle=True),
@@ -269,12 +278,15 @@ def _main():
     p.add_argument('--adapter',  type=int, nargs='+', default=ADAPTER_STARTERS)
     p.add_argument('--unseen',   type=int, nargs='+', default=UNSEEN)
     p.add_argument('--n_cycles', type=int, default=N_CYCLES)
+    p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE)
     a = p.parse_args()
 
-    info = validate_split(a.pretrain, a.adapter, a.unseen, a.n_cycles)
+    info = validate_split(a.pretrain, a.adapter, a.unseen, a.n_cycles,
+                          a.vocab_size)
     c, T = info['cells'], info['seq_len']
 
-    print(f'rule        : token[i] = (x + {OFFSETS}[i % {PERIOD}]) % {VOCAB_SIZE}')
+    V = info['vocab_size']
+    print(f'rule        : token[i] = (x + {OFFSETS}[i % {PERIOD}]) % {V}')
     print(f'seq_len     : {T}  ({a.n_cycles} cycles); AR sees {T - 1} after '
           f'teacher forcing')
     print(f'\ntraining pools')
@@ -294,9 +306,10 @@ def _main():
         print(f'  {label:<9}{k:<16}{str(c[k]):<26}{len(c[k]):>3}'
               f'{info["n_predictions"][k]:>8}  {what[k]}')
     tot = sum(len(v) for v in c.values())
-    print(f'  {"":<9}{"":<16}{"":<26}{tot:>3}  (of {VOCAB_SIZE} starters)')
+    print(f'  {"":<9}{"":<16}{"":<26}{tot:>3}  (of {V} starters)')
 
-    print(f'\nholdout is structural: every token {{6,8}} need appears in A or B')
+    print(f'\nholdout is structural: every token {info["unseen"]} need '
+          f'appears in A or B')
     print(f'  unseen starters need tokens {info["unseen_needs"]}')
     for u in info['unseen']:
         print(f'    {u:2d} -> {sorted(set(sequence([u], T)[0].tolist()))}')
@@ -311,7 +324,7 @@ def _main():
               'only rule failure.')
 
     print(f'\nbefore trusting any adapter number, check the AR baseline:')
-    print(f'  the AR trains on A ({len(info["pretrain"])} of {VOCAB_SIZE} '
+    print(f'  the AR trains on A ({len(info["pretrain"])} of {V} '
           f'starters). The rule is translation-equivariant in x, so if that')
     print(f'  is enough for it to learn the RULE rather than the starters, it')
     print(f'  generalises everywhere and the adapter has nothing to add.')
