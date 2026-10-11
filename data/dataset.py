@@ -3,25 +3,21 @@ Sequence dataset for the modulo rule:
   position i: (x + OFFSETS[i % 4]) % 12
 where OFFSETS = [0, 5, 7, 0] and x is the starting integer.
 
-Current split (vocab=12):
+Splits mirror the bass CP experiment exactly (vocab=12, same counts):
 
-  Pretrain set A = {0, 1, 3, 4}                        – AR pretraining   (4 starters)
-  Finetune set B = {1, 3, 4, 5, 7, 9, 10, 11}          – adapter / FT     (8 starters)
+  Pretrain set  = {0, 5, 9}                           – AR pretraining  (3 starters)
+  Finetune set  = {0, 1, 2, 3, 4, 7, 10, 11}          – adapter training (8 starters)
 
 Four-way evaluation partition:
-  Pretrain-only  = A \ B = {0}                  – seen only during pretraining
-  Finetune-only  = B \ A = {5, 7, 9, 10, 11}    – seen only during finetuning
-  Both           = A ∩ B = {1, 3, 4}            – seen in both stages
-  Neither        =         {6, 8}               – never seen as starters
+  Pretrain-only  = {5, 9}                    – seen only during pretraining  (2 starters)
+  Finetune-only  = {1, 2, 3, 4, 7, 10, 11}  – seen only during finetuning   (7 starters)
+  Both           = {0}                       – seen in both stages            (1 starter)
+  Neither        = {6, 8}                    – never seen as starters;
+                                               tokens {6,11,13,8,13,15} are
+                                               covered by training sequences   (2 starters)
 
-Token coverage for the never-seen starters: seq(6) = 6,11,1,6 and
-seq(8) = 8,1,3,8, so the required tokens are {1, 3, 6, 8, 11}.  All of them
-appear inside training sequences of A ∪ B (6 from starters 1 and 11, 8 from 1
-and 3, 11 from 4, 1 from 1, 3 from 3), so the unseen cells test rule
-composition rather than unseen token embeddings.
-
-Note: starter 2 is in neither pool and is not a test starter, so it is simply
-not evaluated under this split.
+Identical to bass CP key splits: pretrain-only={5,9}, finetune-only={1,2,3,4,7,10,11},
+both={0}, unseen={6,8}.  Enables direct comparison between the two experiments.
 """
 
 import numpy as np
@@ -31,19 +27,19 @@ from torch.utils.data import Dataset, DataLoader
 VOCAB_SIZE = 12
 OFFSETS = [0, 5, 7, 0]       # rule offsets per cycle step (period 4)
 
-# Training splits
-AR_TRAIN_STARTERS      = [0, 1, 3, 4]                     # pretrain A (4 starters)
-FINETUNE_STARTERS      = [1, 3, 4, 5, 7, 9, 10, 11]       # finetune B (8 starters)
-TEST_STARTERS          = [6, 8]                            # never-seen starters
+# Training splits  (matched to bass CP experiment)
+AR_TRAIN_STARTERS      = [0, 5, 9]                    # pretrain  (3 starters)
+FINETUNE_STARTERS      = [0, 1, 2, 3, 4, 7, 10, 11]   # all seen  (8 starters)
+TEST_STARTERS          = [6, 8]                        # never-seen starters
 
 # Backward-compat alias
 ADAPTER_TRAIN_STARTERS = FINETUNE_STARTERS
 TRAIN_STARTERS         = AR_TRAIN_STARTERS
 
 # Four evaluation categories
-EVAL_PRETRAIN_ONLY = [0]                         # A \ B  – seen only in pretrain
-EVAL_FINETUNE_ONLY = [5, 7, 9, 10, 11]           # B \ A  – seen only in finetune
-EVAL_BOTH          = [1, 3, 4]                   # A ∩ B  – seen in both stages
+EVAL_PRETRAIN_ONLY = [5, 9]                      # seen only in pretrain
+EVAL_FINETUNE_ONLY = [1, 2, 3, 4, 7, 10, 11]    # seen only in finetune
+EVAL_BOTH          = [0]                         # seen in both stages
 EVAL_NEITHER       = [6, 8]                      # never seen
 
 
