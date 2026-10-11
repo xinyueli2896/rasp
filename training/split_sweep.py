@@ -188,11 +188,22 @@ def main():
     p.add_argument('--seeds', type=int, nargs='+', default=[0])
     p.add_argument('--gpus', type=int, nargs='+', default=[0])
     p.add_argument('--cell', choices=CELLS, default='unseen')
+    p.add_argument('--only', type=str, nargs='+', default=None,
+                   help='Restrict to these split tags, e.g. --only a3o2 a3o1 '
+                        'a2o1. Use with --seeds to re-run the candidates from '
+                        'a 1-seed sweep properly; the enumeration is '
+                        'deterministic, so a tag means the same split.')
     p.add_argument('--enum_seed', type=int, default=0)
     p.add_argument('--ckpt_dir', type=str, default='checkpoints')
     a = p.parse_args()
 
     splits = enumerate_splits(a.enum_seed)
+    if a.only:
+        keep = set(a.only)
+        missing = keep - {t for t, _, _ in splits}
+        if missing:
+            raise SystemExit(f'unknown split tag(s): {sorted(missing)}')
+        splits = [s_ for s_ in splits if s_[0] in keep]
     return plan(a, splits) or 0 if a.plan else rank(a, splits)
 
 
