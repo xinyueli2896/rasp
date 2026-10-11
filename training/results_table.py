@@ -94,7 +94,10 @@ def main():
     # table cannot look at a different set of checkpoints than it describes.
     p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE)
     p.add_argument('--pretrain', type=int, nargs='+', default=None)
-    p.add_argument('--adapter',  type=int, nargs='+', default=None)
+    # '--adapter_pool' is what the trainers call it; accept both so the
+    # same shell variable can be reused without renaming.
+    p.add_argument('--adapter', '--adapter_pool', dest='adapter',
+                   type=int, nargs='+', default=None)
     p.add_argument('--unseen',   type=int, nargs='+', default=None)
     p.add_argument('--split_tag', type=str, default='')
     a = p.parse_args()
