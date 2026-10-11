@@ -457,6 +457,7 @@ class CPYinyangLightning(L.LightningModule):
 # ---------------------------------------------------------------------------
 
 def main(args):
+    L.seed_everything(args.seed, workers=True)
     if args.equiv_loss_weight > 0:
         # The constraint acts on ar_to_rule, which only exists in the
         # no-rule-input variant, and it reads ONE depth so the shifted pass is
@@ -872,7 +873,7 @@ def get_args():
                         'weight 1.0 binds; invariant to a global rescaling of '
                         'the logits. mse = squared error on the raw logits, '
                         'which is what the first run used and which did NOT '
-                        'bind: at ~0.05 against an LM loss of ~1.5 it was 1.5% '
+                        'bind: at ~0.05 against an LM loss of ~1.5 it was 1.5%% '
                         'of the objective, fell to 0.035 and then drifted back '
                         'to 0.055. Kept only for that comparison.')
     p.add_argument('--unseen_keys', type=int, nargs='*', default=[6, 8],
@@ -929,6 +930,10 @@ def get_args():
                         'level queries. Mutually exclusive with --encoder_injected.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
+    p.add_argument('--seed',               type=int, default=42,
+                   help='Seed for pl.seed_everything. The auto-generated run '
+                        'name does not include it, so pass a distinct '
+                        '--run_name per seed or the runs share a checkpoint dir.')
     p.add_argument('--resume_ckpt',        type=str, default=None)
     p.add_argument('--unseen_data',        type=str, default=None,
                    help='Path to unseen-keys .pt file for generalisation eval')

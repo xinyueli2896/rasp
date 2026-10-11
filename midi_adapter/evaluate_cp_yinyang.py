@@ -384,10 +384,18 @@ def run_evaluation(args) -> None:
     print(f'  Finetune-new  : {FINETUNE_NEW}')
     print(f'  Unseen        : {UNSEEN}')
 
+    # Keyword arguments past n_skip: passed positionally, `device` landed in
+    # load_model's 11th parameter (chords_per_bar), leaving device=None, so
+    # `model.to(device)` was a no-op and the model stayed on CPU while this
+    # function builds CUDA tensors.
     model = load_model(getattr(args, 'base_ckpt', None), args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip,
                        args.bidirectional, args.encoder_injected,
-                       args.encoder_type, args.rule_mode, args.approach, device)
+                       encoder_type = args.encoder_type,
+                       rule_mode    = args.rule_mode,
+                       approach     = args.approach,
+                       lora_rank    = args.lora_rank,
+                       device       = device)
 
     is_chord = (args.approach == 'chord')
 
@@ -471,6 +479,11 @@ def get_args():
     p.add_argument('--rule_mode', type=str, default='current',
                    choices=['current', 'period4', 'seed_broadcast'],
                    help='Must match the flag used during training')
+    p.add_argument('--lora_rank', type=int, default=0,
+                   help='LoRA rank the checkpoint was TRAINED with. Must match '
+                        '--lora_rank from train_cp_yinyang.py: at the wrong rank '
+                        'the LoRA modules are built at the wrong shape and their '
+                        'weights silently fail to load.')
     p.add_argument('--approach', type=str, default='bass',
                    choices=['bass', 'chord'],
                    help='Must match the flag used during training')

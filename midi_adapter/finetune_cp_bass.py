@@ -63,6 +63,7 @@ def _load_weights(net: RoFormerSymbolicTransformer, ckpt_path: str) -> None:
 
 
 def main(args):
+    L.seed_everything(args.seed, workers=True)
     n_gpus   = max(torch.cuda.device_count(), 1)
     run_name = (
         args.run_name
@@ -178,6 +179,9 @@ def get_args():
     p.add_argument('--val_check_interval', type=int, default=500)
     p.add_argument('--ckpt_dir',      type=str, default='ckpt')
     p.add_argument('--run_name',      type=str, default=None)
+    p.add_argument('--seed',          type=int, default=42,
+                   help='Seed for pl.seed_everything. Pass a distinct --run_name '
+                        'per seed so the runs do not share a checkpoint dir.')
     p.add_argument('--wandb_project', type=str, default='cp_bass',
                    help='W&B project name (empty string to disable wandb)')
     p.add_argument('--wandb_entity',  type=str, default=None)
