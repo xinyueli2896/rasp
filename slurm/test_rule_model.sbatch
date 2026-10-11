@@ -13,6 +13,18 @@
 #  Needs only torch + numpy. tracr/jax are NOT required: section 1 of the
 #  suite (lift-vs-Tracr) reports SKIP without them and the other 31 checks
 #  run from the committed weights.
+#
+#  The request is deliberately tiny (2 cores, 8 G, 20 min) so it schedules
+#  on whatever is free. If cscc-cpu-p is drained and this sits in PD, the
+#  same script runs on the GPU debug pairing -- command-line flags override
+#  the directives below:
+#
+#    sbatch --partition=cscc-gpu-p --qos=gpu-debug-qos --gres=gpu:1 \
+#           slurm/test_rule_model.sbatch
+#
+#  That takes a GPU it will not use, which is worth it only to get
+#  unblocked -- gpu-debug-qos exists for dependency validation, which this
+#  is. Do not make a habit of it.
 # =============================================================================
 #SBATCH --job-name=rule-model-test
 #SBATCH --output=slurm_logs/%x-%j.out
@@ -22,8 +34,8 @@
 #SBATCH --time=00:20:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
