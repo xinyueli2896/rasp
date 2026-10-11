@@ -154,14 +154,18 @@ def rank(args, splits):
               reverse=True)
     print(f'ranked by delta on `{cell}`   (adapter - pretrain), {len(rows)} splits\n')
     print(f'{"split":<8}{"|A|":>4}{"|B|":>4}{"pre_only":>9}{"both":>6}'
-          f'{"ft_only":>8}   {"baseline":>9}{"adapter":>9}{"delta":>9}{"n":>3}')
-    print('-' * 80)
+          f'{"ft_only":>8}   {"baseline":>9}{"adapter (mean +- std)":>24}'
+          f'{"delta":>9}{"n":>3}')
+    print('-' * 95)
+    def pm(v):
+        return (f'{v.mean():.3f}' if len(v) < 2
+                else f'{v.mean():.3f} +- {v.std(ddof=1):.3f}')
     for r in rows:
         a, b = len(r['A']), len(r['B'])
         o = len(set(r['A']) & set(r['B']))
         p_, d_ = r['pre'][cell].mean(), r['ada'][cell].mean()
         print(f'{r["tag"]:<8}{a:>4}{b:>4}{a-o:>9}{o:>6}{b-o:>8}   '
-              f'{p_:>9.3f}{d_:>9.3f}{d_-p_:>+9.3f}{r["n"]:>3}')
+              f'{p_:>9.3f}{pm(r["ada"][cell]):>24}{d_-p_:>+9.3f}{r["n"]:>3}')
 
     best_d = rows[0]
     best_f = max(rows, key=lambda r: r['ada'][cell].mean())
@@ -174,6 +178,19 @@ def rank(args, splits):
         print('  problem: delta is bounded by how bad the baseline was, so')
         print('  ranking by it favours splits with a weak AR. Quote whichever')
         print('  answers the question you are actually asking, and say which.')
+    # Welch's t between the top two, so the ranking is not read off means
+    # that overlap. Deliberately not a p-value: with n=5 and 62 predictions
+    # per run, this only says whether the gap clears the noise.
+    if len(rows) >= 2 and rows[0]['n'] >= 2 and rows[1]['n'] >= 2:
+        x, y = rows[0]['ada'][cell], rows[1]['ada'][cell]
+        se = np.sqrt(x.var(ddof=1) / len(x) + y.var(ddof=1) / len(y))
+        if se > 0:
+            print(f'\n  top two separation: {rows[0]["tag"]} - '
+                  f'{rows[1]["tag"]} = {x.mean() - y.mean():+.3f}, '
+                  f'{(x.mean() - y.mean()) / se:.1f} standard errors')
+            if abs(x.mean() - y.mean()) < 2 * se:
+                print('  under 2 SE -- the top two are not separated; do not '
+                      'pick between them on this evidence.')
     print(f'\n  A = pretrain pool, B = adapter pool, A u B = all 10 seen '
           f'starters, holdout {UNSEEN}.')
     print(f'  `{cell}` is 31 predictions per starter; with n=1 seed treat the '
