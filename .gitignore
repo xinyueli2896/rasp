@@ -44,3 +44,6 @@ slurm_logs/*
 
 # per-job training logs from run_seeds.sh
 run_logs/
+
+# generated sweep scripts
+sweep*.sh

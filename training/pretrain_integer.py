@@ -103,6 +103,15 @@ def main():
                    help='Copies of each sequence per epoch. The sequences are '
                         'deterministic, so this only sets the epoch length; it '
                         'adds no information.')
+    p.add_argument('--pretrain', type=int, nargs='+', default=None,
+                   help='Override pool A. Default: data.integer_dataset.')
+    p.add_argument('--adapter_pool', type=int, nargs='+', default=None,
+                   help='Override pool B.')
+    p.add_argument('--unseen', type=int, nargs='+', default=None,
+                   help='Override the holdout.')
+    p.add_argument('--split_tag', type=str, default='',
+                   help='Short label folded into the checkpoint name so a '
+                        'sweep over splits does not overwrite itself.')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--ckpt_dir', type=str, default='checkpoints')
     p.add_argument('--ckpt_name', type=str, default=None)
@@ -114,7 +123,8 @@ def main():
     np.random.seed(a.seed)
     dev = torch.device(a.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    info = validate_split(n_cycles=a.n_cycles)
+    info = validate_split(a.pretrain, a.adapter_pool, a.unseen,
+                          n_cycles=a.n_cycles)
     cells = info['cells']
     print(f'device       : {dev}')
     print(f'A  pretrain  : {info["pretrain"]}')
@@ -127,7 +137,8 @@ def main():
 
     train_loader, _ = get_dataloaders(
         'pretrain', batch_size=a.batch_size, n_cycles=a.n_cycles,
-        n_repeats=a.n_repeats)
+        n_repeats=a.n_repeats, pretrain=a.pretrain, adapter=a.adapter_pool,
+        unseen=a.unseen)
 
     model = AutoregressiveTransformer(
         vocab_size=VOCAB_SIZE, max_seq_len=4 * a.n_cycles + 8,
@@ -170,7 +181,8 @@ def main():
 
     print(f'\n{ar_baseline_is_informative(acc)}')
 
-    name = a.ckpt_name or f'ar_integer_seed{a.seed}.pt'
+    sfx  = f'_{a.split_tag}' if a.split_tag else ''
+    name = a.ckpt_name or f'ar_integer{sfx}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)
     path = os.path.join(a.ckpt_dir, name)
     torch.save({'state_dict': model.state_dict(),

@@ -96,6 +96,15 @@ def main():
     p.add_argument('--weight_decay', type=float, default=1e-4)
     p.add_argument('--n_cycles', type=int, default=N_CYCLES)
     p.add_argument('--n_repeats', type=int, default=200)
+    p.add_argument('--pretrain', type=int, nargs='+', default=None,
+                   help='Override pool A. Default: data.integer_dataset.')
+    p.add_argument('--adapter_pool', type=int, nargs='+', default=None,
+                   help='Override pool B.')
+    p.add_argument('--unseen', type=int, nargs='+', default=None,
+                   help='Override the holdout.')
+    p.add_argument('--split_tag', type=str, default='',
+                   help='Short label folded into the checkpoint name so a '
+                        'sweep over splits does not overwrite itself.')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--ckpt_dir', type=str, default='checkpoints')
     p.add_argument('--ckpt_name', type=str, default=None)
@@ -105,7 +114,8 @@ def main():
 
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     dev = torch.device(a.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    info = validate_split(n_cycles=a.n_cycles)
+    info = validate_split(a.pretrain, a.adapter_pool, a.unseen,
+                          n_cycles=a.n_cycles)
     cells = info['cells']
 
     print(f'device   : {dev}   mode: {a.mode}')
@@ -179,7 +189,10 @@ def main():
 
     train_loader, _ = get_dataloaders(stage, batch_size=a.batch_size,
                                       n_cycles=a.n_cycles,
-                                      n_repeats=a.n_repeats)
+                                      n_repeats=a.n_repeats,
+                                      pretrain=a.pretrain,
+                                      adapter=a.adapter_pool,
+                                      unseen=a.unseen)
     params = [q for q in model.parameters() if q.requires_grad]
     crit, opt = nn.CrossEntropyLoss(), optim.AdamW(
         params, lr=a.lr, weight_decay=a.weight_decay)
@@ -220,7 +233,8 @@ def main():
 
     tag  = (a.mode if a.mode != 'adapter'
             else f'adapter-{"trainar" if a.train_ar else f"lora{a.lora_rank}" if a.lora_rank else "frozen"}')
-    name = a.ckpt_name or f'integer_{tag}_{a.rule_slice}_seed{a.seed}.pt'
+    sfx  = f'_{a.split_tag}' if a.split_tag else ''
+    name = a.ckpt_name or f'integer_{tag}{sfx}_{a.rule_slice}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)
     path = os.path.join(a.ckpt_dir, name)
     torch.save({'state_dict': model.state_dict(), 'args': vars(a),
