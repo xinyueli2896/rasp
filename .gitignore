@@ -36,3 +36,6 @@ settings.py
 # plain `git pull`.
 !models/compiled_rules/
 !models/compiled_rules/*.pt
+
+# Slurm job logs
+slurm_logs/
