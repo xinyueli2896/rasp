@@ -29,6 +29,7 @@
 #   ENC_TYPE          mode 7 encoder: embedding (default, warm-started from the
 #                     frozen one-hot W_E) or token_mlp (xavier, not warm-started)
 #   SKIP_LORA=1       skip mode 5 when the peft package is unavailable
+#   SKIP_WAVE1=1      modes 1 and 6 already ran; launch only the second wave
 #   NO_EVAL=1         skip the final evaluation table
 
 set -u
@@ -45,6 +46,7 @@ COMMON="--n_skip 1 --epochs 400 --n_cycles 8 --n_seqs_per_starter 200"
 ENC_LOSS_WEIGHT="${ENC_LOSS_WEIGHT:-0.0}"
 ENC_TYPE="${ENC_TYPE:-embedding}"
 SKIP_LORA="${SKIP_LORA:-0}"
+SKIP_WAVE1="${SKIP_WAVE1:-0}"
 NO_EVAL="${NO_EVAL:-0}"
 
 # --- preflight: mode 5 hard-errors inside build_yinyang_model without peft ---
@@ -69,35 +71,50 @@ run () {   # run <logname> <script> <args...>
     printf '  gpu%-2s %-22s pid=%s\n' "$gpu" "$log" "$LAST_PID"
 }
 
-echo "=============================================================="
-echo "Wave 1: AR pretrain (mode 1)  ||  scratch-joint (mode 6)"
-echo "=============================================================="
+if [ "$SKIP_WAVE1" = "1" ]; then
+    echo "SKIP_WAVE1=1: modes 1 and 6 assumed already done."
+    if [ ! -f "$AR" ]; then
+        echo "ERROR: $AR missing -- cannot skip wave 1." >&2
+        exit 1
+    fi
+    for S in 0 1 2 3 4; do
+        [ -f "checkpoints/yinyang_scratch_seed$S.pt" ] \
+            || echo "  WARNING: checkpoints/yinyang_scratch_seed$S.pt missing (mode 6 seed $S)" >&2
+    done
+    # Start the round-robin where wave 1 left off so the load stays spread.
+    GPU=6
+else
+    echo "=============================================================="
+    echo "Wave 1: AR pretrain (mode 1)  ||  scratch-joint (mode 6)"
+    echo "=============================================================="
 
-run pretrain training/pretrain.py \
-    --epochs 200 --lr 3e-4 --n_cycles 8 --n_seqs_per_starter 200 \
-    --ckpt_name ar_transformer
-PRETRAIN_PID=$LAST_PID
+    run pretrain training/pretrain.py \
+        --epochs 200 --lr 3e-4 --n_cycles 8 --n_seqs_per_starter 200 \
+        --ckpt_name ar_transformer
+    PRETRAIN_PID=$LAST_PID
 
-for S in 0 1 2 3 4; do
-    # --ar_ckpt '' is what forces from-scratch: _build() loads a checkpoint only
-    # when the path is non-empty AND exists, and $AR will exist once mode 1 ends.
-    run "scratch_seed$S" training/train_yinyang.py \
-        --seed "$S" --ckpt_name "yinyang_scratch_seed$S" \
-        --joint --train_ar --ar_ckpt '' --no_lora $COMMON
-done
+    for S in 0 1 2 3 4; do
+        # --ar_ckpt '' is what forces from-scratch: _build() loads a checkpoint
+        # only when the path is non-empty AND exists, and $AR will exist once
+        # mode 1 ends.
+        run "scratch_seed$S" training/train_yinyang.py \
+            --seed "$S" --ckpt_name "yinyang_scratch_seed$S" \
+            --joint --train_ar --ar_ckpt '' --no_lora $COMMON
+    done
 
-# --- gate: wave 2 needs ONLY the pretrained checkpoint, not mode 6 ----------
-echo
-echo "Waiting on pretrain (pid $PRETRAIN_PID); mode 6 keeps running ..."
-wait "$PRETRAIN_PID"
-PRE_RC=$?
-if [ "$PRE_RC" -ne 0 ] || [ ! -f "$AR" ]; then
-    echo "ERROR: pretrain exited $PRE_RC / $AR missing. See logs/pretrain.log." >&2
-    echo "       Letting mode 6 finish, then aborting." >&2
-    wait
-    exit 1
+    # --- gate: wave 2 needs ONLY the pretrained checkpoint, not mode 6 ------
+    echo
+    echo "Waiting on pretrain (pid $PRETRAIN_PID); mode 6 keeps running ..."
+    wait "$PRETRAIN_PID"
+    PRE_RC=$?
+    if [ "$PRE_RC" -ne 0 ] || [ ! -f "$AR" ]; then
+        echo "ERROR: pretrain exited $PRE_RC / $AR missing. See logs/pretrain.log." >&2
+        echo "       Letting mode 6 finish, then aborting." >&2
+        wait
+        exit 1
+    fi
+    echo "Pretrain done -> $AR"
 fi
-echo "Pretrain done -> $AR"
 
 echo
 echo "=============================================================="
