@@ -123,6 +123,10 @@ def main():
     p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE,
                    help='Must match a compiled rule model in '
                         'models/compiled_rules/ (v12 and v24 are committed).')
+    p.add_argument('--allow_empty_cells', action='store_true',
+                   help='Permit an empty evaluation cell. The earlier '
+                        'integer runs used A subset of B, so they have no '
+                        'pretrain_only cell.')
     p.add_argument('--split_tag', type=str, default='',
                    help='Short label folded into the checkpoint name so a '
                         'sweep over splits does not overwrite itself.')
@@ -136,7 +140,8 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     dev = torch.device(a.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     info = validate_split(a.pretrain, a.adapter_pool, a.unseen,
-                          n_cycles=a.n_cycles, vocab_size=a.vocab_size)
+                          n_cycles=a.n_cycles, vocab_size=a.vocab_size,
+                          allow_empty_cells=a.allow_empty_cells)
     cells = info['cells']
 
     print(f'device   : {dev}   mode: {a.mode}')

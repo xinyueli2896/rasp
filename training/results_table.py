@@ -99,13 +99,15 @@ def main():
     p.add_argument('--adapter', '--adapter_pool', dest='adapter',
                    type=int, nargs='+', default=None)
     p.add_argument('--unseen',   type=int, nargs='+', default=None)
+    p.add_argument('--allow_empty_cells', action='store_true')
     p.add_argument('--split_tag', type=str, default='')
     a = p.parse_args()
 
     sfx  = f'_v{a.vocab_size}' if a.vocab_size != VOCAB_SIZE else ''
     sfx += f'_{a.split_tag}' if a.split_tag else ''
     ref = validate_split(a.pretrain, a.adapter, a.unseen,
-                         vocab_size=a.vocab_size)
+                         vocab_size=a.vocab_size,
+                         allow_empty_cells=a.allow_empty_cells)
     if sfx:
         print(f'checkpoints matching *{sfx}*   V={a.vocab_size}')
     print(f'split   A={ref["pretrain"]}  B={ref["adapter"]}')

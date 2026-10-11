@@ -129,7 +129,8 @@ SEQ_LEN  = PERIOD * N_CYCLES
 
 def validate_split(pretrain=None, adapter=None, unseen=None,
                    n_cycles: int = N_CYCLES,
-                   vocab_size: int = VOCAB_SIZE) -> dict:
+                   vocab_size: int = VOCAB_SIZE,
+                   allow_empty_cells: bool = False) -> dict:
     """Check the four-way split. Raises if it is malformed or leaky."""
     A      = list(PRETRAIN_STARTERS if pretrain is None else pretrain)
     B      = list(ADAPTER_STARTERS  if adapter  is None else adapter)
@@ -153,12 +154,17 @@ def validate_split(pretrain=None, adapter=None, unseen=None,
                  both=sorted(set(A) & set(B)),
                  unseen=sorted(unseen))
     empty = [k for k, v in cells.items() if not v]
-    if empty:
+    if empty and not allow_empty_cells:
         raise ValueError(
             f'evaluation cell(s) {empty} are empty. pretrain_only measures '
             f'forgetting and finetune_only measures installation, so a split '
             f'without them answers a different question than the four-way '
-            f'partition claims to.')
+            f'partition claims to. Pass allow_empty_cells=True (or '
+            f'--allow_empty_cells) if that is deliberate -- the earlier '
+            f'integer runs used A subset of B, which has no pretrain_only '
+            f'cell by construction and so cannot show forgetting at all.')
+    if empty:
+        print(f'  NOTE empty cell(s): {empty}  (allowed explicitly)')
 
     toks = lambda xs: set().union(
         *[set(sequence([x], T, V)[0].tolist()) for x in xs]) if xs else set()
@@ -279,10 +285,11 @@ def _main():
     p.add_argument('--unseen',   type=int, nargs='+', default=UNSEEN)
     p.add_argument('--n_cycles', type=int, default=N_CYCLES)
     p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE)
+    p.add_argument('--allow_empty_cells', action='store_true')
     a = p.parse_args()
 
     info = validate_split(a.pretrain, a.adapter, a.unseen, a.n_cycles,
-                          a.vocab_size)
+                          a.vocab_size, a.allow_empty_cells)
     c, T = info['cells'], info['seq_len']
 
     V = info['vocab_size']
