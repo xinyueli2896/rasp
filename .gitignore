@@ -37,5 +37,7 @@ settings.py
 !models/compiled_rules/
 !models/compiled_rules/*.pt
 
-# Slurm job logs
-slurm_logs/
+# Slurm job logs. The directory itself is tracked via .gitkeep because
+# Slurm opens --output before the script runs and fails if it is absent.
+slurm_logs/*
+!slurm_logs/.gitkeep

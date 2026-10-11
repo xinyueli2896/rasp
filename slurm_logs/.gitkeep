@@ -1,0 +1,4 @@
+Slurm opens the --output file BEFORE the job script runs, so if this
+directory does not exist the job fails immediately with no log to explain
+why. An in-script `mkdir -p slurm_logs` is too late. Hence this file: the
+directory has to be present in a fresh clone.

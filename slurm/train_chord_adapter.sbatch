@@ -7,13 +7,19 @@
 #
 #  Edit the settings block below to change the run. Everything in it is an
 #  env var that midi_adapter/run_adapter_tracr.sh reads.
+#
+#  WALL TIME is an estimate, not a measurement -- 8 h for MAX_STEPS=8000.
+#  After the first run, get the real figure and trim it:
+#      sacct -j <jobid> --format=JobID,JobName,Elapsed,State,ExitCode
+#  Policy asks for only the runtime you need; over-requesting costs you
+#  queue priority. The cap on long/gpu-12 is 72 h.
 # =============================================================================
 #SBATCH --job-name=chord-adapter
 #SBATCH --output=slurm_logs/%x-%j.out
 #SBATCH --error=slurm_logs/%x-%j.out
 #SBATCH --partition=long
 #SBATCH --qos=gpu-12
-#SBATCH --time=24:00:00
+#SBATCH --time=08:00:00   # 8k steps; raise for 40k (cap 72h on long)
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -22,7 +28,13 @@
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
-mkdir -p slurm_logs
+# sbatch runs this from SLURM_SUBMIT_DIR, i.e. wherever you ran sbatch, so
+# submit from the repo root. Say so plainly rather than failing on a
+# confusing "No such file" halfway down.
+if [ ! -f slurm/env.sh ]; then
+    echo "run sbatch from the repo root: cd <repo> && sbatch slurm/$(basename "$0")" >&2
+    exit 1
+fi
 source slurm/env.sh
 
 # ── settings ────────────────────────────────────────────────────────────

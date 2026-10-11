@@ -35,7 +35,13 @@
 
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
-mkdir -p slurm_logs
+# sbatch runs this from SLURM_SUBMIT_DIR, i.e. wherever you ran sbatch, so
+# submit from the repo root. Say so plainly rather than failing on a
+# confusing "No such file" halfway down.
+if [ ! -f slurm/env.sh ]; then
+    echo "run sbatch from the repo root: cd <repo> && sbatch slurm/$(basename "$0")" >&2
+    exit 1
+fi
 source slurm/env.sh
 
 # ── your command ────────────────────────────────────────────────────────
