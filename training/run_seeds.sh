@@ -21,16 +21,25 @@
 #
 #  SCHEDULING
 #  ----------
-#  Two phases, because there is exactly one dependency: everything else for
-#  seed N reads ar_integer_seed<N>.pt, so every pretrain must finish first.
-#  Within a phase the jobs are independent and run concurrently, one per GPU.
+#  The only dependency is WITHIN a seed: everything else for seed N reads
+#  ar_integer_seed<N>.pt. Two ways to exploit that, and which is faster
+#  depends on the shape of the sweep:
 #
-#    phase 1   pretrain x |SEEDS|
-#    ---- barrier ----
-#    phase 2   (finetune, adapter, lora, trainar) x |SEEDS|
+#  PHASE mode (default). Two waves with a barrier:
+#       phase 1   pretrain x |SEEDS|
+#       ---- barrier ----
+#       phase 2   (finetune, adapter, lora, ...) x |SEEDS|
+#     Best when phase 2 has many more jobs than phase 1, because every GPU
+#     is busy during the long phase.
 #
-#  With 5 seeds, 3 adapter variants and 8 GPUs that is 15 phase-2 jobs in
-#  two waves rather than 15 sequential runs.
+#  PIPELINE mode (PIPELINE=1). One chain per seed, chains in parallel:
+#       gpu0: pretrain_s0 -> finetune_s0 -> adapter_s0 -> ...
+#       gpu1: pretrain_s1 -> finetune_s1 -> adapter_s1 -> ...
+#     Best when |SEEDS| <= |GPUS| and each seed has few rows: seed N's
+#     adapter starts the moment seed N's pretrain lands instead of waiting
+#     for the slowest pretrain. With 5 seeds and 2 rows it removes the
+#     barrier entirely; with 5 seeds and 5 rows the phase mode wins,
+#     because the pipeline leaves 3 of 8 GPUs idle throughout.
 #
 #  Each job gets ONE GPU via --device cuda:N. These are plain PyTorch
 #  scripts at d_model=128, so a second GPU would do nothing for a single
@@ -48,6 +57,7 @@ SEEDS="${SEEDS:-0 1 2 3 4}"
 LORA_RANK="${LORA_RANK:-16}"
 LOGDIR="${LOGDIR:-run_logs}"
 DRY="${DRY:-0}"
+PIPELINE="${PIPELINE:-0}"
 
 # GPUs: honour $GPUS, else every visible device, else CPU.
 if [ -n "${GPUS:-}" ]; then
@@ -101,6 +111,51 @@ run_phase() {
     done
     return $rc
 }
+
+# ── pipeline mode: one chain per seed, chains concurrent ─────────────────
+if [ "$PIPELINE" = 1 ]; then
+    echo
+    echo "══ pipeline: one chain per seed over ${#GPU[@]} device(s) ══"
+    pids=(); names=(); i=0
+    for s in $SEEDS; do
+        g="${GPU[$((i % ${#GPU[@]}))]}"; dev="$(dev_of "$g")"; i=$((i+1))
+        AR="checkpoints/ar_integer_seed${s}.pt"
+        B="python -m training.finetune_adapter_integer --seed $s --ar_ckpt $AR"
+        chain=()
+        want pretrain && chain+=("python -m training.pretrain_integer --seed $s")
+        want finetune && chain+=("$B --mode finetune")
+        want adapter  && chain+=("$B --mode adapter")
+        want lora     && chain+=("$B --mode adapter --lora_rank $LORA_RANK")
+        want trainar  && chain+=("$B --mode adapter --train_ar")
+        want enc      && chain+=("$B --mode adapter --rule_input encoder")
+        want encsup   && chain+=("$B --mode adapter --rule_input encoder --proxy_loss_weight $PROXY_W")
+        want scratch  && chain+=("python -m training.finetune_adapter_integer --seed $s --mode scratch")
+        want joint    && chain+=("python -m training.finetune_adapter_integer --seed $s --mode joint_scratch")
+        [ ${#chain[@]} -eq 0 ] && continue
+        printf '  seed %-3s %-9s %d step(s) -> %s/chain_seed%s.log\n' \
+               "$s" "$dev" "${#chain[@]}" "$LOGDIR" "$s"
+        if [ "$DRY" = 1 ]; then
+            for c in "${chain[@]}"; do echo "      $c --device $dev"; done
+            continue
+        fi
+        (
+            for c in "${chain[@]}"; do
+                echo "### $c" >>"$LOGDIR/chain_seed${s}.log"
+                $c --device "$dev" >>"$LOGDIR/chain_seed${s}.log" 2>&1 || exit 1
+            done
+        ) &
+        pids+=($!); names+=("seed$s")
+    done
+    rc=0
+    for k in "${!pids[@]}"; do
+        if ! wait "${pids[$k]}"; then
+            echo "  FAILED chain ${names[$k]} (see $LOGDIR/chain_${names[$k]}.log)" >&2
+            rc=1
+        fi
+    done
+    echo; echo "done. Build the table with:  python -m training.results_table"
+    exit $rc
+fi
 
 # ── phase 1: pretrain (everything else depends on it) ────────────────────
 P1=()

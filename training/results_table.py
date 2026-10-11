@@ -26,34 +26,34 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data.integer_dataset import validate_split  # noqa: E402
+from data.integer_dataset import VOCAB_SIZE, validate_split  # noqa: E402
 from training.pretrain_integer import CELLS      # noqa: E402
 
 # (glob, tag, description, always_show)
 # always_show=False rows appear only when they actually match something, so
 # the table is not padded with rows that will never exist.
 ROWS = [
-    ('ar_integer_seed*.pt',               'Pre',  'AR alone, trained on pool A',   True, None),
-    ('integer_finetune_*seed*.pt',        'FT',   'AR continued on B, no adapter', True, None),
-    ('integer_adapter-frozen_*seed*.pt',  'YY',   'adapter, AR frozen',            True, None),
-    ('integer_adapter-lora*_*seed*.pt',   'YY+L', 'adapter + LoRA on the AR',      True, None),
-    ('integer_adapter-trainar_*seed*.pt', 'YY+T', 'adapter + AR fully trainable',  True, None),
+    ('ar_integer{sfx}_seed*.pt',               'Pre',  'AR alone, trained on pool A',   True, None),
+    ('integer_finetune{sfx}_*seed*.pt',        'FT',   'AR continued on B, no adapter', True, None),
+    ('integer_adapter-frozen{sfx}_*seed*.pt',  'YY',   'adapter, AR frozen',            True, None),
+    ('integer_adapter-lora*{sfx}_*seed*.pt',   'YY+L', 'adapter + LoRA on the AR',      True, None),
+    ('integer_adapter-trainar{sfx}_*seed*.pt', 'YY+T', 'adapter + AR fully trainable',  True, None),
     # Single-stage runs on A u B. Only `unseen` is held out for these, so the
     # other three cells are in-distribution and NOT comparable with the rows
     # above, where they are held out by construction.
-    ('integer_adapter-frozen-enc*_*seed*.pt', 'YY-E',
+    ('integer_adapter-frozen-enc*{sfx}_*seed*.pt', 'YY-E',
      'adapter, NO rule input (encoder)',                           True, '-sup'),
-    ('integer_adapter-frozen-enc*-sup*_*seed*.pt', 'YY-ES',
+    ('integer_adapter-frozen-enc*-sup*{sfx}_*seed*.pt', 'YY-ES',
      'adapter, NO rule input + CE supervision',                     True, None),
-    ('integer_scratch_*seed*.pt',         'S',    'AR from scratch on AuB, no rule', True, None),
-    ('integer_joint_scratch_*seed*.pt',   'S+YY', 'AR from scratch + adapter, joint', True, None),
+    ('integer_scratch{sfx}_*seed*.pt',         'S',    'AR from scratch on AuB, no rule', True, None),
+    ('integer_joint_scratch{sfx}_*seed*.pt',   'S+YY', 'AR from scratch + adapter, joint', True, None),
     # Checkpoints written before the variant suffix existed, when every
     # adapter run was `integer_adapter_<slice>_seed<N>.pt` regardless of
     # whether the AR was frozen. Listed separately rather than folded into
     # YY because which variant produced them is no longer recoverable from
     # the filename. The globs do not overlap -- this one needs an UNDERSCORE
     # after "adapter" where the others have a hyphen.
-    ('integer_adapter_*seed*.pt',         'YY?',  'adapter, variant unknown '
+    ('integer_adapter{sfx}_*seed*.pt',         'YY?',  'adapter, variant unknown '
                                                   '(pre-rename checkpoint)',  False, None),
 ]
 
@@ -89,9 +89,22 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--ckpt_dir', type=str, default='checkpoints')
     p.add_argument('--latex', action='store_true')
+    # Target a specific experiment. These must match what the runs used, and
+    # the filename infix is built the same way the trainers build it, so the
+    # table cannot look at a different set of checkpoints than it describes.
+    p.add_argument('--vocab_size', type=int, default=VOCAB_SIZE)
+    p.add_argument('--pretrain', type=int, nargs='+', default=None)
+    p.add_argument('--adapter',  type=int, nargs='+', default=None)
+    p.add_argument('--unseen',   type=int, nargs='+', default=None)
+    p.add_argument('--split_tag', type=str, default='')
     a = p.parse_args()
 
-    ref = validate_split()
+    sfx  = f'_v{a.vocab_size}' if a.vocab_size != VOCAB_SIZE else ''
+    sfx += f'_{a.split_tag}' if a.split_tag else ''
+    ref = validate_split(a.pretrain, a.adapter, a.unseen,
+                         vocab_size=a.vocab_size)
+    if sfx:
+        print(f'checkpoints matching *{sfx}*   V={a.vocab_size}')
     print(f'split   A={ref["pretrain"]}  B={ref["adapter"]}')
     for k in CELLS:
         print(f'  {k:<14} {ref["cells"][k]}')
@@ -103,7 +116,8 @@ def main():
     table = {}
     n_other_total = 0
     for pattern, tag, desc, always, excl in ROWS:
-        runs, n_other = collect(pattern, a.ckpt_dir, excl, ref['cells'])
+        runs, n_other = collect(pattern.format(sfx=sfx), a.ckpt_dir, excl,
+                                ref['cells'])
         n_other_total += n_other
         if not runs:
             if always:
