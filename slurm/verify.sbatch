@@ -35,24 +35,10 @@
 set -uo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}" || exit 1
 
-ENV_NAME="${ENV_NAME:-rasp}"
-
-echo "node      : $(hostname)"
-echo "job       : ${SLURM_JOB_ID:-<none>}"
-# Printed only. Policy forbids SETTING this or otherwise reaching for GPUs
-# Slurm did not allocate; nothing in this repo does.
-echo "gpus      : ${CUDA_VISIBLE_DEVICES:-<none>}  (read-only)"
+mkdir -p slurm_logs
+source slurm/env.sh
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || \
     echo "nvidia-smi unavailable"
 echo
-
-# Activate however this cluster does it. `conda activate` needs the shell hook,
-# which a non-interactive job does not get from .bashrc.
-if command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)" && conda activate "$ENV_NAME"
-elif [ -f .venv/bin/activate ]; then
-    # shellcheck disable=SC1091
-    source .venv/bin/activate
-fi
 
 python verify_env.py

@@ -15,10 +15,10 @@
 set -euo pipefail
 
 # ─── Paths (edit checkpoints here when models are retrained) ─────────────────
-RASP_REPO=/l/users/xinyue.li/rasp
-D=/l/users/xinyue.li/data/pop909_ivvi_w1
+RASP_REPO="${RASP_REPO:-/l/users/xinyue.li/rasp}"
+D="${D:-/l/users/xinyue.li/data/pop909_ivvi_w1}"
 
-BASE=checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt
+BASE="${BASE:-checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt}"
 ADAPTER_DIRECT='checkpoints/pop909_ivvi_w1_direct_only_v3/pop909_ivvi_w1_direct_only_v3.by_val_loss.epoch=00.val_loss=1.58653.ckpt'
 ADAPTER_MIXED='checkpoints/pop909_ivvi_w1_orch_perkey_mixed/pop909_ivvi_w1_orch_perkey_mixed.by_val_loss.epoch=00.val_loss=1.55711.ckpt'
 FT_DIRECT='checkpoints/pop909_ivvi_w1_ftbase_direct/pop909_ivvi_w1_ftbase_direct.by_val_loss.epoch=00.val_loss=1.14533.ckpt'

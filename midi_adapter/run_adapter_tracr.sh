@@ -65,9 +65,9 @@
 
 set -euo pipefail
 
-RASP_REPO=/l/users/xinyue.li/rasp
-D=/l/users/xinyue.li/data/pop909_ivvi_w1
-BASE=checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt
+RASP_REPO="${RASP_REPO:-/l/users/xinyue.li/rasp}"
+D="${D:-/l/users/xinyue.li/data/pop909_ivvi_w1}"
+BASE="${BASE:-checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt}"
 PROXY_W="${PROXY_W:-0}"
 NO_POS="${NO_POS:-0}"
 HEADS="${HEADS:-2}"

@@ -19,11 +19,11 @@
 set -euo pipefail
 
 # ─── Paths (edit these) ──────────────────────────────────────────────────────
-POP909=/l/users/xinyue.li/data/pop909_combined
-ROOT=/l/users/xinyue.li/data/pop909_ivvi_w1
-BASE_CKPT=/l/users/xinyue.li/rasp/checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt
-RASP_REPO=/l/users/xinyue.li/rasp
-SA_REPO=/l/users/xinyue.li/Structured-Arrangement-Code         # ← edit
+POP909="${POP909:-/l/users/xinyue.li/data/pop909_combined}"
+ROOT="${ROOT:-/l/users/xinyue.li/data/pop909_ivvi_w1}"
+BASE_CKPT="${BASE_CKPT:-/l/users/xinyue.li/rasp/checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt}"
+RASP_REPO="${RASP_REPO:-/l/users/xinyue.li/rasp}"
+SA_REPO="${SA_REPO:-/l/users/xinyue.li/Structured-Arrangement-Code}"         # ← edit
 SA_DATA_ROOT_REL=data_file_dir                          # relative to SA_REPO
 
 # ─── Derived paths (don't edit) ──────────────────────────────────────────────

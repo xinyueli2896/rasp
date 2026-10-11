@@ -51,56 +51,48 @@ Minimum GPU request on either GPU partition is 1. `long` has 39 nodes,
 `cscc-gpu-p` 16, `cscc-cpu-p` 16 (71 total). The `cscc` prefix is a legacy
 SLURM identifier; all three are DANA.
 
-Don't memorise the pairing — `slurm/submit.sh` applies it and refuses
-anything over a cap:
+## Submitting
+
+Every job script is self-contained: the command lives inside it, and you
+submit it with nothing after the filename, as in the DANA examples.
 
 ```bash
-bash slurm/submit.sh -- python -m midi_adapter.train_cp_yinyang ...  # long/gpu-12
-bash slurm/submit.sh --debug -- python verify_env.py          # cscc-gpu-p/debug
-bash slurm/submit.sh --cpu --cpus 32 -- python -m midi_adapter.filter_nottingham ...
-bash slurm/submit.sh --dry --gpus 4 -- python -m ...          # print, don't submit
-
-# REFUSING: 16 GPUs exceeds the 12-GPU cap on long/gpu-12
-# REFUSING: 48:00:00 exceeds the 24h limit on cscc-gpu-p/cscc-gpu-qos
+sbatch slurm/verify.sbatch                  # check the environment
+sbatch slurm/train_chord_adapter.sbatch     # the flagship chord run
 ```
 
-It also sets `WANDB_MODE=offline`, picks the example configs' CPU/RAM shapes
-(8 cpu / 64 G for one GPU, 16 cpu / 230 G for four), and switches to `srun`
-with `--ntasks-per-node=N` when you ask for more than one GPU.
+| script | partition + QoS | resources |
+|---|---|---|
+| `verify.sbatch` | `cscc-gpu-p` + `gpu-debug-qos` | 1 GPU, 8 cpu, 40 G, 20 min |
+| `train_chord_adapter.sbatch` | `long` + `gpu-12` | 1 GPU, 8 cpu, 64 G, 24 h |
+| `template_gpu.sbatch` | `long` + `gpu-12` | copy, edit, submit |
+| `template_cpu.sbatch` | `cscc-cpu-p` + `cscc-cpu-qos` | copy, edit, submit |
+
+For anything new, copy a template and put the command at the bottom:
+
+```bash
+cp slurm/template_gpu.sbatch slurm/my_job.sbatch
+$EDITOR slurm/my_job.sbatch
+sbatch slurm/my_job.sbatch
+```
+
+### One file to edit for a new cluster
+
+Every script sources `slurm/env.sh`, which activates the conda env, sets
+`WANDB_MODE=offline`, prints the node/GPU/paths, and exports:
+
+| var | default |
+|---|---|
+| `RASP_REPO` | the repo containing `slurm/env.sh` |
+| `D` | `$RASP_REPO/../data/pop909_ivvi_w1` |
+| `BASE` | `checkpoints/cp_transformer_v0.42_..._size1_...ckpt` |
+
+Those three are read as overridable defaults by every `midi_adapter/run_*.sh`
+(they used to be hardcoded to `/l/users/xinyue.li/...`, which is why nothing
+ran elsewhere). Fix `env.sh` once and every run script follows.
 
 `--mail-type` / `--mail-user` are unavailable on DANA and are not used.
-
-## Setup
-
-```bash
-bash setup_env.sh               # installs, submits verify on `long`
-squeue -u "$USER"
-cat slurm_logs/verify-<jobid>.out       # expect: environment OK
-```
-
-Still undocumented and therefore not hardcoded: the **account** (if one is
-required) and this site's **gres syntax** (`gpu:1` vs `gpu:a100:1` vs …).
-Also the **wall-time limits**, which matter most. Ask the scheduler:
-
-```bash
-bash slurm/discover.sh          # pure sinfo/sacctmgr, login-safe
-```
-
-then override as needed:
-
-```bash
-SB_ACCOUNT=<yours> SB_GRES=gpu:a100:1 bash setup_env.sh
-SB_PARTITION=cscc-gpu-p bash setup_env.sh      # if `long` is busy
-```
-
-`setup_env.sh` installs on the login node (pip is IO, not compute) and
-submits `slurm/verify.sbatch`, which requests `--qos=gpu-debug-qos`.
-
-For an interactive shell, `srun` — not `salloc`:
-
-```bash
-srun --qos=gpu-debug-qos --gres=gpu:1 --time=00:30:00 --pty bash
-```
+`--exclusive` needs approval and is not used.
 
 ## Four things that bite specifically under Slurm
 

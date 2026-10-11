@@ -26,7 +26,7 @@
 # =============================================================================
 
 set -uo pipefail
-RASP_REPO=/l/users/xinyue.li/rasp
+RASP_REPO="${RASP_REPO:-/l/users/xinyue.li/rasp}"
 cd "$RASP_REPO" || exit 1
 
 # label                 PROGRAM    PROXY_ACT  CR    RULE_IN
