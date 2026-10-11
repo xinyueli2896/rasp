@@ -2,8 +2,8 @@
 
     token[i] = (x + OFFSETS[i % 4]) % 12,   x = token[0],   OFFSETS = [0,5,7,0]
 
-THE SPLIT, AND WHY IT HAS ONLY TWO CELLS
-----------------------------------------
+THE SPLIT
+---------
 The old config (`data/dataset.py`) ran two training stages over DIFFERENT
 starter sets -- AR pretrain on {0,5,9}, adapter on {0,1,2,3,4,7,10,11} -- which
 gives a four-way evaluation partition: pretrain-only, finetune-only, both,
@@ -86,9 +86,24 @@ from rasp_program.next_token_rule import (  # noqa: E402
 UNSEEN   = [6, 8]
 SEEN     = [x for x in range(VOCAB_SIZE) if x not in UNSEEN]
 
-# Chord-matched: one pool, both stages. Not a typo -- see the module docstring.
-PRETRAIN_STARTERS = SEEN
-ADAPTER_STARTERS  = SEEN
+# The two training stages draw from DIFFERENT pools, so all four evaluation
+# cells are populated:
+#
+#   A \ B  {5, 9, 11}        pretrain-only  -> catastrophic forgetting
+#   B \ A  {1, 3, 4, 7, 10}  finetune-only  -> rule installation
+#   A n B  {0, 2}            both           -> control, should stay ~1.0
+#   none   {6, 8}            unseen         -> generalisation (the headline)
+#
+# Why A is small (5 of 12). The rule is translation-equivariant in x, so
+# every starter is structurally identical and only the COUNT matters. Give
+# the AR too many and it learns the rule outright, generalises to all twelve
+# by itself, and there is nothing left for the adapter to demonstrate. The
+# V=24 report used 6 of 24 and its pretrain baseline still scored 0.000 on
+# the unseen cell; 5 of 12 is a far higher fraction, so this is the number
+# to check empirically before trusting any adapter result. See
+# `ar_baseline_is_informative` below.
+PRETRAIN_STARTERS = [0, 2, 5, 9, 11]                 # A
+ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10]           # B
 
 # 4 cycles * 8 = 32 tokens. Teacher forcing drops one, so the AR sees 31 and
 # the rule model is fed 31 + BOS = 32, which is exactly the length its
@@ -98,15 +113,32 @@ N_CYCLES = 8
 SEQ_LEN  = PERIOD * N_CYCLES
 
 
-def validate_split(seen=None, unseen=None, n_cycles: int = N_CYCLES) -> dict:
-    """Check the holdout is structural, not lexical. Raises if it is not."""
-    seen   = list(SEEN if seen is None else seen)
+def validate_split(pretrain=None, adapter=None, unseen=None,
+                   n_cycles: int = N_CYCLES) -> dict:
+    """Check the four-way split. Raises if it is malformed or leaky."""
+    A      = list(PRETRAIN_STARTERS if pretrain is None else pretrain)
+    B      = list(ADAPTER_STARTERS  if adapter  is None else adapter)
     unseen = list(UNSEEN if unseen is None else unseen)
     T      = PERIOD * n_cycles
+    seen   = sorted(set(A) | set(B))
 
-    overlap = set(seen) & set(unseen)
-    if overlap:
-        raise ValueError(f'seen and unseen overlap: {sorted(overlap)}')
+    leak = set(unseen) & set(seen)
+    if leak:
+        raise ValueError(
+            f'starter(s) {sorted(leak)} are held out AND trained on. The '
+            f'unseen number would be meaningless.')
+
+    cells = dict(pretrain_only=sorted(set(A) - set(B)),
+                 finetune_only=sorted(set(B) - set(A)),
+                 both=sorted(set(A) & set(B)),
+                 unseen=sorted(unseen))
+    empty = [k for k, v in cells.items() if not v]
+    if empty:
+        raise ValueError(
+            f'evaluation cell(s) {empty} are empty. pretrain_only measures '
+            f'forgetting and finetune_only measures installation, so a split '
+            f'without them answers a different question than the four-way '
+            f'partition claims to.')
 
     cov = set()
     for x in seen:
@@ -117,14 +149,14 @@ def validate_split(seen=None, unseen=None, n_cycles: int = N_CYCLES) -> dict:
     if bad:
         raise ValueError(
             f'holdout is not purely structural: starter(s) {sorted(bad)} must '
-            f'emit token(s) never produced by any seen starter: {bad}. Pick a '
-            f'different holdout, or the unseen number conflates "cannot apply '
-            f'the rule" with "has never emitted this symbol".')
+            f'emit token(s) never produced by any TRAINED starter: {bad}. Pick '
+            f'a different holdout, or the unseen number conflates "cannot '
+            f'apply the rule" with "has never emitted this symbol".')
 
-    return dict(seen=seen, unseen=unseen, seq_len=T,
+    return dict(pretrain=A, adapter=B, cells=cells,
+                seen=seen, unseen=unseen, seq_len=T,
                 token_coverage=sorted(cov),
-                n_eval_sequences=len(unseen),
-                n_eval_predictions=len(unseen) * (T - 1))
+                n_predictions={k: len(v) * (T - 1) for k, v in cells.items()})
 
 
 class IntegerRuleDataset(Dataset):
@@ -153,60 +185,98 @@ class IntegerRuleDataset(Dataset):
 
 def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
                     n_cycles: int = N_CYCLES, n_repeats: int = 200,
-                    seen=None, unseen=None):
-    """-> (train_loader, eval_loaders) where eval_loaders = {'seen', 'unseen'}.
+                    pretrain=None, adapter=None, unseen=None):
+    """-> (train_loader, eval_loaders) with one eval loader PER CELL.
 
-    stage is 'pretrain' or 'adapter'; under this config they are the same
-    pool, and that is deliberate.
+    stage picks which pool to train on: 'pretrain' trains on A, 'adapter'
+    on B. The eval loaders are the same four cells either way, so the AR
+    baseline and the adapter are scored on identical partitions.
     """
     if stage not in ('pretrain', 'adapter'):
         raise ValueError(f"stage must be 'pretrain' or 'adapter', got {stage!r}")
-    info = validate_split(seen, unseen, n_cycles)
+    info = validate_split(pretrain, adapter, unseen, n_cycles)
 
-    train = IntegerRuleDataset(info['seen'], n_cycles, n_repeats)
-    evals = {
-        'seen':   IntegerRuleDataset(info['seen'],   n_cycles, 1),
-        'unseen': IntegerRuleDataset(info['unseen'], n_cycles, 1),
-    }
+    pool  = info['pretrain'] if stage == 'pretrain' else info['adapter']
+    train = IntegerRuleDataset(pool, n_cycles, n_repeats)
+    evals = {k: IntegerRuleDataset(v, n_cycles, 1)
+             for k, v in info['cells'].items()}
     return (
         DataLoader(train, batch_size=batch_size, shuffle=True),
         {k: DataLoader(v, batch_size=max(len(v), 1)) for k, v in evals.items()},
     )
 
 
+def ar_baseline_is_informative(acc_by_cell: dict, threshold: float = 0.5) -> str:
+    """Read the AR-alone numbers before trusting any adapter result.
+
+    The experiment only has something to show if the AR, trained on A,
+    FAILS outside it. Pass the AR baseline's per-cell accuracy here and this
+    says whether the split is doing its job.
+    """
+    ft = acc_by_cell.get('finetune_only', 0.0)
+    un = acc_by_cell.get('unseen', 0.0)
+    if un > threshold and ft > threshold:
+        return (f'AR alone already scores {un:.3f} unseen / {ft:.3f} '
+                f'finetune-only: it learned the RULE, not the starters, so '
+                f'there is no headroom for the adapter. SHRINK the pretrain '
+                f'pool (PRETRAIN_STARTERS) and retrain.')
+    if un > threshold:
+        return (f'AR alone scores {un:.3f} on unseen. The headline cell is '
+                f'already solved before the adapter runs; shrink A.')
+    return (f'AR alone: {un:.3f} unseen, {ft:.3f} finetune-only -- both low, '
+            f'so both cells have headroom. Split is doing its job.')
+
+
 def _main():
     import argparse
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    p.add_argument('--unseen', type=int, nargs='+', default=UNSEEN)
+    p.add_argument('--pretrain', type=int, nargs='+', default=PRETRAIN_STARTERS)
+    p.add_argument('--adapter',  type=int, nargs='+', default=ADAPTER_STARTERS)
+    p.add_argument('--unseen',   type=int, nargs='+', default=UNSEEN)
     p.add_argument('--n_cycles', type=int, default=N_CYCLES)
     a = p.parse_args()
 
-    seen = [x for x in range(VOCAB_SIZE) if x not in a.unseen]
-    info = validate_split(seen, a.unseen, a.n_cycles)
+    info = validate_split(a.pretrain, a.adapter, a.unseen, a.n_cycles)
+    c, T = info['cells'], info['seq_len']
 
     print(f'rule        : token[i] = (x + {OFFSETS}[i % {PERIOD}]) % {VOCAB_SIZE}')
-    print(f'seq_len     : {info["seq_len"]}  ({a.n_cycles} cycles); AR sees '
-          f'{info["seq_len"] - 1} after teacher forcing')
-    print(f'\nsplit (chord-matched: ONE pool, both stages)')
-    print(f'  AR pretrain : {info["seen"]}')
-    print(f'  adapter     : {info["seen"]}   <- same pool, no pretrain-only cell')
-    print(f'  UNSEEN      : {info["unseen"]}')
+    print(f'seq_len     : {T}  ({a.n_cycles} cycles); AR sees {T - 1} after '
+          f'teacher forcing')
+    print(f'\ntraining pools')
+    print(f'  A  AR pretrain : {info["pretrain"]}')
+    print(f'  B  adapter     : {info["adapter"]}')
+
     print(f'\nevaluation partition')
-    print(f'  seen    {len(info["seen"]):2d} starters')
-    print(f'  unseen  {len(info["unseen"]):2d} starters = '
-          f'{info["n_eval_predictions"]} token predictions  <- the whole result')
+    print(f'  {"":<9}{"cell":<16}{"starters":<26}{"n":>3}{"preds":>8}  measures')
+    print('  ' + '-' * 83)
+    what = {'pretrain_only': 'catastrophic forgetting',
+            'finetune_only': 'rule installation',
+            'both':          'control, should stay ~1.0',
+            'unseen':        'GENERALISATION (the headline)'}
+    for k in ('pretrain_only', 'finetune_only', 'both', 'unseen'):
+        label = {'pretrain_only': r'A \ B', 'finetune_only': r'B \ A',
+                 'both': 'A n B', 'unseen': 'neither'}[k]
+        print(f'  {label:<9}{k:<16}{str(c[k]):<26}{len(c[k]):>3}'
+              f'{info["n_predictions"][k]:>8}  {what[k]}')
+    tot = sum(len(v) for v in c.values())
+    print(f'  {"":<9}{"":<16}{"":<26}{tot:>3}  (of {VOCAB_SIZE} starters)')
+
     print(f'\nholdout is structural, not lexical:')
-    print(f'  tokens covered by seen starters: {info["token_coverage"]}')
+    print(f'  tokens covered by trained starters: {info["token_coverage"]}')
     for u in info['unseen']:
-        need = sorted(set(sequence([u], info['seq_len'])[0].tolist()))
+        need = sorted(set(sequence([u], T)[0].tolist()))
         print(f'    unseen {u:2d} needs {need} -- all covered')
+
+    print(f'\nbefore trusting any adapter number, check the AR baseline:')
+    print(f'  the AR trains on A ({len(info["pretrain"])} of {VOCAB_SIZE} '
+          f'starters). The rule is translation-equivariant in x, so if that')
+    print(f'  is enough for it to learn the RULE rather than the starters, it')
+    print(f'  generalises everywhere and the adapter has nothing to add.')
+    print(f'  Score the AR alone per cell and pass it to')
+    print(f'  ar_baseline_is_informative(); shrink --pretrain if it says so.')
     if len(info['unseen']) < 4:
-        print(f'\n  NOTE: {info["n_eval_predictions"]} predictions is a thin '
-              f'result to rest a paper on. Widen with e.g.\n'
-              f'  --unseen 2 6 8 10  (one of 34 valid 4-starter holdouts '
-              f'containing 6 and 8),\n  or report over >= 5 seeds. Always run '
-              f'this validator on a new holdout:\n  many plausible-looking '
-              f'ones (e.g. 1 6 8 11) are not structural.')
+        print(f'\n  NOTE: unseen is {info["n_predictions"]["unseen"]} predictions. '
+              f'Widen with --unseen 2 6 8 10, or report over >= 5 seeds.')
 
 
 if __name__ == '__main__':
