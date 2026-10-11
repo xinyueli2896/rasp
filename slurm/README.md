@@ -38,20 +38,38 @@ scratch (`$TMPDIR`) and only writing the final `.pt` files to `/l/`.
 The `.pt` datasets and checkpoints are large and few, which is the pattern
 Lustre wants. It is the MIDI intermediates that are the problem.
 
+## DANA partitions
+
+| partition | type | nodes | notes |
+|---|---|---|---|
+| `long` | GPU | 39 | **default partition**; what the job scripts here request |
+| `cscc-gpu-p` | GPU | 16 | fall back if `long` is saturated |
+| `cscc-cpu-p` | CPU | 16 | CPU-only — data prep, not training |
+
+55 GPU nodes, 16 CPU nodes, 71 total. The `cscc` prefix is a legacy SLURM
+identifier only; all three are DANA.
+
 ## Setup
+
+```bash
+bash setup_env.sh               # installs, submits verify on `long`
+squeue -u "$USER"
+cat slurm_logs/verify-<jobid>.out       # expect: environment OK
+```
+
+Still undocumented and therefore not hardcoded: the **account** (if one is
+required) and this site's **gres syntax** (`gpu:1` vs `gpu:a100:1` vs …).
+Also the **wall-time limits**, which matter most. Ask the scheduler:
 
 ```bash
 bash slurm/discover.sh          # pure sinfo/sacctmgr, login-safe
 ```
 
-The policy page does **not** name the GPU partitions, wall-time limits, or
-this site's `gres` syntax, so ask the scheduler. Then:
+then override as needed:
 
 ```bash
-SB_PARTITION=<from discover>  SB_ACCOUNT=<from discover>  SB_GRES=gpu:1 \
-    bash setup_env.sh
-squeue -u "$USER"
-cat slurm_logs/verify-<jobid>.out       # expect: environment OK
+SB_ACCOUNT=<yours> SB_GRES=gpu:a100:1 bash setup_env.sh
+SB_PARTITION=cscc-gpu-p bash setup_env.sh      # if `long` is busy
 ```
 
 `setup_env.sh` installs on the login node (pip is IO, not compute) and
@@ -105,7 +123,8 @@ Single GPU with one task is unaffected. Stay within the 12-GPU cap.
 
 ### 3. Wall time, preemption and requeue
 
-Check `MaxWall` from `discover.sh` against the runs you intend:
+The partition is called `long`, but that is a name, not a guarantee — check
+the real `MaxWall` from `discover.sh` against the runs you intend:
 
 | run | steps |
 |---|---|

@@ -29,8 +29,9 @@
 #                                      #    the standard way to run work)
 #    bash setup_env.sh --no-verify     # install only
 #
-#    ENV_NAME=rasp  SB_PARTITION=gpu  SB_ACCOUNT=myproj  SB_GRES=gpu:1 \
-#        bash setup_env.sh
+#    bash setup_env.sh                           # DANA: partition `long`
+#    SB_PARTITION=cscc-gpu-p bash setup_env.sh   # if `long` is saturated
+#    ENV_NAME=rasp SB_ACCOUNT=myproj SB_GRES=gpu:1 bash setup_env.sh
 #
 #  See slurm/README.md for offline wandb, multi-GPU srun, and preemption.
 # =============================================================================
@@ -113,6 +114,9 @@ if [ "$ON_SLURM_LOGIN" = 1 ] && [ "$FORCE_LOCAL" = 0 ]; then
     echo "   verify_env.py builds the 112M CP transformer, so it does not run here."
     mkdir -p slurm_logs
     SB_ARGS=()
+    # `long` is DANA's default GPU partition (39 nodes); cscc-gpu-p (16) is
+    # the alternative. verify.sbatch already asks for `long`, so this only
+    # has an effect when overridden.
     [ -n "${SB_PARTITION:-}" ] && SB_ARGS+=(--partition="$SB_PARTITION")
     [ -n "${SB_ACCOUNT:-}" ]   && SB_ARGS+=(--account="$SB_ACCOUNT")
     [ -n "${SB_GRES:-}" ]      && SB_ARGS+=(--gres="$SB_GRES")

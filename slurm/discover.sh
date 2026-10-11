@@ -36,8 +36,12 @@ for p in $(sinfo -h -o '%P' 2>/dev/null | tr -d '*' | sort -u); do
         "$(get DefaultTime)" "$(get MaxTime)" "$(get MaxNodes)" "$(get MaxCPUsPerNode)"
 done
 
-hdr "GPU types and counts per node"
-sinfo -h -o '%20P %20N %10c %10m %40G' 2>/dev/null | sort -u
+hdr "GPU types and counts per node  (the gres syntax to pass as SB_GRES)"
+# The form the DANA docs give for showing nodes with their GPU resources.
+sinfo -N -o '%N %P %G %t' 2>/dev/null | sort -u | head -40
+echo
+echo "  gres strings seen:"
+sinfo -h -N -o '%G' 2>/dev/null | sort -u | sed 's/^/    /'
 
 hdr "your associations: accounts, QOS, limits"
 if have sacctmgr; then
@@ -67,7 +71,8 @@ squeue -u "$USER" -o '%.10i %.12P %.20j %.8T %.10M %.6D %R' 2>/dev/null || true
 
 hdr "what the job scripts need from the above"
 cat <<'NOTE'
-  SB_PARTITION  a partition from the first table that has GPUs
+  SB_PARTITION  DANA: `long` (GPU, 39 nodes, default) or `cscc-gpu-p`
+                (GPU, 16). `cscc-cpu-p` is CPU-only -- not for training.
   SB_ACCOUNT    your default account, unless you must bill a project
   SB_GRES       the gres syntax this cluster uses, from the GPU table
                 (gpu:1, or gpu:a100:1, or similar -- it differs per site)
