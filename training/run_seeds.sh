@@ -14,6 +14,8 @@
 #    adapter    cross-attention, AR FROZEN          -> the proposed model
 #    lora       cross-attention + LoRA on the AR    -> partly trainable
 #    trainar    cross-attention + AR fully trainable
+#    scratch    AR from random init on A u B, no rule model   (one stage)
+#    joint      AR from random init + adapter, jointly, A u B (one stage)
 #
 #  SCHEDULING
 #  ----------
@@ -55,7 +57,7 @@ else
 fi
 [ ${#GPU[@]} -eq 0 ] && GPU=(cpu)
 
-ROWS=("$@"); [ ${#ROWS[@]} -eq 0 ] && ROWS=(pretrain finetune adapter lora trainar)
+ROWS=("$@"); [ ${#ROWS[@]} -eq 0 ] && ROWS=(pretrain finetune adapter lora trainar scratch joint)
 want() { for r in "${ROWS[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
 
 mkdir -p "$LOGDIR"
@@ -122,6 +124,10 @@ for s in $SEEDS; do
     want adapter  && P2+=("adapter_frozen_seed${s}	$B --mode adapter")
     want lora     && P2+=("adapter_lora${LORA_RANK}_seed${s}	$B --mode adapter --lora_rank $LORA_RANK")
     want trainar  && P2+=("adapter_trainar_seed${s}	$B --mode adapter --train_ar")
+    # scratch runs need no AR checkpoint: they build one.
+    S="python -m training.finetune_adapter_integer --seed $s"
+    want scratch  && P2+=("scratch_seed${s}	$S --mode scratch")
+    want joint    && P2+=("joint_scratch_seed${s}	$S --mode joint_scratch")
 done
 run_phase "phase 2  finetune / adapter variants" "${P2[@]}" || exit 1
 

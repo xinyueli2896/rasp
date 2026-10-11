@@ -217,14 +217,21 @@ def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
     """-> (train_loader, eval_loaders) with one eval loader PER CELL.
 
     stage picks which pool to train on: 'pretrain' trains on A, 'adapter'
-    on B. The eval loaders are the same four cells either way, so the AR
-    baseline and the adapter are scored on identical partitions.
+    on B, 'union' on A u B. The eval loaders are the same four cells in
+    every case, so all rows are scored on identical partitions.
     """
-    if stage not in ('pretrain', 'adapter'):
-        raise ValueError(f"stage must be 'pretrain' or 'adapter', got {stage!r}")
+    if stage not in ('pretrain', 'adapter', 'union'):
+        raise ValueError(
+            f"stage must be 'pretrain', 'adapter' or 'union', got {stage!r}")
     info = validate_split(pretrain, adapter, unseen, n_cycles)
 
-    pool  = info['pretrain'] if stage == 'pretrain' else info['adapter']
+    # 'union' = A u B, for single-stage runs that train from scratch. Note
+    # this collapses the evaluation partition: pretrain_only, finetune_only
+    # and both are ALL trained on, so only `unseen` is held out. The cells
+    # are still reported separately so the rows line up with the two-stage
+    # runs, but for this stage they are three in-distribution subsets.
+    pool = {'pretrain': info['pretrain'], 'adapter': info['adapter'],
+            'union': info['seen']}[stage]
     train = IntegerRuleDataset(pool, n_cycles, n_repeats)
     evals = {k: IntegerRuleDataset(v, n_cycles, 1)
              for k, v in info['cells'].items()}

@@ -38,6 +38,11 @@ ROWS = [
     ('integer_adapter-frozen_*seed*.pt',  'YY',   'adapter, AR frozen',            True),
     ('integer_adapter-lora*_*seed*.pt',   'YY+L', 'adapter + LoRA on the AR',      True),
     ('integer_adapter-trainar_*seed*.pt', 'YY+T', 'adapter + AR fully trainable',  True),
+    # Single-stage runs on A u B. Only `unseen` is held out for these, so the
+    # other three cells are in-distribution and NOT comparable with the rows
+    # above, where they are held out by construction.
+    ('integer_scratch_*seed*.pt',         'S',    'AR from scratch on AuB, no rule', True),
+    ('integer_joint_scratch_*seed*.pt',   'S+YY', 'AR from scratch + adapter, joint', True),
     # Checkpoints written before the variant suffix existed, when every
     # adapter run was `integer_adapter_<slice>_seed<N>.pt` regardless of
     # whether the AR was frozen. Listed separately rather than folded into
@@ -105,6 +110,9 @@ def main():
     print('  pretrain_only is the forgetting cell -- FT is expected to collapse')
     print('  there, the adapter cannot (the AR weights never move).')
     print('  unseen is the headline; neither pool contains {6, 8}.')
+    print('  S / S+YY train on A u B in ONE stage, so for those rows only')
+    print('  `unseen` is held out -- their other three cells are training data')
+    print('  and must not be read across against Pre/FT/YY.')
     if any(len(v[CELLS[0]]) == 1 for v in table.values()):
         print('\n  std blank = a single seed. Run at least 5 before quoting '
               'these; the unseen')

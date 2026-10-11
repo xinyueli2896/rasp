@@ -58,7 +58,20 @@ def rfa(model, starters, n_cycles, device):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--mode', choices=['adapter', 'finetune'], default='adapter')
+    p.add_argument('--mode', default='adapter',
+                   choices=['adapter', 'finetune', 'joint_scratch', 'scratch'],
+                   help='adapter: cross-attention over a pretrained AR, '
+                        'trained on B. finetune: that AR continued on B with '
+                        'no rule model. joint_scratch: AR from RANDOM INIT '
+                        'plus the adapter, trained jointly on A u B. scratch: '
+                        'the same but with no adapter -- the control that '
+                        'makes joint_scratch interpretable.')
+    p.add_argument('--d_model', type=int, default=128,
+                   help='Scratch modes only; otherwise read from --ar_ckpt.')
+    p.add_argument('--n_layers', type=int, default=4,
+                   help='Scratch modes only.')
+    p.add_argument('--ar_n_heads', type=int, default=4,
+                   help='Scratch modes only. (--n_heads is the ADAPTER\'s.)')
     p.add_argument('--ar_ckpt', type=str, default='checkpoints/ar_integer_seed0.pt')
     p.add_argument('--rule_ckpt', type=str, default=None)
     p.add_argument('--rule_slice', choices=list(SLICES), default='program')
@@ -98,6 +111,17 @@ def main():
     print(f'device   : {dev}   mode: {a.mode}')
     print(f'A pretrain: {info["pretrain"]}   B adapter: {info["adapter"]}')
 
+    scratch = a.mode in ('joint_scratch', 'scratch')
+    stage   = 'union' if scratch else 'adapter'
+    if scratch:
+        # One training stage over A u B, so pretrain_only / finetune_only /
+        # both are all IN-distribution here. Only `unseen` is held out. The
+        # cells are still printed separately so the rows align with the
+        # two-stage runs, but only the last one is a generalisation claim.
+        print(f'from scratch: training on A u B = {info["seen"]}')
+        print('  NOTE only `unseen` is held out in this mode; the other three')
+        print('       cells are subsets of the training pool.')
+
     if a.mode == 'adapter':
         model = build(a.ar_ckpt, a.rule_ckpt, n_skip=a.n_skip,
                       embed_dim=a.embed_dim, n_heads=a.n_heads,
@@ -113,7 +137,7 @@ def main():
               f'n_skip {a.n_skip}')
         print(f'trainable: {model.n_trainable():,}   frozen: {model.n_frozen():,}'
               f'   ({100 * model.n_trainable() / model.n_frozen():.1f}% of frozen)')
-    else:
+    elif a.mode == 'finetune':
         blob = torch.load(a.ar_ckpt, map_location='cpu', weights_only=False)
         ab = blob['args']
         model = AutoregressiveTransformer(
@@ -123,15 +147,37 @@ def main():
         model.load_state_dict(blob['state_dict'])
         print(f'trainable: {sum(q.numel() for q in model.parameters()):,} '
               f'(ALL of the AR -- this is the forgetting control)')
+    else:
+        ar = AutoregressiveTransformer(
+            vocab_size=VOCAB_SIZE, max_seq_len=4 * a.n_cycles + 8,
+            d_model=a.d_model, n_layers=a.n_layers, n_heads=a.ar_n_heads)
+        if a.mode == 'scratch':
+            model = ar.to(dev)
+            print(f'trainable: {sum(q.numel() for q in model.parameters()):,} '
+                  f'(AR from scratch, NO rule model)')
+        else:
+            from models.integer_adapter import IntegerRuleAdapter
+            from models.integer_rule_model import IntegerRuleModel, cache_path
+            rule = IntegerRuleModel.load(a.rule_ckpt or cache_path(32))
+            model = IntegerRuleAdapter(
+                ar, rule, n_skip=a.n_skip, embed_dim=a.embed_dim,
+                n_heads=a.n_heads, rule_slice=a.rule_slice,
+                train_ar=True).to(dev)
+            print(f'rule_slice: {a.rule_slice} -> {SLICES[a.rule_slice]}  '
+                  f'({model.rule_dims.numel()} dims)')
+            print(f'trainable: {model.n_trainable():,} (AR from scratch AND '
+                  f'the adapter, jointly)')
 
-    # The AR baseline this is measured against, if the checkpoint carries it.
-    base = torch.load(a.ar_ckpt, map_location='cpu',
-                      weights_only=False).get('rfa')
+    # The AR baseline this is measured against. Scratch runs have no
+    # pretrained AR, so there is nothing to compare against and the delta
+    # column is blank rather than against an unrelated model.
+    base = (None if scratch else torch.load(
+        a.ar_ckpt, map_location='cpu', weights_only=False).get('rfa'))
     if base:
         print('AR baseline: ' + '  '.join(f'{k}={base[k]:.3f}' for k in CELLS))
     print()
 
-    train_loader, _ = get_dataloaders('adapter', batch_size=a.batch_size,
+    train_loader, _ = get_dataloaders(stage, batch_size=a.batch_size,
                                       n_cycles=a.n_cycles,
                                       n_repeats=a.n_repeats)
     params = [q for q in model.parameters() if q.requires_grad]
@@ -151,7 +197,8 @@ def main():
             hits += int((logits.argmax(-1) == y).sum()); n += y.numel()
         sched.step()
         if ep % a.log_every == 0 or ep in (1, a.epochs):
-            g, _ = rfa(model, info['adapter'], a.n_cycles, dev)
+            g, _ = rfa(model, info['seen'] if scratch else info['adapter'],
+                       a.n_cycles, dev)
             print(f'  epoch {ep:4d}  loss {tot/n:.4f}  train_tf {hits/n:.4f}  '
                   f'train_RFA {g:.4f}  lr {sched.get_last_lr()[0]:.2e}')
 
