@@ -469,6 +469,14 @@ def main(args):
                              '(0 reads the stream entering the stack, where the '
                              'shifted pass costs only the local encoder)')
     n_gpus   = max(torch.cuda.device_count(), 1)
+    # --devices caps how many of the visible GPUs this run uses. On a node
+    # with many GPUs the default (-1 = all) is usually WRONG for this repo:
+    # the model is 112M at batch_size 8, so one card is already ample, and
+    # the dataloaders are IterableDataset with no distributed sampler, so
+    # extra ranks duplicate work instead of splitting it. Prefer --devices 1
+    # and a larger --batch_size.
+    if args.devices > 0:
+        n_gpus = min(n_gpus, args.devices)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
     lora_suffix     = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
     rule_suffix     = f'_{args.rule_mode}' if args.rule_mode != 'current' else ''
@@ -661,6 +669,11 @@ def main(args):
     loggers.append(TensorBoardLogger('tb_logs', name=run_name))
 
     use_gpu = torch.cuda.is_available()
+    n_devices = n_gpus if use_gpu else 1
+    if use_gpu:
+        print(f'using {n_devices} of {torch.cuda.device_count()} visible GPU(s)'
+              + ('' if n_devices == 1 else
+                 '  -- DDP; note the dataloaders have no distributed sampler'))
     if n_gpus > 1:
         import datetime
         from pytorch_lightning.strategies import DDPStrategy
@@ -676,7 +689,7 @@ def main(args):
     # Always clip at 1.0 for adapter finetuning — random-init adapters bolted
     # onto a frozen base can spike, so the clip guards stability even at size 1.
     trainer = L.Trainer(
-        devices            = -1 if use_gpu else 1,
+        devices            = n_devices,
         accelerator        = 'gpu' if use_gpu else 'cpu',
         precision          = 'bf16-mixed' if use_gpu else 32,
         max_steps          = args.max_steps,
@@ -721,6 +734,14 @@ def get_args():
                    choices=['all', 'train', 'val', 'test'])
     p.add_argument('--val_split',          type=str, default='val',
                    choices=['all', 'train', 'val', 'test'])
+    p.add_argument('--devices', type=int, default=-1,
+                   help='How many visible GPUs to use. -1 (default) = all, '
+                        'which triggers DDP above one card. On a multi-GPU '
+                        'node prefer --devices 1: this model is 112M at '
+                        'batch_size 8, so one GPU is ample, and the '
+                        'dataloaders are IterableDataset with no distributed '
+                        'sampler, so extra ranks duplicate work rather than '
+                        'splitting it. Scale with --batch_size instead.')
     p.add_argument('--model_size',         type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',         type=int, default=8)
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
@@ -872,7 +893,7 @@ def get_args():
                         'weight 1.0 binds; invariant to a global rescaling of '
                         'the logits. mse = squared error on the raw logits, '
                         'which is what the first run used and which did NOT '
-                        'bind: at ~0.05 against an LM loss of ~1.5 it was 1.5% '
+                        'bind: at ~0.05 against an LM loss of ~1.5 it was 1.5%% '
                         'of the objective, fell to 0.035 and then drifted back '
                         'to 0.055. Kept only for that comparison.')
     p.add_argument('--unseen_keys', type=int, nargs='*', default=[6, 8],
