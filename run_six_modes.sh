@@ -21,6 +21,10 @@
 #
 # Env overrides:
 #   N_GPUS            visible GPUs to spread across (default 8)
+#   GPU_LIST          explicit GPUs to use, space separated, e.g. "2 3 4 5 6 7".
+#                     Overrides N_GPUS. Use it to keep off GPUs that another
+#                     job already holds -- an outer CUDA_VISIBLE_DEVICES will
+#                     NOT work, since each job sets its own.
 #   OMP_NUM_THREADS   per-process thread cap (default 4; prevents 26 torch
 #                     processes from oversubscribing the node's cores)
 #   ENC_LOSS_WEIGHT   mode 7 auxiliary encoder CE weight (default 0.0 = the
@@ -38,6 +42,15 @@ cd "$(dirname "$(readlink -f "$0")")"
 mkdir -p logs checkpoints
 
 N_GPUS="${N_GPUS:-8}"
+if [ -n "${GPU_LIST:-}" ]; then
+    read -r -a GPUS <<< "$GPU_LIST"
+else
+    GPUS=()
+    for ((i = 0; i < N_GPUS; i++)); do GPUS+=("$i"); done
+fi
+[ "${#GPUS[@]}" -gt 0 ] || { echo "ERROR: no GPUs selected" >&2; exit 1; }
+echo "GPUs in use: ${GPUS[*]}"
+
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
@@ -64,7 +77,7 @@ LAST_PID=""
 run () {   # run <logname> <script> <args...>
     local log=$1
     shift
-    local gpu=$((GPU % N_GPUS))
+    local gpu=${GPUS[$((GPU % ${#GPUS[@]}))]}
     GPU=$((GPU + 1))
     CUDA_VISIBLE_DEVICES="$gpu" python "$@" > "logs/$log.log" 2>&1 &
     LAST_PID=$!
@@ -82,7 +95,7 @@ if [ "$SKIP_WAVE1" = "1" ]; then
             || echo "  WARNING: checkpoints/yinyang_scratch_seed$S.pt missing (mode 6 seed $S)" >&2
     done
     # Start the round-robin where wave 1 left off so the load stays spread.
-    GPU=6
+    GPU=$(( 6 % ${#GPUS[@]} ))
 else
     echo "=============================================================="
     echo "Wave 1: AR pretrain (mode 1)  ||  scratch-joint (mode 6)"
