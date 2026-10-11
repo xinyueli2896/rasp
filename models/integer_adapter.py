@@ -177,7 +177,8 @@ class IntegerRuleAdapter(nn.Module):
                  n_skip: int = 1, embed_dim: int = 64, n_heads: int = 4,
                  dropout: float = 0.1, rule_slice: str = 'program',
                  train_ar: bool = False, lora_rank: int = 0,
-                 lora_alpha: float | None = None):
+                 lora_alpha: float | None = None,
+                 rule_input: str = 'tokens', encoder_hidden: int = 0):
         super().__init__()
         if rule_slice not in SLICES:
             raise ValueError(f'rule_slice must be one of {list(SLICES)}')
@@ -188,6 +189,30 @@ class IntegerRuleAdapter(nn.Module):
         for nm in SLICES[rule_slice]:
             dims += rule.subspace(nm)
         self.register_buffer('rule_dims', torch.as_tensor(sorted(dims)))
+
+        # 'tokens'  : the rule model is handed the input tokens one-hot.
+        # 'encoder' : NO input. A learned encoder reads the AR stream BEFORE
+        #             the transformer blocks -- i.e. drop(tok_emb + pos_emb)
+        #             -- and its softmax output replaces the rule model's
+        #             token embedding. This is the integer analogue of the
+        #             chord experiment's --rule_from_layer 0, and of
+        #             yinyang_model.py's `bidirectional` ar_to_rule, except
+        #             that IntegerRuleModel.embed already accepts a
+        #             distribution, so the encoder feeds it directly rather
+        #             than assembling a residual stream by hand.
+        if rule_input not in ('tokens', 'encoder'):
+            raise ValueError("rule_input must be 'tokens' or 'encoder'")
+        self.rule_input = rule_input
+        self.encoder = None
+        if rule_input == 'encoder':
+            V = rule.vocab_size
+            self.encoder = (
+                nn.Sequential(nn.Linear(ar.d_model, encoder_hidden), nn.ReLU(),
+                              nn.Linear(encoder_hidden, V))
+                if encoder_hidden else nn.Linear(ar.d_model, V))
+        # Stashed by rule_hidden() so the trainer can supervise the encoder
+        # without a second forward pass.
+        self._enc_logits = None
 
         n_ad = len(ar.blocks) // n_skip
         self.adapters = nn.ModuleList([
@@ -218,16 +243,62 @@ class IntegerRuleAdapter(nn.Module):
 
     # ---------------------------------------------------------------------
     def rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
-        """(B, T) tokens -> (B, T, len(rule_dims)) rule state, aligned to q.
+        """(B, T) tokens -> (B, T, len(rule_dims)) rule state, aligned to q."""
+        dt = next(self.adapters.parameters()).dtype
+        self._enc_logits = None
 
-        A one-hot is a valid distribution, so this takes the differentiable
-        path even though the input is hard here; there is simply no encoder
-        upstream to receive the gradient in this variant.
-        """
-        probs = F.one_hot(idx.long(), self.rule.vocab_size).to(
-            next(self.adapters.parameters()).dtype)
+        if self.rule_input == 'tokens':
+            # A one-hot is a valid distribution, so this still takes the
+            # differentiable path; there is simply no encoder upstream to
+            # receive the gradient.
+            probs = F.one_hot(idx.long(), self.rule.vocab_size).to(dt)
+        else:
+            ar, T = self.ar, idx.shape[1]
+            pos = torch.arange(T, device=idx.device).unsqueeze(0)
+            h0  = ar.drop(ar.tok_emb(idx) + ar.pos_emb(pos))   # pre-block
+            self._enc_logits = self.encoder(h0)
+            # SOFTMAX, never sigmoid. The rule model's MLPs are exact on
+            # inputs that sum to 1; scaling the mass 2x at one position is
+            # already enough to flip a prediction, so a per-dimension
+            # activation would corrupt the program. This is the same
+            # constraint the chord experiment hit from the other direction.
+            probs = F.softmax(self._enc_logits, dim=-1).to(dt)
+
         h, _ = self.rule(probs)
         return h[..., self.rule_dims]
+
+    def encoder_loss(self, idx: torch.Tensor) -> torch.Tensor | None:
+        """CE pulling the encoder's output toward the token at each position.
+
+        Optional. Without it the encoder is shaped only by the LM loss
+        reaching it through the frozen rule model and the adapter, which is
+        a long and narrow path -- in the chord experiment that path alone
+        left the read near chance (0.065) and the same CE term took it to
+        0.340, so this is worth having even though inference never uses it.
+
+        The target is the input token, because that is what the rule model's
+        W_E would have embedded. Only position 0 actually matters to the
+        program (the Select is k == 0), but supervising every position gives
+        the encoder far more signal for the same forward pass.
+        """
+        if self._enc_logits is None:
+            return None
+        return F.cross_entropy(
+            self._enc_logits.reshape(-1, self.rule.vocab_size),
+            idx.reshape(-1).long())
+
+    @torch.no_grad()
+    def encoder_acc(self, idx: torch.Tensor) -> tuple[float, float]:
+        """(all positions, position 0 only) token accuracy of the encoder.
+
+        Position 0 is reported separately because it is the only one the
+        program reads; a high overall number with a wrong seed is useless.
+        """
+        if self._enc_logits is None:
+            return float('nan'), float('nan')
+        pred = self._enc_logits.argmax(-1)
+        return (float((pred == idx).float().mean()),
+                float((pred[:, 0] == idx[:, 0]).float().mean()))
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         ar, B, T = self.ar, idx.shape[0], idx.shape[1]
@@ -246,7 +317,8 @@ class IntegerRuleAdapter(nn.Module):
 def build(ar_ckpt: str, rule_ckpt: str | None = None, n_skip: int = 1,
           embed_dim: int = 64, n_heads: int = 4, rule_slice: str = 'program',
           train_ar: bool = False, lora_rank: int = 0,
-          lora_alpha: float | None = None, max_seq_len: int | None = None,
+          lora_alpha: float | None = None, rule_input: str = 'tokens',
+          encoder_hidden: int = 0, max_seq_len: int | None = None,
           device='cpu') -> IntegerRuleAdapter:
     """Load the pretrained AR and the compiled rule model, and bolt them together."""
     from models.integer_rule_model import cache_path
@@ -262,5 +334,6 @@ def build(ar_ckpt: str, rule_ckpt: str | None = None, n_skip: int = 1,
     m = IntegerRuleAdapter(ar, rule, n_skip=n_skip, embed_dim=embed_dim,
                            n_heads=n_heads, rule_slice=rule_slice,
                            train_ar=train_ar, lora_rank=lora_rank,
-                           lora_alpha=lora_alpha)
+                           lora_alpha=lora_alpha, rule_input=rule_input,
+                           encoder_hidden=encoder_hidden)
     return m.to(device)

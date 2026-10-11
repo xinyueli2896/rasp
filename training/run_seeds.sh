@@ -14,6 +14,8 @@
 #    adapter    cross-attention, AR FROZEN          -> the proposed model
 #    lora       cross-attention + LoRA on the AR    -> partly trainable
 #    trainar    cross-attention + AR fully trainable
+#    enc        NO rule input: encoder -> rule embedding, unsupervised
+#    encsup     the same with CE supervision on the encoder
 #    scratch    AR from random init on A u B, no rule model   (one stage)
 #    joint      AR from random init + adapter, jointly, A u B (one stage)
 #
@@ -58,6 +60,7 @@ fi
 [ ${#GPU[@]} -eq 0 ] && GPU=(cpu)
 
 ROWS=("$@"); [ ${#ROWS[@]} -eq 0 ] && ROWS=(pretrain finetune adapter lora trainar scratch joint)
+PROXY_W="${PROXY_W:-1.0}" 
 want() { for r in "${ROWS[@]}"; do [ "$r" = "$1" ] && return 0; done; return 1; }
 
 mkdir -p "$LOGDIR"
@@ -124,6 +127,8 @@ for s in $SEEDS; do
     want adapter  && P2+=("adapter_frozen_seed${s}	$B --mode adapter")
     want lora     && P2+=("adapter_lora${LORA_RANK}_seed${s}	$B --mode adapter --lora_rank $LORA_RANK")
     want trainar  && P2+=("adapter_trainar_seed${s}	$B --mode adapter --train_ar")
+    want enc      && P2+=("adapter_enc_seed${s}	$B --mode adapter --rule_input encoder")
+    want encsup   && P2+=("adapter_encsup_seed${s}	$B --mode adapter --rule_input encoder --proxy_loss_weight $PROXY_W")
     # scratch runs need no AR checkpoint: they build one.
     S="python -m training.finetune_adapter_integer --seed $s"
     want scratch  && P2+=("scratch_seed${s}	$S --mode scratch")

@@ -88,6 +88,24 @@ def main():
                         'at exactly its pretrained behaviour.')
     p.add_argument('--lora_alpha', type=float, default=None,
                    help='LoRA scale; defaults to lora_rank (scale = 1).')
+    p.add_argument('--rule_input', choices=['tokens', 'encoder'],
+                   default='tokens',
+                   help="tokens: the rule model is handed the input one-hot. "
+                        "encoder: NO input -- a learned encoder reads the AR "
+                        "stream BEFORE the blocks and its softmax output "
+                        "replaces the rule model's token embedding.")
+    p.add_argument('--encoder_hidden', type=int, default=0,
+                   help='0 = Linear(d_model, 12); >0 = one hidden layer. The '
+                        'integer reference used a plain Linear, and the '
+                        'chord work found the MLP form memorises.')
+    p.add_argument('--proxy_loss_weight', type=float, default=0.0,
+                   help='CE pulling the encoder toward the token at each '
+                        'position. Train-time only; inference still needs no '
+                        'rule input. 0 = unsupervised, the encoder is shaped '
+                        'only by the LM loss reaching it through the frozen '
+                        'rule model. In the chord experiment that path alone '
+                        'left the read at 0.065 and this term took it to '
+                        '0.340, so 1.0 is the recommended starting point.')
     p.add_argument('--embed_dim', type=int, default=64)
     p.add_argument('--n_heads', type=int, default=4)
     p.add_argument('--epochs', type=int, default=200)
@@ -137,10 +155,16 @@ def main():
                       embed_dim=a.embed_dim, n_heads=a.n_heads,
                       rule_slice=a.rule_slice, train_ar=a.train_ar,
                       lora_rank=a.lora_rank, lora_alpha=a.lora_alpha,
+                      rule_input=a.rule_input,
+                      encoder_hidden=a.encoder_hidden,
                       max_seq_len=4 * a.n_cycles + 8, device=dev)
         variant = ('trainar' if a.train_ar else
                    f'lora{a.lora_rank}' if a.lora_rank else 'frozen')
         print(f'AR       : {variant}')
+        if a.rule_input == 'encoder':
+            print(f'rule in  : NO INPUT -- encoder reads the pre-block AR '
+                  f'stream ({"MLP h=" + str(a.encoder_hidden) if a.encoder_hidden else "Linear"})')
+            print(f'           proxy_loss_weight = {a.proxy_loss_weight}')
         print(f'rule_slice: {a.rule_slice} -> {SLICES[a.rule_slice]}  '
               f'({model.rule_dims.numel()} dims)')
         print(f'adapters : {len(model.adapters)} x embed_dim {a.embed_dim}, '
@@ -205,6 +229,10 @@ def main():
             x, y = x.to(dev), y.to(dev)
             logits = model(x)
             loss = crit(logits.reshape(-1, VOCAB_SIZE), y.reshape(-1))
+            if a.proxy_loss_weight > 0 and hasattr(model, 'encoder_loss'):
+                el = model.encoder_loss(x)
+                if el is not None:
+                    loss = loss + a.proxy_loss_weight * el
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item() * y.numel()
             hits += int((logits.argmax(-1) == y).sum()); n += y.numel()
@@ -212,8 +240,13 @@ def main():
         if ep % a.log_every == 0 or ep in (1, a.epochs):
             g, _ = rfa(model, info['seen'] if scratch else info['adapter'],
                        a.n_cycles, dev)
+            enc = ''
+            if a.rule_input == 'encoder':
+                model(x)                       # repopulate _enc_logits
+                ea, e0 = model.encoder_acc(x)
+                enc = f'  enc {ea:.3f} (pos0 {e0:.3f})'
             print(f'  epoch {ep:4d}  loss {tot/n:.4f}  train_tf {hits/n:.4f}  '
-                  f'train_RFA {g:.4f}  lr {sched.get_last_lr()[0]:.2e}')
+                  f'train_RFA {g:.4f}{enc}  lr {sched.get_last_lr()[0]:.2e}')
 
     print(f'\n{"cell":<16}{"starters":<24}{"n":>3}{"RFA":>9}{"vs AR":>9}'
           f'{"teacher-forced":>16}')
@@ -233,6 +266,10 @@ def main():
 
     tag  = (a.mode if a.mode != 'adapter'
             else f'adapter-{"trainar" if a.train_ar else f"lora{a.lora_rank}" if a.lora_rank else "frozen"}')
+    if a.mode == 'adapter' and a.rule_input == 'encoder':
+        tag += f'-enc{a.encoder_hidden or "lin"}'
+        if a.proxy_loss_weight > 0:
+            tag += f'-sup{a.proxy_loss_weight:g}'
     sfx  = f'_{a.split_tag}' if a.split_tag else ''
     name = a.ckpt_name or f'integer_{tag}{sfx}_{a.rule_slice}_seed{a.seed}.pt'
     os.makedirs(a.ckpt_dir, exist_ok=True)

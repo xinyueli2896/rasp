@@ -41,6 +41,8 @@ ROWS = [
     # Single-stage runs on A u B. Only `unseen` is held out for these, so the
     # other three cells are in-distribution and NOT comparable with the rows
     # above, where they are held out by construction.
+    ('integer_adapter-frozen-enc*_*seed*.pt', 'YY-E',
+     'adapter, NO rule input (encoder)',                                   True),
     ('integer_scratch_*seed*.pt',         'S',    'AR from scratch on AuB, no rule', True),
     ('integer_joint_scratch_*seed*.pt',   'S+YY', 'AR from scratch + adapter, joint', True),
     # Checkpoints written before the variant suffix existed, when every
