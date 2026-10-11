@@ -57,13 +57,19 @@ Every job script is self-contained: the command lives inside it, and you
 submit it with nothing after the filename, as in the DANA examples.
 
 ```bash
-sbatch slurm/verify.sbatch                  # check the environment
+sbatch slurm/test_rule_model.sbatch         # rule model (CPU, no data needed)
+sbatch slurm/verify.sbatch                  # full environment check (1 GPU)
 sbatch slurm/train_chord_adapter.sbatch     # the flagship chord run
 ```
+
+`test_rule_model.sbatch` is the one to run first on a new cluster: it needs
+no GPU, no dataset and no base checkpoint, only the committed weights under
+`models/compiled_rules/`. If it passes, the repo is installed correctly.
 
 | script | partition + QoS | resources |
 |---|---|---|
 | `verify.sbatch` | `cscc-gpu-p` + `gpu-debug-qos` | 1 GPU, 8 cpu, 40 G, 20 min |
+| `test_rule_model.sbatch` | `cscc-cpu-p` + `cscc-cpu-qos` | **no GPU**, 4 cpu, 16 G, 20 min |
 | `train_chord_adapter.sbatch` | `long` + `gpu-12` | 1 GPU, 8 cpu, 64 G, 24 h |
 | `template_gpu.sbatch` | `long` + `gpu-12` | copy, edit, submit |
 | `template_cpu.sbatch` | `cscc-cpu-p` + `cscc-cpu-qos` | copy, edit, submit |
