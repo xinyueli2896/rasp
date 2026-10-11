@@ -89,26 +89,35 @@ SEEN     = [x for x in range(VOCAB_SIZE) if x not in UNSEEN]
 # The two training stages draw from DIFFERENT pools, so all four evaluation
 # cells are populated:
 #
-#   A \ B  {5, 9}                pretrain-only  -> forgetting
-#   B \ A  {1, 3, 4, 7, 10, 11}  finetune-only  -> rule installation
-#   A n B  {0, 2}                both           -> control, ~1.0
-#   none   {6, 8}                unseen         -> generalisation
+#   A \ B  {0, 5}              pretrain-only  -> forgetting
+#   B \ A  {2, 7, 9, 10, 11}   finetune-only  -> rule installation
+#   A n B  {1, 3, 4}           both           -> control, ~1.0
+#   none   {6, 8}              unseen         -> generalisation
 #
-# REQUIREMENT: every token the unseen starters must emit has to appear in
-# some training sequence -- in A or in B. `validate_split` enforces that on
-# the UNION and refuses a split that fails it, so the unseen number measures
-# rule application rather than vocabulary coverage.
+# REQUIREMENT: every token the unseen starters emit has to appear in some
+# training sequence. {6, 8} need tokens {1, 3, 6, 8, 11}, and this split
+# puts all five in EACH pool, not merely in their union:
 #
-# It also REPORTS per-pool coverage without failing on it, because the two
-# are different questions and the per-pool one is tight: {6, 8} need tokens
-# {1, 3, 6, 8, 11}, and starter 1 is the ONLY seen starter producing token 1,
-# so no A without starter 1 can cover them. A = {0, 2, 5, 9} covers
-# [0, 2, 4, 5, 7, 9, 10] -- none of the five. Worth knowing when reading the
-# AR-alone baseline on the unseen cell: part of its failure there is that it
-# never emitted those symbols, not only that it cannot apply the rule. The
-# adapter, whose pool B covers all twelve, does not have that excuse.
-PRETRAIN_STARTERS = [0, 2, 5, 9]                     # A
-ADAPTER_STARTERS  = [0, 1, 2, 3, 4, 7, 10, 11]       # B
+#   A covers [0,1,3,4,5,6,7,8,9,10,11]     all five present
+#   B covers [0,1,2,3,4,5,6,7,8,9,10,11]   all five present
+#
+# That matters because two models get scored on the unseen cell -- the AR
+# trained on A alone, and the adapter trained on B over a base frozen from
+# A. If a needed token were missing from one pool, that model's failure on
+# {6, 8} would be partly LEXICAL (it had never emitted the symbol) rather
+# than a failure to apply the rule, and the number would not mean what the
+# table says. Here neither model has that excuse.
+#
+# Getting both pools covered is tight, because starter 1 is the ONLY seen
+# starter that produces token 1, so 1 must sit in both pools -- which is why
+# it is a `both` starter rather than pretrain-only. Starter 5 is then what
+# keeps A \ B at two starters instead of collapsing to {0}.
+#
+# `validate_split` enforces the union (the stated requirement) and REPORTS
+# per-pool coverage, so a later edit that breaks the per-pool property shows
+# up in the printout instead of failing silently.
+PRETRAIN_STARTERS = [0, 1, 3, 4, 5]                  # A
+ADAPTER_STARTERS  = [1, 2, 3, 4, 7, 9, 10, 11]       # B
 
 # 4 cycles * 8 = 32 tokens. Teacher forcing drops one, so the AR sees 31 and
 # the rule model is fed 31 + BOS = 32, which is exactly the length its
