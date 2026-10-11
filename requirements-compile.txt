@@ -12,7 +12,11 @@
 # over absolute position, so d_model grows with it (59 at T=16, 75 at T=32)
 # and the model refuses to run on a longer sequence than it was built for.
 #
-#   pip install -r requirements-compile.txt
+#   python -m pip install -r requirements-compile.txt
+#
+# `python -m pip`, not bare `pip`: bare pip is whichever shim is first on
+# PATH and may belong to a different interpreter entirely, in which case
+# the packages land somewhere your env cannot see.
 #
 # verified: jax 0.10.2, jaxlib 0.10.2, dm-haiku 0.0.17, chex 0.1.92,
 #           einops 0.8.2, tracr 1.0.0 (Python 3.11)

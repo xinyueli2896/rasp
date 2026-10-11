@@ -1,5 +1,13 @@
 # Core — everything needed to TRAIN and EVALUATE.
 #
+#   python -m pip install -r requirements.txt
+#
+# Use `python -m pip`, never bare `pip`. Bare pip is whichever shim comes
+# first on PATH, which is not necessarily the one belonging to the active
+# interpreter; when it is not, the packages install where this environment
+# cannot see them and every later install reports "Requirement already
+# satisfied" while the env stays empty.
+#
 # Versions after the comment are what this repo has been run against. The
 # floors are what the code actually requires.
 #

@@ -57,7 +57,7 @@ Vocab is mod 12 (same as bass). Splits are identical to the bass CP experiment f
 ## Setup
 
 ```bash
-pip install torch numpy peft
+python -m pip install torch numpy peft
 ```
 
 JAX/Tracr are **not required** — the rule model is implemented analytically in PyTorch.

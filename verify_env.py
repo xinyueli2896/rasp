@@ -136,7 +136,7 @@ def main() -> int:
         if not os.path.exists(pth):
             ok(f'compiled weights at {pth}', False,
                'missing — `git pull`, or rebuild with '
-               '`pip install -r requirements-compile.txt` then '
+               '`python -m pip install -r requirements-compile.txt` then '
                '`python -m models.integer_rule_model --build --max_seq_len 32`')
         else:
             m = IntegerRuleModel.load(pth)
