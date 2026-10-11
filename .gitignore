@@ -9,7 +9,11 @@ checkpoints/
 dist/
 build/
 .env
-data/
+# `data/*` not `data/`: git cannot re-include a file whose parent
+# DIRECTORY is excluded, so the negation below only works this way.
+# The .pt tensors stay ignored; the dataset definitions are source.
+data/*
+!data/*.py
 input/
 
 # generated artefacts — regenerable, keep them out of git status
