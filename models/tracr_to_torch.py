@@ -135,6 +135,13 @@ class TracrTorch(nn.Module):
             raise ValueError(f'expected last dim {self.vocab_size}, got {V}')
         W_tok = self.W('token_embed__embeddings')
         W_pos = self.W('pos_embed__embeddings')
+        # The lifted weights are float32. Cast rather than letting the matmul
+        # raise "expected m1 and m2 to have the same dtype", which says nothing
+        # about which argument is wrong. Casting is lossless in the direction
+        # that matters: a float64 caller loses nothing the float32 weights
+        # could have used.
+        if token_probs.dtype != W_tok.dtype:
+            token_probs = token_probs.to(W_tok.dtype)
 
         h = token_probs @ W_tok[:self.vocab_size]            # (B, T, d)
         if prepend_bos:

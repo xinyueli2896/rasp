@@ -334,6 +334,50 @@ def main():
     check('the next_phase subspace holds (q+1) % 4',
           ph.tolist() == [(q + 1) % 4 for q in range(8)], f'{ph.tolist()}')
 
+    # -- 7. plumbing -------------------------------------------------------
+    # Not statements about the rule, but about the module being usable. Every
+    # check above runs at B=1, so batching in particular was untested.
+    print('\n7. plumbing (batching, round-trip, bounds, dtype)')
+    xs = [0, 3, 5, 9, 11]
+    bt = torch.as_tensor(sequence(xs, 8))
+    lgb = m.from_tokens(bt)[1].argmax(-1).numpy()
+    check('a batch gives the same answers as the rows run one at a time',
+          (lgb == next_token(xs, 8)).all() and all(
+              (m.from_tokens(torch.as_tensor(sequence([x], 8)))[1]
+               .argmax(-1)[0].numpy() == lgb[i]).all()
+              for i, x in enumerate(xs)),
+          f'B={len(xs)}')
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        pth = os.path.join(d, 'rt.pt')
+        m.save(pth)
+        m2 = IntegerRuleModel.load(pth)
+        d1 = float((m.from_tokens(bt)[0] - m2.from_tokens(bt)[0]).abs().max())
+        check('save/load round-trips exactly', d1 == 0.0
+              and bool((m.program_dims == m2.program_dims).all())
+              and m2.seed_mode == m.seed_mode,
+              f'max|diff|={d1:.1e}  seed_mode={m2.seed_mode}')
+
+    # Tracr one-hots `indices` over absolute position, so running past the
+    # compiled length is not merely inaccurate, it is undefined. It must
+    # raise, not return something plausible.
+    try:
+        m.from_tokens(torch.as_tensor(sequence([0], m.max_seq_len + 8)))
+        check('running past max_seq_len raises instead of silently computing',
+              False, 'no error raised')
+    except ValueError as e:
+        check('running past max_seq_len raises instead of silently computing',
+              'max_seq_len' in str(e), type(e).__name__)
+
+    p64 = torch.zeros(1, 8, V, dtype=torch.float64)
+    p64[0, torch.arange(8), torch.as_tensor(sequence([0], 8)[0])] = 1.0
+    try:
+        check('a float64 input is cast, not a dtype crash',
+              (m(p64)[1].argmax(-1)[0].numpy() == next_token([0], 8)[0]).all())
+    except RuntimeError as e:
+        check('a float64 input is cast, not a dtype crash', False, str(e)[:60])
+
     print(f'\n{"all checks passed" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}"}')
     return 1 if FAILS else 0
 
