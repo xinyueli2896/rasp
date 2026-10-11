@@ -146,7 +146,8 @@ def main():
     train_loader, _ = get_dataloaders(
         'pretrain', batch_size=a.batch_size, n_cycles=a.n_cycles,
         n_repeats=a.n_repeats, pretrain=a.pretrain, adapter=a.adapter_pool,
-        unseen=a.unseen, vocab_size=a.vocab_size)
+        unseen=a.unseen, vocab_size=a.vocab_size,
+        allow_empty_cells=a.allow_empty_cells)
 
     model = AutoregressiveTransformer(
         vocab_size=a.vocab_size, max_seq_len=4 * a.n_cycles + 8,

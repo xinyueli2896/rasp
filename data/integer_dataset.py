@@ -228,7 +228,8 @@ class IntegerRuleDataset(Dataset):
 def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
                     n_cycles: int = N_CYCLES, n_repeats: int = 200,
                     pretrain=None, adapter=None, unseen=None,
-                    vocab_size: int = VOCAB_SIZE):
+                    vocab_size: int = VOCAB_SIZE,
+                    allow_empty_cells: bool = False):
     """-> (train_loader, eval_loaders) with one eval loader PER CELL.
 
     stage picks which pool to train on: 'pretrain' trains on A, 'adapter'
@@ -238,7 +239,11 @@ def get_dataloaders(stage: str = 'adapter', batch_size: int = 64,
     if stage not in ('pretrain', 'adapter', 'union'):
         raise ValueError(
             f"stage must be 'pretrain', 'adapter' or 'union', got {stage!r}")
-    info = validate_split(pretrain, adapter, unseen, n_cycles, vocab_size)
+    # Must forward allow_empty_cells: this re-validates, and without it the
+    # caller's flag is silently dropped and the split is rejected here
+    # instead -- after main() already accepted it.
+    info = validate_split(pretrain, adapter, unseen, n_cycles, vocab_size,
+                          allow_empty_cells)
 
     # 'union' = A u B, for single-stage runs that train from scratch. Note
     # this collapses the evaluation partition: pretrain_only, finetune_only

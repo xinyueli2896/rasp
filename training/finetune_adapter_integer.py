@@ -227,7 +227,8 @@ def main():
                                       pretrain=a.pretrain,
                                       adapter=a.adapter_pool,
                                       unseen=a.unseen,
-                                      vocab_size=a.vocab_size)
+                                      vocab_size=a.vocab_size,
+                                      allow_empty_cells=a.allow_empty_cells)
     params = [q for q in model.parameters() if q.requires_grad]
     crit, opt = nn.CrossEntropyLoss(), optim.AdamW(
         params, lr=a.lr, weight_decay=a.weight_decay)
