@@ -3,3 +3,8 @@ numpy>=1.24.0
 
 # Optional: only needed for LoRA training (--use_lora flag)
 # peft>=0.9.0
+
+# Optional — needed only to COMPILE the rule models (models/tracr_to_torch.py).
+# Using the cached .pt in checkpoints/rule_models/ needs none of these.
+#   pip install jax jaxlib dm-haiku chex einops
+#   pip install git+https://github.com/google-deepmind/tracr.git
