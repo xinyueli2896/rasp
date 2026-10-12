@@ -53,7 +53,8 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
                 enc_logits = model.get_encoder_logits(inp)
                 if enc_logits is not None:
                     enc_type = model.rule_input_encoder.encoder_type
-                    enc_tgt  = inp if enc_type in ('token_mlp', 'embedding') else tgt
+                    enc_tgt  = inp if enc_type in ('token_mlp', 'embedding',
+                                                  'linear', 'mlp') else tgt
                     enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE), enc_tgt.reshape(-1))
                     loss = loss + enc_loss_weight * enc_loss
                     total_enc_loss    += enc_loss.item() * enc_tgt.numel()
@@ -196,6 +197,9 @@ def train(args):
             encoder_n_heads  = args.encoder_n_heads,
             rule_mode        = args.rule_mode,
             rule_view        = args.rule_view,
+            rule_input       = args.rule_input,
+            rule_enc_type    = args.rule_enc_type,
+            rule_enc_hidden  = args.rule_enc_hidden,
         )
 
     if args.phase2_epochs > 0:
@@ -296,6 +300,20 @@ def get_args():
                         'shared with the CP bass experiment) -- a head retrieves the '
                         'starter and an MLP computes the next token, so the rule is in '
                         'the weights. Use --rule_view to choose what the adapter reads.')
+    p.add_argument('--rule_input',         type=str,   default='tokens',
+                   choices=['tokens', 'ar_state'],
+                   help="tokens: the rule model reads the token sequence. "
+                        "ar_state: NO input to the rule model -- the AR's "
+                        "representation before the transformer blocks is encoded "
+                        "into the rule model's token subspace instead. Requires "
+                        "--rule_mode compiled.")
+    p.add_argument('--rule_enc_type',      type=str,   default='mlp',
+                   choices=['linear', 'mlp'],
+                   help='Encoder for --rule_input ar_state. Output is softmaxed: '
+                        'the compiled MLP gates pairs with ReLU(k + p - 1), which '
+                        'needs every dimension in [0, 1].')
+    p.add_argument('--rule_enc_hidden',    type=int,   default=64,
+                   help='Hidden width for --rule_enc_type mlp.')
     p.add_argument('--rule_view',          type=str,   default='key_phase',
                    choices=['root_next', 'key_phase', 'computed', 'full'],
                    help='Only with --rule_mode compiled. root_next (12) hands the '

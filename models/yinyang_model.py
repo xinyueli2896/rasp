@@ -13,6 +13,7 @@ from models.transformer              import AutoregressiveTransformer
 from models.rule_model               import RuleModelWrapper
 from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
 from models.rasp_compiled_rule       import RaspCompiledRule
+from models.ar_state_encoder         import ARStateRuleEncoder
 from data.dataset                    import VOCAB_SIZE
 
 # rule_hidden is the 28-dim hidden state from the rule model:
@@ -478,6 +479,9 @@ class YinyangModel(nn.Module):
         encoder_n_heads:  int  = 4,
         rule_mode:        str  = 'period4',    # 'period4'|'seed_broadcast'|'compiled'
         rule_view:        str  = 'key_phase',  # only with rule_mode='compiled'
+        rule_input:       str  = 'tokens',     # 'tokens' | 'ar_state'
+        rule_enc_type:    str  = 'mlp',        # 'linear' | 'mlp'
+        rule_enc_hidden:  int  = 64,
     ):
         super().__init__()
         self.n_layers         = n_layers
@@ -544,6 +548,26 @@ class YinyangModel(nn.Module):
                 rule_mode      = rule_mode,
             ).to(device)
         self.rule_d_model = rule_d_model
+
+        # No-rule-input variant: the rule model receives nothing external. The
+        # AR's pre-block representation is encoded into the rule model's token
+        # subspace instead. Requires the compiled rule model, whose embedding
+        # is a plain subspace write; the analytical model indexes W_E by token
+        # id and has no float entry point.
+        self.rule_input = rule_input
+        if rule_input == 'ar_state':
+            if rule_mode != 'compiled':
+                raise ValueError("rule_input='ar_state' requires "
+                                 "rule_mode='compiled'")
+            if bidirectional:
+                raise ValueError("rule_input='ar_state' and bidirectional are "
+                                 "mutually exclusive")
+            self.rule_input_encoder = ARStateRuleEncoder(
+                d_model      = d_model,
+                vocab_size   = VOCAB_SIZE,
+                encoder_type = rule_enc_type,
+                hidden       = rule_enc_hidden,
+            ).to(device)
 
         if encoder_injected and rule_mode == 'compiled':
             raise ValueError("encoder_injected is not supported with "
@@ -649,6 +673,41 @@ class YinyangModel(nn.Module):
 
         return h_out
 
+    def _ar_state(self, idx: torch.Tensor) -> torch.Tensor:
+        """AR representation BEFORE the transformer blocks: (B, T, d_model).
+
+        tok_emb + pos_emb, deliberately WITHOUT ar.drop.  Dropout would draw a
+        mask here independent of the one _forward_layerwise draws, so the
+        encoder would not see what layer 0 sees -- which is the whole point of
+        reading this representation.  Worse, it would make the rule signal
+        randomly masked during training and deterministic at eval, a train/test
+        mismatch in the one pathway that is supposed to be reliable.  The AR's
+        own stack still applies its dropout; only this read is clean.
+        """
+        ar = self._ar_base
+        T  = idx.shape[1]
+        tok = ar.tok_emb(idx)
+        pos = ar.pos_emb(torch.arange(T, device=idx.device).unsqueeze(0))
+        return tok + pos
+
+    def _ar_state_rule_hidden(self, idx: torch.Tensor) -> torch.Tensor:
+        """rule_hidden with no external input to the rule model.
+
+        encoder(x0) replaces the token one-hots; the frozen phase embeddings,
+        the frozen head and the frozen MLP all run unchanged on top, so the
+        encoder is shaped by the compiled structure rather than free to write
+        anything it likes.
+        """
+        rm   = self.rule_model
+        T    = idx.shape[1]
+        dev  = idx.device
+        p    = self.rule_input_encoder(self._ar_state(idx))        # (B, T, 12)
+        h    = F.pad(p, (0, rm.d_model - p.shape[-1]))             # (B, T, 44)
+        h    = (h + rm.W_phase[rm.phase_at(T, dev, 0)].unsqueeze(0)
+                  + rm.W_phase_next[rm.phase_at(T, dev, rm.shift)].unsqueeze(0))
+        h    = rm.mlp(rm.attention(h))
+        return h.index_select(-1, rm._view_dims)
+
     def forward(self, idx: torch.Tensor,
                 indices_query: torch.Tensor | None = None,
                 indices_key:   torch.Tensor | None = None) -> torch.Tensor:
@@ -656,6 +715,8 @@ class YinyangModel(nn.Module):
             rule_hidden = None
         elif self.encoder_injected:
             rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 28)
+        elif self.rule_input == 'ar_state':
+            rule_hidden = self._ar_state_rule_hidden(idx)
         elif self.rule_mode == 'compiled':
             # Only the selected view, not the whole 44-dim stream.
             rule_hidden = self.rule_model.rule_hidden(idx)
@@ -677,6 +738,10 @@ class YinyangModel(nn.Module):
           compare against idx (current token).
         Returns None for encoder types without vocab-space logits.
         """
+        if self.rule_input == 'ar_state':
+            # Pre-softmax scores; the auxiliary CE target is the CURRENT token,
+            # since the encoder's job is to name the pitch class at t.
+            return self.rule_input_encoder.logits(self._ar_state(idx))
         if not (self.encoder_injected and hasattr(self, 'rule_input_encoder')):
             return None
         enc = self.rule_input_encoder
@@ -751,6 +816,9 @@ def build_yinyang_model(
     encoder_n_heads:   int  = 4,
     rule_mode:         str  = 'period4',
     rule_view:         str  = 'key_phase',
+    rule_input:        str  = 'tokens',
+    rule_enc_type:     str  = 'mlp',
+    rule_enc_hidden:   int  = 64,
 ) -> YinyangModel:
     return YinyangModel(
         ar_ckpt_path     = ar_ckpt_path,
@@ -773,6 +841,9 @@ def build_yinyang_model(
         encoder_n_heads  = encoder_n_heads,
         rule_mode        = rule_mode,
         rule_view        = rule_view,
+        rule_input       = rule_input,
+        rule_enc_type    = rule_enc_type,
+        rule_enc_hidden  = rule_enc_hidden,
     )
 
 
