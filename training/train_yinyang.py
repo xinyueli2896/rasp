@@ -40,8 +40,10 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
         total_loss, total_correct, total_tokens = 0.0, 0, 0
         total_main_loss = 0.0
         total_enc_loss, total_enc_correct = 0.0, 0
+        enc_tok_seen, enc_p0_correct, enc_p0_seen = 0, 0, 0
 
         enc_loss_weight = getattr(args, 'enc_loss_weight', 0.0)
+        has_encoder     = hasattr(model, 'rule_input_encoder')
 
         for inp, tgt in train_loader:
             inp, tgt = inp.to(device), tgt.to(device)
@@ -49,16 +51,38 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
             main_loss = criterion(logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
             loss      = main_loss
 
-            if enc_loss_weight > 0:
+            # Encoder metrics are computed whenever an encoder exists, not only
+            # when the auxiliary loss is on -- the aux=0 runs need the same
+            # diagnostic. The loss term itself is still gated on the weight.
+            if has_encoder:
                 enc_logits = model.get_encoder_logits(inp)
                 if enc_logits is not None:
                     enc_type = model.rule_input_encoder.encoder_type
                     enc_tgt  = inp if enc_type in ('token_mlp', 'embedding',
                                                   'linear', 'mlp') else tgt
-                    enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE), enc_tgt.reshape(-1))
-                    loss = loss + enc_loss_weight * enc_loss
-                    total_enc_loss    += enc_loss.item() * enc_tgt.numel()
-                    total_enc_correct += (enc_logits.argmax(-1) == enc_tgt).sum().item()
+                    enc_loss = criterion(enc_logits.reshape(-1, VOCAB_SIZE),
+                                         enc_tgt.reshape(-1))
+                    if enc_loss_weight > 0:
+                        loss = loss + enc_loss_weight * enc_loss
+
+                    with torch.no_grad():
+                        pred = enc_logits.argmax(-1)
+                        hit  = (pred == enc_tgt)
+                        total_enc_loss    += enc_loss.item() * enc_tgt.numel()
+                        total_enc_correct += hit.sum().item()
+                        enc_tok_seen      += enc_tgt.numel()
+
+                        # Only phase-0 slots are read by Select(phase == 0);
+                        # the encoder's output elsewhere is discarded, so this
+                        # is the accuracy that actually predicts rule-following.
+                        rm = model.rule_model
+                        T  = inp.shape[1]
+                        if hasattr(rm, 'phase_at'):
+                            p0 = (rm.phase_at(T, inp.device, 0) == 0)
+                        else:
+                            p0 = (torch.arange(T, device=inp.device) % 4 == 0)
+                        enc_p0_correct += hit[:, p0].sum().item()
+                        enc_p0_seen    += hit[:, p0].numel()
 
             optimizer.zero_grad()
             loss.backward()
@@ -74,8 +98,9 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
         train_loss = total_loss    / total_tokens
         main_loss  = total_main_loss / total_tokens
         train_acc  = total_correct / total_tokens
-        enc_loss   = total_enc_loss    / total_tokens if total_enc_loss > 0 else float('nan')
-        enc_acc    = total_enc_correct / total_tokens if total_enc_loss > 0 else float('nan')
+        enc_loss   = total_enc_loss    / enc_tok_seen if enc_tok_seen else float('nan')
+        enc_acc    = total_enc_correct / enc_tok_seen if enc_tok_seen else float('nan')
+        enc_p0_acc = enc_p0_correct    / enc_p0_seen  if enc_p0_seen  else float('nan')
 
         model.eval()
         with torch.no_grad():
@@ -88,11 +113,12 @@ def _run_training(model, train_loader, test_loader, args, device, epochs, ckpt_p
         test_acc = test_correct / test_tokens
 
         if epoch % args.log_every == 0 or epoch == epochs:
-            if total_enc_loss > 0:
+            if enc_tok_seen:
                 print(
                     f'Epoch {epoch:4d}/{epochs}  '
                     f'main_loss={main_loss:.4f}  train_acc={train_acc:.4f}  '
                     f'enc_loss={enc_loss:.4f}  enc_acc={enc_acc:.4f}  '
+                    f'enc_acc_p0={enc_p0_acc:.4f}  '
                     f'test_acc(unseen)={test_acc:.4f}'
                 )
             else:
