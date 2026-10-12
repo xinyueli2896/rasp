@@ -43,6 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
+from models.bass_rasp_compiled    import BassRaspCompiled
 
 
 # ---------------------------------------------------------------------------
@@ -227,11 +228,14 @@ class CPYinyangTransformer(nn.Module):
         encoder_injected: bool = False,
         encoder_type:     str  = 'embedding',
         rule_mode:        str  = 'current',
+        rule_view:        str  = 'key_phase',
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
         assert not (encoder_injected and rule_mode != 'current'), \
             "encoder_injected only supported with rule_mode='current'"
+        assert rule_mode != 'compiled' or not bidirectional, \
+            "rule_mode='compiled' and --bidirectional are mutually exclusive"
         assert encoder_type in ('embedding', 'token_mlp'), \
             f"encoder_type must be 'embedding' or 'token_mlp', got {encoder_type!r}"
         super().__init__()
@@ -257,13 +261,25 @@ class CPYinyangTransformer(nn.Module):
             f"n_global_layers ({n_layers}) must be divisible by n_skip ({n_skip})"
         n_adapters = n_layers // n_skip
 
-        # Frozen analytical rule model — zero trainable parameters (unused when bidirectional)
-        self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
+        # Frozen rule model — zero trainable parameters (unused when bidirectional).
+        # 'compiled' is the full TracR compilation: the attention head retrieves
+        # the key and an MLP computes the root, so the rule lives in the weights.
+        # rule_view then picks which subspaces become rule_hidden.
+        self.rule_mode = rule_mode
+        self.rule_view = rule_view
+        if rule_mode == 'compiled':
+            self.rule_model = BassRaspCompiled(shift=1, view=rule_view)
+        else:
+            self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
+        # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the
+        # width of the selected view, which is what the adapter actually reads.
+        rule_width = getattr(self.rule_model, 'rule_d_model',
+                             self.rule_model.d_model)
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
                 d_model      = self.base.hidden_size,
-                rule_d_model = self.rule_model.d_model,
+                rule_d_model = rule_width,
                 embed_dim    = adapter_rank,
                 n_heads      = 8,
             )
@@ -340,6 +356,9 @@ class CPYinyangTransformer(nn.Module):
         hidden[t] encodes the CURRENT pitch class: (key + OFFSETS[t%4]) % 12.
         """
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
+        if self.rule_mode == 'compiled':
+            # Returns only the selected view, not the whole 44-dim stream.
+            return self.rule_model.rule_hidden(pc)
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
         return h
 

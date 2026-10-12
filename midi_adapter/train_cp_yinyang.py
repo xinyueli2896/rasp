@@ -299,6 +299,7 @@ def main(args):
         encoder_injected  = args.encoder_injected,
         encoder_type      = args.encoder_type,
         rule_mode         = args.rule_mode,
+        rule_view         = args.rule_view,
     )
 
     if args.unfreeze_base:
@@ -459,10 +460,22 @@ def get_args():
                         'Directly supervises dims 0-11 of encoder output to predict the current pc. '
                         'Only active when --encoder_injected. Recommended: 1.0.')
     p.add_argument('--rule_mode', type=str, default='current',
-                   choices=['current', 'period4', 'seed_broadcast'],
+                   choices=['current', 'period4', 'seed_broadcast', 'compiled'],
                    help='current: analytical 16-dim rule model (existing); '
                         'period4: TRACR attention 28-dim, dims 12-23=next pc; '
-                        'seed_broadcast: 28-dim, dims 12-23=seed pc.')
+                        'seed_broadcast: 28-dim, dims 12-23=seed pc; '
+                        'compiled: full TracR compilation (BassRaspCompiled) -- '
+                        'attention head retrieves the key, MLP computes the next '
+                        'root, so the rule is in the weights. Use --rule_view to '
+                        'choose which subspaces the adapter reads.')
+    p.add_argument('--rule_view', type=str, default='key_phase',
+                   choices=['root_next', 'key_phase', 'computed', 'full'],
+                   help='Only with --rule_mode compiled. Which subspaces become '
+                        'rule_hidden: root_next (12) hands the adapter the answer, '
+                        'so it only has to copy; key_phase (16) hands it the key '
+                        'and the next phase, so it must learn '
+                        '(key + OFFSETS[p]) %% 12; computed (32) is everything the '
+                        'network computed; full (44) adds the raw token echo.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
