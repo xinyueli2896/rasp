@@ -420,7 +420,7 @@ def run_evaluation(args):
         enc_labels = list(enc_results.keys())
         def _enc_w(lbl): return max(len(_short(lbl)), 5)
         print()
-        print("ENCODER TOKEN ACCURACY  (token_mlp/embedding: current token; others: next token)")
+        print("ENCODER TOKEN ACCURACY  (ar_state/token_mlp/embedding: current token; shift encoders: next token)")
         enc_header = f"{'Data Split':<20} {'Starters':<15}"
         for lbl in enc_labels:
             enc_header += f" {_short(lbl):>{_enc_w(lbl)}}"
