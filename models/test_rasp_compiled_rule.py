@@ -12,8 +12,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.bass_rasp_compiled import (
-    BassRaspCompiled, VIEWS, VIEW_WIDTH, view_dims,
+from models.rasp_compiled_rule import (
+    RaspCompiledRule, VIEWS, VIEW_WIDTH, view_dims,
     N_ROOTS, N_POS, TOK_BASE, KEY_BASE, PH_BASE, PHN_BASE, ROOT_BASE, D_MODEL,
 )
 from models.bass_tracr_rule_model import BassTracrRuleModel
@@ -33,7 +33,7 @@ def seq(key, T):
 
 def main():
     T = 24
-    m = BassRaspCompiled()           # shift=1 -> next root
+    m = RaspCompiledRule()           # shift=1 -> next root
 
     print('\n1. exactness: root_next[t] == token[t+1], every key, every position')
     worst = 1.0
@@ -50,7 +50,7 @@ def main():
     check('output is a clean one-hot', abs(worst - 1.0) < 1e-5)
 
     print('\n2. shift=0 gives the CURRENT root instead')
-    m0 = BassRaspCompiled(shift=0)
+    m0 = RaspCompiledRule(shift=0)
     idx = torch.tensor([seq(6, T)])
     check('shift=0 reproduces the input', m0(idx).argmax(-1)[0].tolist() == seq(6, T))
 
@@ -112,16 +112,16 @@ def main():
     idx = torch.tensor([seq(6, T)])
     expected = {'root_next': 12, 'key_phase': 16, 'computed': 32, 'full': 44}
     for view, width in expected.items():
-        mv = BassRaspCompiled(view=view)
+        mv = RaspCompiledRule(view=view)
         rh = mv.rule_hidden(idx)
         check(f'{view:<10} width {width}',
               VIEW_WIDTH[view] == width and rh.shape[-1] == width
               and mv.rule_d_model == width)
     # content checks
-    mv = BassRaspCompiled(view='root_next')
+    mv = RaspCompiledRule(view='root_next')
     check('root_next view IS the answer',
           mv.rule_hidden(idx)[0, :T - 1].argmax(-1).tolist() == idx[0, 1:].tolist())
-    mv = BassRaspCompiled(view='key_phase')
+    mv = RaspCompiledRule(view='key_phase')
     rh = mv.rule_hidden(idx)
     check('key_phase view carries the key', rh[0, :, :N_ROOTS].argmax(-1).tolist()
           == [6] * T)

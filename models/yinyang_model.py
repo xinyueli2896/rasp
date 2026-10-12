@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from models.transformer              import AutoregressiveTransformer
 from models.rule_model               import RuleModelWrapper
 from models.tracr_pytorch_rule_model import TracrPyTorchRuleModel
+from models.rasp_compiled_rule       import RaspCompiledRule
 from data.dataset                    import VOCAB_SIZE
 
 # rule_hidden is the 28-dim hidden state from the rule model:
@@ -41,7 +42,7 @@ class YinyangCrossAttention(nn.Module):
     def __init__(
         self,
         d_model:      int,
-        rule_d_model: int,   # kept for API compat (unused; input is always VOCAB_SIZE)
+        rule_d_model: int,   # width of rule_hidden; set by the rule model / view
         embed_dim:    int,
         n_heads:      int = 4,
         dropout:      float = 0.1,
@@ -53,8 +54,12 @@ class YinyangCrossAttention(nn.Module):
         self.head_dim  = embed_dim // n_heads
         self.embed_dim = embed_dim
 
-        # V reads from rule hidden state (RULE_D_MODEL=28); output goes to AR residual (d_model)
-        self.v_proj   = nn.Linear(RULE_D_MODEL, embed_dim)
+        # V reads from rule_hidden (width rule_d_model: 28 for the analytical
+        # rule model, or the selected view width for rule_mode='compiled');
+        # output goes to the AR residual (d_model).  This used to hardcode
+        # RULE_D_MODEL, silently ignoring the argument.
+        self.rule_d_model = rule_d_model
+        self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
 
         self.gate      = nn.Parameter(torch.ones(1))
@@ -471,7 +476,8 @@ class YinyangModel(nn.Module):
         encoder_type:     str  = 'embedding',  # 'embedding' | 'transformer'
         encoder_n_layers: int  = 2,
         encoder_n_heads:  int  = 4,
-        rule_mode:        str  = 'period4',    # 'period4' | 'seed_broadcast'
+        rule_mode:        str  = 'period4',    # 'period4'|'seed_broadcast'|'compiled'
+        rule_view:        str  = 'key_phase',  # only with rule_mode='compiled'
     ):
         super().__init__()
         self.n_layers         = n_layers
@@ -519,13 +525,30 @@ class YinyangModel(nn.Module):
             self.ar_model = ar_model
             self._ar_base = ar_model
 
-        self.rule_model = RuleModelWrapper(
-            max_seq_len    = max_seq_len,
-            rule_d_model   = rule_d_model,
-            force_fallback = force_fallback,
-            rule_mode      = rule_mode,
-        ).to(device)
+        # 'compiled' is the complete TracR compilation shared with the CP bass
+        # experiment: the head retrieves the starter and an MLP computes the
+        # next token, so the rule lives in the weights rather than in Python.
+        # rule_view then selects which subspaces become rule_hidden.
+        self.rule_mode = rule_mode
+        self.rule_view = rule_view
+        if rule_mode == 'compiled':
+            self.rule_model = RaspCompiledRule(
+                subbeats_per_chord = 1, shift = 1, view = rule_view,
+            ).to(device)
+            rule_d_model = self.rule_model.rule_d_model
+        else:
+            self.rule_model = RuleModelWrapper(
+                max_seq_len    = max_seq_len,
+                rule_d_model   = rule_d_model,
+                force_fallback = force_fallback,
+                rule_mode      = rule_mode,
+            ).to(device)
+        self.rule_d_model = rule_d_model
 
+        if encoder_injected and rule_mode == 'compiled':
+            raise ValueError("encoder_injected is not supported with "
+                             "rule_mode='compiled' (the encoder path writes into "
+                             "the analytical model's 28-dim layout)")
         if encoder_injected:
             # Learned encoder replaces W_E[tokens] before the frozen W_Q/K/V/O block.
             # rule_d_model must stay 28 so shapes match.
@@ -633,11 +656,10 @@ class YinyangModel(nn.Module):
             rule_hidden = None
         elif self.encoder_injected:
             rule_hidden = self._encoder_injected_rule_hidden(idx)   # (B, T, 28)
+        elif self.rule_mode == 'compiled':
+            # Only the selected view, not the whole 44-dim stream.
+            rule_hidden = self.rule_model.rule_hidden(idx)
         else:
-            # rule_hidden: h_out (B, T, 28) from the rule transformer.
-            # dims  0-11 : one-hot current token t_q
-            # dims 12-23 : one-hot next token
-            # dims 24-27 : one-hot q % 4
             _, rule_hidden = self.rule_model(idx, return_hidden=True)
             rule_hidden = rule_hidden.to(idx.device)
         logits, _ = self._forward_layerwise(idx, rule_hidden,
@@ -728,6 +750,7 @@ def build_yinyang_model(
     encoder_n_layers:  int  = 2,
     encoder_n_heads:   int  = 4,
     rule_mode:         str  = 'period4',
+    rule_view:         str  = 'key_phase',
 ) -> YinyangModel:
     return YinyangModel(
         ar_ckpt_path     = ar_ckpt_path,
@@ -749,6 +772,7 @@ def build_yinyang_model(
         encoder_n_layers = encoder_n_layers,
         encoder_n_heads  = encoder_n_heads,
         rule_mode        = rule_mode,
+        rule_view        = rule_view,
     )
 
 

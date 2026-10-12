@@ -195,6 +195,7 @@ def train(args):
             encoder_n_layers = args.encoder_n_layers,
             encoder_n_heads  = args.encoder_n_heads,
             rule_mode        = args.rule_mode,
+            rule_view        = args.rule_view,
         )
 
     if args.phase2_epochs > 0:
@@ -287,10 +288,21 @@ def get_args():
                    help='Train on union of AR pretrain + adapter finetune starters')
     p.add_argument('--seed',               type=int,   default=42)
     p.add_argument('--rule_mode',          type=str,   default='period4',
-                   choices=['period4', 'seed_broadcast'],
+                   choices=['period4', 'seed_broadcast', 'compiled'],
                    help='period4: rule model attends to k=q-3, dims 12-23 = e_{next_token}. '
                         'seed_broadcast: all queries attend to seed positions (k%%4==0), '
-                        'dims 12-23 = e_{starter}. Adapter must do more work in seed_broadcast.')
+                        'dims 12-23 = e_{starter}. Adapter must do more work in seed_broadcast. '
+                        'compiled: the complete TracR compilation (RaspCompiledRule, '
+                        'shared with the CP bass experiment) -- a head retrieves the '
+                        'starter and an MLP computes the next token, so the rule is in '
+                        'the weights. Use --rule_view to choose what the adapter reads.')
+    p.add_argument('--rule_view',          type=str,   default='key_phase',
+                   choices=['root_next', 'key_phase', 'computed', 'full'],
+                   help='Only with --rule_mode compiled. root_next (12) hands the '
+                        'adapter the answer, so it only has to copy; key_phase (16) '
+                        'hands it the starter and the next phase, so it must learn '
+                        '(x + OFFSETS[p]) %% 12; computed (32) is everything the network '
+                        'computed; full (44) adds the raw token echo.')
     return p.parse_args()
 
 

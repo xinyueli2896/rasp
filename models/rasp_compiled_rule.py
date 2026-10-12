@@ -1,5 +1,13 @@
 """
-Complete TracR compilation of the bass rule, in PyTorch.
+Complete TracR compilation of the I-IV-V-I rule, in PyTorch.
+
+Shared by BOTH experiments. The integer task
+    token[i] = (x + OFFSETS[i % 4]) % 12
+and the CP bass task
+    root[t]  = (key + OFFSETS[t % 4]) % 12
+are the same RASP program over the same vocabulary (12) with the same
+offsets; only the carrier differs (an integer token vs a bass note).
+One compiled model therefore serves both, with subbeats_per_chord=1.
 
 BassTracrRuleModel compiles only half the RASP program: an attention head that
 retrieves the key.  The arithmetic (key, phase) -> root is done in Python
@@ -124,7 +132,7 @@ def view_dims(view: str) -> list[int]:
     return [b + i for b, n in VIEWS[view] for i in range(n)]
 
 
-class BassRaspCompiled(nn.Module):
+class RaspCompiledRule(nn.Module):
     """One attention head + one MLP: the whole bass rule, compiled."""
 
     D_MODEL: int = D_MODEL
@@ -269,8 +277,12 @@ if __name__ == '__main__':
     print(f'd_model = {D_MODEL}   views: '
           + ', '.join(f'{k}={v}' for k, v in VIEW_WIDTH.items()))
     for view in VIEWS:
-        m = BassRaspCompiled(view=view)
+        m = RaspCompiledRule(view=view)
         idx = torch.tensor([[(6 + OFFSETS[t % 4]) % 12 for t in range(8)]])
         rh = m.rule_hidden(idx)
         print(f'  {view:<10} rule_d_model={m.rule_d_model:<3} '
               f'rule_hidden={tuple(rh.shape)}')
+
+
+# Backwards-compatible alias: this started life as a bass-only module.
+BassRaspCompiled = RaspCompiledRule

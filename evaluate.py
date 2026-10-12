@@ -78,6 +78,25 @@ def load_yinyang(label, ckpt_path, args, device):
     state = torch.load(ckpt_path, map_location=device)
     has_lora = any('lora_' in k for k in state)
 
+    # rule_hidden width is recoverable from v_proj: 28 is the analytical rule
+    # model, anything else is a rule_mode='compiled' view. Reading it from the
+    # checkpoint means a run cannot be rebuilt at the wrong shape by forgetting
+    # a flag -- the failure probe_run.sh exists to prevent.
+    from models.rasp_compiled_rule import VIEW_WIDTH
+    rule_view = None
+    for k, v in state.items():
+        if k.endswith('v_proj.weight'):
+            width = v.shape[1]
+            if width != 28:
+                match = [n for n, w in VIEW_WIDTH.items() if w == width]
+                if not match:
+                    raise SystemExit(
+                        f'{ckpt_path}: v_proj expects rule_hidden width {width}, '
+                        f'which is neither 28 nor any known view {VIEW_WIDTH}')
+                rule_view = match[0]
+                rule_mode = 'compiled'
+            break
+
     lora_rank = 16
     for k, v in state.items():
         if 'lora_A' in k:
@@ -118,6 +137,7 @@ def load_yinyang(label, ckpt_path, args, device):
         lora_rank        = lora_rank,
         force_fallback   = args.force_fallback,
         device           = str(device),
+        rule_view        = rule_view or 'key_phase',
         bidirectional    = is_bidir,
         encoder_injected = is_enc_inj,
         encoder_type     = enc_type,

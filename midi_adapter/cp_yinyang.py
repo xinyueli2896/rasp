@@ -43,7 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
-from models.bass_rasp_compiled    import BassRaspCompiled
+from models.rasp_compiled_rule     import RaspCompiledRule
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ class CPYinyangTransformer(nn.Module):
         self.rule_mode = rule_mode
         self.rule_view = rule_view
         if rule_mode == 'compiled':
-            self.rule_model = BassRaspCompiled(shift=1, view=rule_view)
+            self.rule_model = RaspCompiledRule(shift=1, view=rule_view)
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
         # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the
