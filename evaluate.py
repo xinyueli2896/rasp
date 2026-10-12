@@ -231,8 +231,20 @@ def encoder_token_acc(model, starters, n_cycles, device):
     if not hasattr(model, 'rule_input_encoder'):
         return None, None
     enc_type = model.rule_input_encoder.encoder_type
-    current_token_mode = enc_type in ('token_mlp', 'embedding')
-    results = {}
+    # Decide the target by which encoder this is, NOT by the type name:
+    # ARStateRuleEncoder uses 'linear'/'mlp', and 'mlp' collides with the
+    # legacy shift-predicting encoder of the same name. Scored against the
+    # next token, a perfect current-token encoder reports exactly the rate at
+    # which current == next -- 7/31 = 0.226 for n_cycles=8 -- which reads as
+    # failure when it is the opposite.
+    is_ar_state = getattr(model, 'rule_input', 'tokens') == 'ar_state'
+    current_token_mode = is_ar_state or enc_type in ('token_mlp', 'embedding')
+
+    # Only phase-0 slots are read by Select(phase == 0); the encoder's output
+    # elsewhere is discarded, so this is the accuracy that predicts whether
+    # the rule signal survives.
+    rm = getattr(model, 'rule_model', None)
+    results, results_p0 = {}, {}
     for x in starters:
         seq = make_sequence(x, n_cycles)
         inp = torch.tensor([seq[:-1]], dtype=torch.long, device=device)
@@ -241,9 +253,18 @@ def encoder_token_acc(model, starters, n_cycles, device):
         if enc_logits is None:
             return None, None
         ref = inp if current_token_mode else tgt
-        correct = (enc_logits.argmax(-1) == ref).sum().item()
-        results[x] = correct / ref.numel()
-    return results, float(np.mean(list(results.values())))
+        hit = (enc_logits.argmax(-1) == ref)
+        results[x] = hit.sum().item() / ref.numel()
+        T = inp.shape[1]
+        if rm is not None and hasattr(rm, 'phase_at'):
+            p0 = (rm.phase_at(T, inp.device, 0) == 0)
+        else:
+            p0 = (torch.arange(T, device=inp.device) % 4 == 0)
+        results_p0[x] = hit[:, p0].sum().item() / hit[:, p0].numel()
+    mean   = float(np.mean(list(results.values())))
+    mean_0 = float(np.mean(list(results_p0.values())))
+    encoder_token_acc.last_phase0 = mean_0
+    return results, mean
 
 
 # ---------------------------------------------------------------------------
