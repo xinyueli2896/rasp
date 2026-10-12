@@ -108,8 +108,21 @@ def load_yinyang(label, ckpt_path, args, device):
     n_skip        = args.n_layers // max(n_adapters, 1)
     # Detect bidirectional: only BidirectionalYinyangAttention has ar_to_rule
     is_bidir      = any('ar_to_rule' in k for k in state)
-    # Detect encoder_injected and encoder_type from saved keys
-    is_enc_inj    = any(k.startswith('rule_input_encoder.') for k in state)
+    # Two different encoders can sit under rule_input_encoder.*:
+    #   ARStateRuleEncoder  (rule_input='ar_state')  -> fc_out[.weight], maybe fc1
+    #   LearnedRuleInputEncoder (encoder_injected)   -> embedding / token_logits / ...
+    # They are mutually exclusive and need different constructor flags, so
+    # decide which by the key names rather than by the prefix alone.
+    is_ar_state   = any(k.startswith('rule_input_encoder.fc_out') for k in state)
+    is_enc_inj    = (not is_ar_state
+                     and any(k.startswith('rule_input_encoder.') for k in state))
+    rule_input    = 'ar_state' if is_ar_state else 'tokens'
+    rule_enc_type = 'linear'
+    rule_enc_hidden = 64
+    if is_ar_state:
+        w1 = state.get('rule_input_encoder.fc1.weight')
+        if w1 is not None:
+            rule_enc_type, rule_enc_hidden = 'mlp', w1.shape[0]
     if any('token_logits' in k for k in state):
         enc_type = 'softmax'
     elif any('mlp_fc1' in k for k in state):
@@ -138,6 +151,9 @@ def load_yinyang(label, ckpt_path, args, device):
         force_fallback   = args.force_fallback,
         device           = str(device),
         rule_view        = rule_view or 'key_phase',
+        rule_input       = rule_input,
+        rule_enc_type    = rule_enc_type,
+        rule_enc_hidden  = rule_enc_hidden,
         bidirectional    = is_bidir,
         encoder_injected = is_enc_inj,
         encoder_type     = enc_type,
@@ -155,6 +171,9 @@ def load_yinyang(label, ckpt_path, args, device):
     enc_state = {k.removeprefix('rule_input_encoder.'): v
                  for k, v in state.items() if k.startswith('rule_input_encoder.')}
     if enc_state and hasattr(model, 'rule_input_encoder'):
+        if is_ar_state:
+            print(f"  {label:<12}: rule_input=ar_state  encoder={rule_enc_type}"
+                  f"{'(hidden=%d)' % rule_enc_hidden if rule_enc_type == 'mlp' else ''}")
         try:
             model.rule_input_encoder.load_state_dict(enc_state, strict=False)
         except RuntimeError as e:
