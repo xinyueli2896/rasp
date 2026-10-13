@@ -134,7 +134,7 @@ def main(args):
         accelerator        = 'gpu' if use_gpu else 'cpu',
         precision          = precision,
         max_steps          = args.max_steps,
-        callbacks          = [checkpoint_cb],
+        callbacks          = callbacks,
         val_check_interval = args.val_check_interval,
         limit_val_batches  = 200,
         check_val_every_n_epoch = None,
@@ -143,6 +143,27 @@ def main(args):
         num_sanity_val_steps = 2,
         strategy           = strategy,
     )
+
+    # val_loss is a poor selector for this task: it is teacher-forced CE over
+    # every CP slot (program, pitch, duration, velocity, EOS, padding), while
+    # what matters is autoregressive voice-0 rule-following. On the previous
+    # pretrain the best-val_loss checkpoint (0.03494) scored 0.217 on its own
+    # training keys, and the whole val_loss range was 0.0349-0.0422 -- noise.
+    # Worse, save_top_k=5 DISCARDS checkpoints by that same criterion, so a
+    # good one can be deleted before it is ever evaluated. This second series
+    # keeps an unfiltered snapshot every N steps so selection can be done
+    # afterwards with evaluate_cp_bass, on the metric that matters.
+    callbacks = [checkpoint_cb]
+    if args.save_every_n_steps > 0:
+        callbacks.append(L.callbacks.ModelCheckpoint(
+            every_n_train_steps = args.save_every_n_steps,
+            save_top_k          = -1,          # keep them all
+            save_weights_only   = True,
+            enable_version_counter = False,
+            dirpath  = os.path.join(args.ckpt_dir, run_name),
+            filename = run_name + '.step{step:06d}',
+            auto_insert_metric_name = False,
+        ))
 
     ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
     trainer.fit(net, train_loader, val_loader, ckpt_path=ckpt_path)
@@ -168,6 +189,10 @@ def get_args():
     p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
     p.add_argument('--run_name',      type=str,  default=None)
+    p.add_argument('--save_every_n_steps', type=int, default=10000,
+                   help='Also keep an UNFILTERED checkpoint every N steps, so '
+                        'the final choice can be made on rule-following accuracy '
+                        'rather than on val_loss. 0 disables.')
     p.add_argument('--seed',          type=int,  default=42,
                    help='Seed for pl.seed_everything. Pass a distinct --run_name '
                         'per seed so the runs do not share a checkpoint dir.')
