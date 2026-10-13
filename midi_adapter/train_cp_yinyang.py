@@ -300,6 +300,9 @@ def main(args):
         encoder_type      = args.encoder_type,
         rule_mode         = args.rule_mode,
         rule_view         = args.rule_view,
+        rule_input        = args.rule_input,
+        rule_enc_type     = args.rule_enc_type,
+        rule_enc_hidden   = args.rule_enc_hidden,
     )
 
     if args.unfreeze_base:
@@ -489,6 +492,19 @@ def get_args():
                    help='Skip the TensorBoard logger. It is also skipped\n'
                         'automatically when neither tensorboard nor\n'
                         'tensorboardX is installed.')
+    p.add_argument('--rule_input',         type=str, default='tokens',
+                   choices=['tokens', 'ar_state'],
+                   help="tokens: the rule model reads the pitch-class stream. "
+                        "ar_state: NO external input -- the host's pre-block "
+                        "state is encoded into the rule model's token subspace. "
+                        "Requires --rule_mode compiled.")
+    p.add_argument('--rule_enc_type',      type=str, default='mlp',
+                   choices=['linear', 'mlp'],
+                   help='Encoder for --rule_input ar_state. Output is softmaxed: '
+                        'the compiled MLP gates pairs with ReLU(k + p - 1), which '
+                        'needs every dimension in [0, 1].')
+    p.add_argument('--rule_enc_hidden',    type=int, default=64,
+                   help='Hidden width for --rule_enc_type mlp.')
     p.add_argument('--sample_step',        type=int, default=1,
                    help='Align training window starts to a multiple of this. '
                         '4 = one I-IV-V-I cycle. Must match the base pretrain.')

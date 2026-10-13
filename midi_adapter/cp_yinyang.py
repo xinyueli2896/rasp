@@ -44,6 +44,7 @@ import torch.nn.functional as F
 
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
 from models.rasp_compiled_rule     import RaspCompiledRule
+from models.ar_state_encoder       import ARStateRuleEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +230,9 @@ class CPYinyangTransformer(nn.Module):
         encoder_type:     str  = 'embedding',
         rule_mode:        str  = 'current',
         rule_view:        str  = 'key_phase',
+        rule_input:       str  = 'tokens',     # 'tokens' | 'ar_state'
+        rule_enc_type:    str  = 'mlp',        # 'linear' | 'mlp'
+        rule_enc_hidden:  int  = 64,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -282,6 +286,25 @@ class CPYinyangTransformer(nn.Module):
         # width of the selected view, which is what the adapter actually reads.
         rule_width = getattr(self.rule_model, 'rule_d_model',
                              self.rule_model.d_model)
+
+        # No-rule-input variant: nothing external reaches the rule model. The
+        # host's own pre-block state -- cat([sos, local_encode(x)[:-1]]), which
+        # at index t encodes BEAT t-1, matching the rule model's input_shift=-1
+        # -- is encoded into the rule model's token subspace instead.
+        self.rule_input = rule_input
+        if rule_input == 'ar_state':
+            if rule_mode != 'compiled':
+                raise ValueError("rule_input='ar_state' requires rule_mode='compiled'")
+            if bidirectional or encoder_injected:
+                raise ValueError("rule_input='ar_state' is exclusive with "
+                                 "--bidirectional and --encoder_injected")
+            self.rule_input_encoder = ARStateRuleEncoder(
+                d_model      = self.base.hidden_size,
+                vocab_size   = 12,
+                encoder_type = rule_enc_type,
+                hidden       = rule_enc_hidden,
+            )
+        self._pre_block_cache = None
 
         self.yinyang_attn = nn.ModuleList([
             CPYinyangCrossAttention(
@@ -340,6 +363,22 @@ class CPYinyangTransformer(nn.Module):
         pos_emb = self.rule_model.W_pos[t_idx % 4]             # (T, d_model)
         return h + pos_emb.unsqueeze(0)
 
+    def _ar_state_encoder_logits(self, x_proc: torch.Tensor):
+        """(pre-softmax logits, target) for the ar_state encoder.
+
+        The target is the PREVIOUS beat's pitch class, because the pre-block
+        state at index t encodes beat t-1. Index 0 is excluded by pointing it
+        at itself, which costs one position out of T.
+        """
+        h_pre = self._pre_block_cache
+        if h_pre is None:
+            raise RuntimeError('call forward() before get_encoder_logits()')
+        pc = x_proc[:, :, 1] % 128 % 12
+        tgt = torch.zeros_like(pc)
+        tgt[:, 1:] = pc[:, :-1]
+        tgt[:, 0]  = pc[:, 0]
+        return self.rule_input_encoder.logits(h_pre), tgt
+
     def get_encoder_logits(self, x_proc: torch.Tensor):
         """Dims 0-11 of the raw encoder output as current-pitch-class logits.
 
@@ -348,6 +387,8 @@ class CPYinyangTransformer(nn.Module):
           cur_pc     : (B, T)      — ground-truth current pitch class
         Returns None if encoder_injected is False.
         """
+        if self.rule_input == 'ar_state':
+            return self._ar_state_encoder_logits(x_proc)
         if not self.encoder_injected:
             return None
         cur_pc  = self._cur_pc(x_proc)                           # (B, T)
@@ -376,6 +417,27 @@ class CPYinyangTransformer(nn.Module):
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
         return h
 
+    def _ar_state_rule_hidden(self, h_pre: torch.Tensor) -> torch.Tensor:
+        """rule_hidden with no external input to the rule model.
+
+        h_pre : (B, T, hidden_size) -- cat([sos, local_encode(x)[:-1]]), the
+        representation entering the global blocks. Index t encodes beat t-1,
+        which is exactly the shifted view the rule model expects at
+        input_shift=-1, so no further realignment is needed.
+        """
+        rm   = self.rule_model
+        T    = h_pre.shape[1]
+        dev  = h_pre.device
+        p    = self.rule_input_encoder(h_pre)                      # (B, T, 12)
+        h    = F.pad(p, (0, rm.d_model - p.shape[-1]))
+        h    = (h + rm.W_phase[rm.phase_at(T, dev, rm.input_shift)].unsqueeze(0)
+                  + rm.W_phase_next[
+                        rm.phase_at(T, dev, rm.input_shift + rm.shift)].unsqueeze(0))
+        h    = rm.mlp(rm.attention(h))
+        rh   = h.index_select(-1, rm._view_dims).clone()
+        rh[:, 0] = 0.0          # nothing is knowable before the first beat
+        return rh
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x : (B, seq_len, subseq_len)  preprocessed CP tokens
@@ -384,17 +446,22 @@ class CPYinyangTransformer(nn.Module):
         base = self.base
         batch_size, seq_len, _ = x.shape
 
-        if self.encoder_injected:
+        # local_encode applies dropout, so it must run ONCE: calling it again
+        # for the encoder would hand it a different mask than the adapter sees.
+        h, emb = base.local_encode(x)
+        h = h.view(batch_size, seq_len, base.hidden_size)
+        sos = base.global_sos.view(1, 1, -1).expand(batch_size, 1, -1)
+        h = torch.cat([sos, h[:, :-1]], dim=1)   # (B, seq_len, hidden)
+        self._pre_block_cache = h                # reused by get_encoder_logits
+
+        if self.rule_input == 'ar_state':
+            rule_hidden = self._ar_state_rule_hidden(h)
+        elif self.encoder_injected:
             rule_hidden = self._encoder_injected_rule_hidden(x)
         elif self.bidirectional:
             rule_hidden = None
         else:
             rule_hidden = self._rule_hidden(x)
-
-        h, emb = base.local_encode(x)
-        h = h.view(batch_size, seq_len, base.hidden_size)
-        sos = base.global_sos.view(1, 1, -1).expand(batch_size, 1, -1)
-        h = torch.cat([sos, h[:, :-1]], dim=1)   # (B, seq_len, hidden)
 
         mask = base.buffered_future_mask(h)
 
