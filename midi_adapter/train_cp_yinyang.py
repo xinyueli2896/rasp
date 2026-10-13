@@ -246,9 +246,11 @@ class CPYinyangLightning(L.LightningModule):
                 self.log('enc_loss', enc_loss, on_step=True, on_epoch=False)
 
         self.log('train_loss', loss, on_step=True, on_epoch=False)
+        # Log the LR but do NOT step: configure_optimizers hands the scheduler
+        # to Lightning with interval='step', so Lightning owns the stepping.
+        # Stepping here as well overran OneCycleLR -- see configure_optimizers.
         scheduler = self.lr_schedulers()
         if scheduler is not None:
-            scheduler.step()
             self.log('training/lr', scheduler.get_last_lr()[0], on_step=True)
         return loss
 
@@ -265,12 +267,18 @@ class CPYinyangLightning(L.LightningModule):
         optimizer = torch.optim.AdamW(trainable, lr=self.max_lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=self.max_lr,
-            total_steps=self.max_steps + 1,   # Lightning steps once more than
-            # max_steps at the end of a run; without the pad OneCycleLR
-            # raises 'Tried to step N+1 times' after the last batch.
-            pct_start=0.02,
+            total_steps=self.max_steps, pct_start=0.02,
         )
-        return [optimizer], [scheduler]
+        # Returning the legacy ([optimizer], [scheduler]) pair makes Lightning
+        # treat the scheduler as epoch-interval and step it at the end of every
+        # training epoch -- on top of the manual step training_step used to do.
+        # The finetune set is small (a few hundred batches), so a 10k-step run
+        # ends ~19 epochs and overran OneCycleLR by ~19 calls, killing the run
+        # about 19 steps short of max_steps. Padding total_steps only moved the
+        # crash; the fix is to have exactly one stepper. Lightning is it, at
+        # interval='step', which makes total_steps=max_steps exact.
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler, 'interval': 'step'}}
 
 
 # ---------------------------------------------------------------------------

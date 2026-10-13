@@ -87,13 +87,15 @@ def main(args):
         optimizer = torch.optim.AdamW(net.parameters(), lr=ft_lr, weight_decay=1e-2)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=ft_lr,
-            total_steps=args.max_steps + 1,   # Lightning steps once more than
-            # max_steps at the end of a run; without the pad OneCycleLR
-            # raises 'Tried to step N+1 times' after the last batch.
+            total_steps=args.max_steps,
             pct_start=0.01,       # 1% warmup → shorter spike than pretrain
             anneal_strategy='cos',
         )
-        return [optimizer], [scheduler]
+        # See pretrain_cp_bass: the model steps the scheduler itself, so
+        # Lightning must not. An unreachable frequency says so declaratively.
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler,
+                                 'interval': 'step', 'frequency': 10 ** 9}}
     net.configure_optimizers = _configure_optimizers
 
     train_loader = DataLoader(

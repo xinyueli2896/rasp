@@ -56,18 +56,24 @@ def main(args):
 
     # cp_transformer's configure_optimizers hardcodes total_steps=2_000_000.
     # Override to use the actual training budget so the LR schedule is correct.
-    # Return legacy ([optimizer], [scheduler]) so PL steps per epoch (never, since we
-    # use max_steps), and training_step's manual scheduler.step() handles per-step LR.
+    #
+    # RoFormerSymbolicTransformer.training_step steps the scheduler itself
+    # (cp_transformer.py:198), so Lightning must not step it too. The legacy
+    # ([optimizer], [scheduler]) return looks harmless but makes Lightning
+    # step it at the end of every training epoch, which overruns OneCycleLR
+    # once total_steps is the real budget rather than the hardcoded 2M -- the
+    # base class never noticed because 2M is never reached. interval='step'
+    # with an unreachable frequency declares "the model owns this scheduler",
+    # keeping the manual step the only one and total_steps=max_steps exact.
     def _configure_optimizers(self=net):
         optimizer = torch.optim.AdamW(net.parameters(), lr=max_lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=max_lr,
-            total_steps=args.max_steps + 1,   # Lightning steps once more than
-            # max_steps at the end of a run; without the pad OneCycleLR
-            # raises 'Tried to step N+1 times' after the last batch.
-            pct_start=0.005,
+            total_steps=args.max_steps, pct_start=0.005,
         )
-        return [optimizer], [scheduler]
+        return {'optimizer': optimizer,
+                'lr_scheduler': {'scheduler': scheduler,
+                                 'interval': 'step', 'frequency': 10 ** 9}}
     net.configure_optimizers = _configure_optimizers
 
     def _preload(ds, cache: dict) -> None:
