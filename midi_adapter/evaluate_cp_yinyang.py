@@ -159,14 +159,16 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                model_size: int, adapter_rank: int, n_skip: int,
                bidirectional: bool, encoder_injected: bool,
                encoder_type: str = 'embedding', rule_mode: str = 'current',
-               device: torch.device = None) -> CPYinyangTransformer:
+               device: torch.device = None,
+               rule_view: str = 'key_phase') -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
     model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip,
                                  bidirectional=bidirectional,
                                  encoder_injected=encoder_injected,
                                  encoder_type=encoder_type,
-                                 rule_mode=rule_mode)
+                                 rule_mode=rule_mode,
+                                 rule_view=rule_view)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
         print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')
@@ -223,10 +225,34 @@ def run_evaluation(args) -> None:
     print(f'  Finetune-new  : {FINETUNE_NEW}')
     print(f'  Unseen        : {UNSEEN}')
 
+    # Recover rule_mode/rule_view from the checkpoint's k_proj width rather than
+    # trusting a flag: the view sets rule_d_model, and a mismatch rebuilds the
+    # adapter at the wrong width so its weights silently fail to load. 16 is the
+    # analytical model; an unknown width is a hard error, not a quiet rebuild.
+    from models.rasp_compiled_rule import VIEW_WIDTH
+    rule_mode, rule_view = args.rule_mode, (args.rule_view or 'key_phase')
+    if args.adapter_ckpt and os.path.exists(args.adapter_ckpt):
+        _raw = torch.load(args.adapter_ckpt, map_location='cpu')
+        _sd  = _raw.get('state_dict', _raw) if isinstance(_raw, dict) else {}
+        for k, v in _sd.items():
+            if k.endswith('k_proj.weight'):
+                w = v.shape[1]
+                if w != 16:
+                    hit = [n for n, ww in VIEW_WIDTH.items() if ww == w]
+                    if not hit:
+                        raise SystemExit(
+                            f'{args.adapter_ckpt}: k_proj expects rule_hidden width '
+                            f'{w}, neither 16 nor any known view {VIEW_WIDTH}')
+                    rule_mode, rule_view = 'compiled', hit[0]
+                    print(f'  inferred      : rule_mode=compiled '
+                          f'rule_view={rule_view}  (k_proj width {w})')
+                break
+
     model = load_model(getattr(args, 'base_ckpt', None), args.adapter_ckpt,
                        args.model_size, args.adapter_rank, args.n_skip,
                        args.bidirectional, args.encoder_injected,
-                       args.encoder_type, args.rule_mode, device)
+                       args.encoder_type, rule_mode, device,
+                       rule_view=rule_view)
 
     rows       = []
     all_errors = []
@@ -289,9 +315,14 @@ def get_args():
     p.add_argument('--encoder_type', type=str, default='embedding',
                    choices=['embedding', 'token_mlp'],
                    help='Must match the flag used during training')
+    p.add_argument('--rule_view', type=str, default=None,
+                   choices=['root_next', 'key_phase', 'computed', 'full'],
+                   help='Only with --rule_mode compiled. Omit to infer it from the '
+                        'checkpoint, which is safer than restating it.')
     p.add_argument('--rule_mode', type=str, default='current',
-                   choices=['current', 'period4', 'seed_broadcast'],
-                   help='Must match the flag used during training')
+                   choices=['current', 'period4', 'seed_broadcast', 'compiled'],
+                   help='Must match training. Normally unnecessary: a compiled '
+                        'checkpoint is detected from its k_proj width.')
     p.add_argument('--save_midi_dir',  type=str, default=None,
                    help='Directory for MIDI output (default: eval_midi/<adapter_name>/)')
     return p.parse_args()
