@@ -141,6 +141,7 @@ class RaspCompiledRule(nn.Module):
         self,
         subbeats_per_chord: int   = 1,
         shift:              int   = 1,
+        input_shift:        int   = 0,
         attn_scale:         float = 100.0,
         bos_beta:           float = 0.5,
         view:               str   = 'key_phase',
@@ -148,8 +149,15 @@ class RaspCompiledRule(nn.Module):
         """
         subbeats_per_chord : positions per phase slot.  1 for the bass
             experiment (one root per beat); 8 would be chord granularity.
-        shift : how far ahead the SequenceMap looks.  1 emits the NEXT root
-            (what an AR adapter at position t needs), 0 the current root.
+        shift : how far ahead the SequenceMap looks, relative to input_shift.
+        input_shift : what the token at stream index j actually is.  0 means
+            index j holds the value at j (the integer task).  -1 means index j
+            holds the value at j-1, which is the case when the host shifts its
+            stream by one before the blocks, as the CP transformer does with
+            h = cat([sos, h[:-1]]).  Select then matches phase-0 slots at
+            phase_at(input_shift) and the SequenceMap emits for
+            phase_at(input_shift + shift), so both stay positional and the
+            output lands on the position the adapter is about to produce.
         attn_scale : Tracr's inverse temperature, 100 in the paper.
         bos_beta : beta_BOS from Appendix D.1.  0.5 = attend BOS only when
             nothing else is selected.
@@ -159,7 +167,8 @@ class RaspCompiledRule(nn.Module):
         if view not in VIEWS:
             raise ValueError(f'view must be one of {sorted(VIEWS)}, got {view!r}')
         self.subbeats_per_chord = subbeats_per_chord
-        self.shift      = shift
+        self.shift       = shift
+        self.input_shift = input_shift
         self.attn_scale = attn_scale
         self.bos_beta   = bos_beta
         self.view       = view
@@ -225,8 +234,9 @@ class RaspCompiledRule(nn.Module):
     def embed(self, idx: torch.Tensor) -> torch.Tensor:
         T, dev = idx.shape[1], idx.device
         return (self.W_E[idx]
-                + self.W_phase[self.phase_at(T, dev, 0)].unsqueeze(0)
-                + self.W_phase_next[self.phase_at(T, dev, self.shift)].unsqueeze(0))
+                + self.W_phase[self.phase_at(T, dev, self.input_shift)].unsqueeze(0)
+                + self.W_phase_next[
+                      self.phase_at(T, dev, self.input_shift + self.shift)].unsqueeze(0))
 
     def attention(self, x: torch.Tensor) -> torch.Tensor:
         """The compiled head, over an arbitrary float residual stream."""

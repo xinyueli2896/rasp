@@ -268,7 +268,14 @@ class CPYinyangTransformer(nn.Module):
         self.rule_mode = rule_mode
         self.rule_view = rule_view
         if rule_mode == 'compiled':
-            self.rule_model = RaspCompiledRule(shift=1, view=rule_view)
+            # input_shift=-1: the CP stack shifts its stream by one before the
+            # global blocks (h = cat([sos, h[:-1]])), so the adapter at index t
+            # produces BEAT t while its state encodes beat t-1. The rule model
+            # is fed the same shifted view, which keeps it causal, and its
+            # SequenceMap then emits the root for beat t -- the beat the
+            # adapter is about to influence.
+            self.rule_model = RaspCompiledRule(shift=1, input_shift=-1,
+                                               view=rule_view)
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
         # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the
@@ -357,8 +364,15 @@ class CPYinyangTransformer(nn.Module):
         """
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
         if self.rule_mode == 'compiled':
-            # Returns only the selected view, not the whole 44-dim stream.
-            return self.rule_model.rule_hidden(pc)
+            # Shift right by one so stream index t carries beat t-1, matching
+            # what the host has at that position. Without this the rule model
+            # reads beat t while the adapter at t is predicting beat t --
+            # measured: corrupting beat 8 moved rule_hidden[8] by 0.333.
+            pc_shift = torch.zeros_like(pc)
+            pc_shift[:, 1:] = pc[:, :-1]
+            rh = self.rule_model.rule_hidden(pc_shift).clone()
+            rh[:, 0] = 0.0          # nothing is known before the first beat
+            return rh
         _, h = self.rule_model(pc, return_hidden=True)   # (B, T, 16)
         return h
 
