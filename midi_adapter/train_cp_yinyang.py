@@ -257,7 +257,10 @@ class CPYinyangLightning(L.LightningModule):
         optimizer = torch.optim.AdamW(trainable, lr=self.max_lr, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=self.max_lr,
-            total_steps=self.max_steps, pct_start=0.02,
+            total_steps=self.max_steps + 1,   # Lightning steps once more than
+            # max_steps at the end of a run; without the pad OneCycleLR
+            # raises 'Tried to step N+1 times' after the last batch.
+            pct_start=0.02,
         )
         return [optimizer], [scheduler]
 

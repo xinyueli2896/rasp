@@ -61,9 +61,11 @@ def main(args):
     def _configure_optimizers(self=net):
         optimizer = torch.optim.AdamW(net.parameters(), lr=max_lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=max_lr, total_steps=args.max_steps + 1,   # Lightning steps once more than
+            optimizer, max_lr=max_lr,
+            total_steps=args.max_steps + 1,   # Lightning steps once more than
             # max_steps at the end of a run; without the pad OneCycleLR
-            # raises 'Tried to step N+1 times' after the last batch. pct_start=0.005,
+            # raises 'Tried to step N+1 times' after the last batch.
+            pct_start=0.005,
         )
         return [optimizer], [scheduler]
     net.configure_optimizers = _configure_optimizers
