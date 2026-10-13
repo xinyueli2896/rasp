@@ -33,6 +33,7 @@ MAX_STEPS    = 200_000
 
 
 def main(args):
+    L.seed_everything(args.seed, workers=True)
     n_gpus     = max(torch.cuda.device_count(), 1)
     max_lr     = 5e-5 if args.model_size >= 2 else 1e-4
     run_name   = (
@@ -121,7 +122,11 @@ def main(args):
             name    = run_name,
             config  = vars(args),
         ))
-    loggers.append(TensorBoardLogger('tb_logs', name=run_name))
+    if not args.no_tensorboard:
+        try:
+            loggers.append(TensorBoardLogger('tb_logs', name=run_name))
+        except ModuleNotFoundError as e:
+            print(f'  TensorBoard logging off: {e.msg.splitlines()[0]}')
 
     use_gpu = torch.cuda.is_available()
     trainer = L.Trainer(
@@ -163,9 +168,16 @@ def get_args():
     p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
     p.add_argument('--run_name',      type=str,  default=None)
+    p.add_argument('--seed',          type=int,  default=42,
+                   help='Seed for pl.seed_everything. Pass a distinct --run_name '
+                        'per seed so the runs do not share a checkpoint dir.')
     p.add_argument('--base_ckpt',      type=str,  default=None,
                    help='Load pretrained weights before finetuning (starts with fresh optimizer/schedule)')
     p.add_argument('--resume_ckpt',   type=str,  default=None)
+    p.add_argument('--no_tensorboard', action='store_true',
+                   help='Skip the TensorBoard logger. It is also skipped\n'
+                        'automatically when neither tensorboard nor\n'
+                        'tensorboardX is installed.')
     p.add_argument('--wandb_project', type=str,  default='cp_bass',
                    help='W&B project name (set to empty string to disable wandb)')
     p.add_argument('--wandb_entity',  type=str,  default=None)
