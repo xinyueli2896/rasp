@@ -276,6 +276,41 @@ class RaspCompiledRule(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def build_rule_hidden_analytic(self, pc_0: torch.Tensor, T: int,
+                                   device, view: str | None = None) -> torch.Tensor:
+        """rule_hidden for a KNOWN key, without reading a stream.
+
+        The sampling path knows the key from the prompt and needs the whole
+        window up front, before the notes it describes exist. Everything the
+        compiled program computes is a function of (key, position), so it can
+        be written directly: the head would retrieve `key`, and the MLP would
+        emit (key + OFFSETS[phase_next]) % 12.
+
+        Built to agree exactly with rule_hidden() on a rule-following stream,
+        including the zeroed index 0 when input_shift < 0, where the host has
+        not yet seen a beat and nothing is knowable.
+        """
+        B = pc_0.shape[0]
+        pc_0 = pc_0.to(device).long()
+        ph   = self.phase_at(T, device, self.input_shift)
+        phn  = self.phase_at(T, device, self.input_shift + self.shift)
+
+        tok_r  = (pc_0[:, None] + self._offsets.to(device)[ph][None, :]) % N_ROOTS
+        root_r = (pc_0[:, None] + self._offsets.to(device)[phn][None, :]) % N_ROOTS
+
+        h = torch.zeros(B, T, self.d_model, device=device)
+        h[:, :, TOK_BASE:TOK_BASE + N_ROOTS]   = F.one_hot(tok_r,  N_ROOTS).float()
+        h[:, :, KEY_BASE:KEY_BASE + N_ROOTS]   = F.one_hot(
+            pc_0[:, None].expand(-1, T), N_ROOTS).float()
+        h[:, :, ROOT_BASE:ROOT_BASE + N_ROOTS] = F.one_hot(root_r, N_ROOTS).float()
+        h = h + self.W_phase[ph].unsqueeze(0) + self.W_phase_next[phn].unsqueeze(0)
+        if self.input_shift < 0:
+            h[:, 0] = 0.0
+
+        dims = (self._view_dims if view is None
+                else torch.tensor(view_dims(view), device=device))
+        return h.index_select(-1, dims)
+
     def parameters(self, recurse=True):
         return iter([])
 
