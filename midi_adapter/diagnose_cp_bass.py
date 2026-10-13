@@ -62,6 +62,39 @@ def teacher_forced_pc_acc(base, key: int, T: int, device):
     return float(np.mean(hits)), pred_pc, exp_pc
 
 
+@torch.no_grad()
+def per_slot_loss(base, key: int, T: int, device):
+    """Cross-entropy broken down by CP slot, on a freshly generated song.
+
+    The aggregate train_loss averages over every non-pad slot. For monophonic
+    bass that is 3 of 8 per beat -- program, pitch, eos -- and two of them are
+    trivially constant, so a small mean can hide a large pitch loss. This
+    prints them separately, plus the loss the trainer would report.
+    """
+    import torch.nn.functional as F
+    pm, _ = generate_song(n_bars=max(1, -(-T // 4)), key=key, quality='maj')
+    data, _ = _preprocess_pm(pm, T)
+    x = base.preprocess(data.unsqueeze(0).to(device),
+                        torch.zeros(1, dtype=torch.long, device=device))
+    y = base(x)                                   # (T, subseq, vocab)
+    pad = base.tokenizer.pad_token
+    tgt = x.view(-1, x.shape[-1])                 # (T, subseq)
+
+    overall = F.cross_entropy(y.reshape(-1, base.tokenizer.n_tokens),
+                              x.reshape(-1), ignore_index=pad)
+    out = {'overall(trainer)': float(overall)}
+    for j in range(x.shape[-1]):
+        t = tgt[:, j]
+        keep = t != pad
+        if keep.sum() == 0:
+            continue
+        ce = F.cross_entropy(y[:, j][keep], t[keep])
+        acc = float((y[:, j][keep].argmax(-1) == t[keep]).float().mean())
+        name = {0: 'v0 program', 1: 'v0 PITCH', 2: 'v1 eos'}.get(j, f'slot {j}')
+        out[name] = (float(ce), acc, int(keep.sum()))
+    return out
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--base_ckpt', required=True)
@@ -92,6 +125,13 @@ def main():
             print(f'      free-run  : {fr_pcs[:12]}')
     print('-' * 62)
     print(f'{"mean":>4}  {np.mean(tf_all):>15.3f}  {np.mean(fr_all):>9.3f}')
+
+    print('\nPER-SLOT LOSS  (key %d, what the trainer is actually averaging)' % keys[0])
+    for k, v in per_slot_loss(base, keys[0], args.n_beats, device).items():
+        if isinstance(v, tuple):
+            print(f'  {k:<16} ce={v[0]:7.4f}  argmax_acc={v[1]:.3f}  n={v[2]}')
+        else:
+            print(f'  {k:<16} {v:7.4f}')
     print()
     if np.mean(tf_all) > 0.9 and np.mean(fr_all) < 0.5:
         print('  -> teacher-forced works, free-run does not: exposure bias or a')
