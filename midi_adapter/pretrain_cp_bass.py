@@ -129,21 +129,6 @@ def main(args):
             print(f'  TensorBoard logging off: {e.msg.splitlines()[0]}')
 
     use_gpu = torch.cuda.is_available()
-    trainer = L.Trainer(
-        devices            = -1 if use_gpu else 1,
-        accelerator        = 'gpu' if use_gpu else 'cpu',
-        precision          = precision,
-        max_steps          = args.max_steps,
-        callbacks          = callbacks,
-        val_check_interval = args.val_check_interval,
-        limit_val_batches  = 200,
-        check_val_every_n_epoch = None,
-        gradient_clip_val  = gradient_clip,
-        logger             = loggers,
-        num_sanity_val_steps = 2,
-        strategy           = strategy,
-    )
-
     # val_loss is a poor selector for this task: it is teacher-forced CE over
     # every CP slot (program, pitch, duration, velocity, EOS, padding), while
     # what matters is autoregressive voice-0 rule-following. On the previous
@@ -164,6 +149,21 @@ def main(args):
             filename = run_name + '.step{step:06d}',
             auto_insert_metric_name = False,
         ))
+
+    trainer = L.Trainer(
+        devices            = -1 if use_gpu else 1,
+        accelerator        = 'gpu' if use_gpu else 'cpu',
+        precision          = precision,
+        max_steps          = args.max_steps,
+        callbacks          = callbacks,
+        val_check_interval = args.val_check_interval,
+        limit_val_batches  = 200,
+        check_val_every_n_epoch = None,
+        gradient_clip_val  = gradient_clip,
+        logger             = loggers,
+        num_sanity_val_steps = 2,
+        strategy           = strategy,
+    )
 
     ckpt_path = args.resume_ckpt if args.resume_ckpt and os.path.exists(args.resume_ckpt) else None
     trainer.fit(net, train_loader, val_loader, ckpt_path=ckpt_path)
