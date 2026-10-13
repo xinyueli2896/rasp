@@ -81,7 +81,16 @@ def main(args):
         ds.pitch_shift_range = psr
 
     _cache: dict = {}
+    # sample_step aligns the random window start to a multiple of itself.
+    # With the default 1 the window begins at an arbitrary beat, so its phase
+    # offset is uniform over {0,1,2,3} and position-within-window carries NO
+    # information about where the I-IV-V-I cycle is. The model then has to
+    # infer phase from content, which needs several beats -- which is why a
+    # 1-beat prompt leaves it guessing. sample_step=4 (one cycle) makes
+    # position 0 of every window phase 0, as it already is for the integer
+    # experiment, whose sequences always start at phase 0.
     train_ds = FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+                             sample_step=args.sample_step,
                              split=args.train_split)
     _preload(train_ds, _cache)
 
@@ -188,6 +197,11 @@ def get_args():
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
     p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
+    p.add_argument('--sample_step',   type=int,  default=1,
+                   help='Align training window starts to a multiple of this. '
+                        '1 = arbitrary offset (phase of the cycle is random); '
+                        '4 = one I-IV-V-I cycle, so every window starts at '
+                        'phase 0 and absolute position encodes phase.')
     p.add_argument('--run_name',      type=str,  default=None)
     p.add_argument('--save_every_n_steps', type=int, default=10000,
                    help='Also keep an UNFILTERED checkpoint every N steps, so '

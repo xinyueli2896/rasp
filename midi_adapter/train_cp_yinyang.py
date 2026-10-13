@@ -317,12 +317,17 @@ def main(args):
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
 
+    # See pretrain_cp_bass: sample_step=4 aligns each window to a cycle
+    # boundary so position encodes phase. Must match whatever the base was
+    # pretrained with, or the adapter sees a different alignment than its host.
     train_ds = BassFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+                                 sample_step=args.sample_step,
                                   split=args.train_split, sample_step=SUBBEATS_PER_BAR)
     train_ds.preload(_cache)
 
     if args.pretrain_data and os.path.exists(args.pretrain_data):
         pretrain_ds = BassFramedDataset(args.pretrain_data, TRAIN_LENGTH, args.batch_size,
+                                        sample_step=args.sample_step,
                                         split=args.train_split, sample_step=SUBBEATS_PER_BAR)
         pretrain_ds.preload(_cache)
         effective_train_ds = InterleavedDataset(pretrain_ds, train_ds)
@@ -484,6 +489,9 @@ def get_args():
                    help='Skip the TensorBoard logger. It is also skipped\n'
                         'automatically when neither tensorboard nor\n'
                         'tensorboardX is installed.')
+    p.add_argument('--sample_step',        type=int, default=1,
+                   help='Align training window starts to a multiple of this. '
+                        '4 = one I-IV-V-I cycle. Must match the base pretrain.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
