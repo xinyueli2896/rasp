@@ -95,12 +95,13 @@ def main(args):
     net.configure_optimizers = _configure_optimizers
 
     train_loader = DataLoader(
-        FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+        FramedDataset(args.train_data, args.train_length, args.batch_size,
+                      sample_step=args.sample_step,
                       split=args.train_split),
         batch_size=None, num_workers=1, persistent_workers=True,
     )
     val_loader = DataLoader(
-        FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+        FramedDataset(args.val_data, args.train_length, args.batch_size,
                       split=args.val_split, sample_step=16, repeat=True),
         batch_size=None, num_workers=0,
     )
@@ -182,6 +183,14 @@ def get_args():
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
     p.add_argument('--val_check_interval', type=int, default=500)
     p.add_argument('--ckpt_dir',      type=str, default='ckpt')
+    p.add_argument('--train_length',  type=int, default=TRAIN_LENGTH,
+                   help='Window length in subbeats. The module default of 384 '
+                        'exceeds a 32-bar song (128 subbeats), so every song '
+                        'fails FramedDataset\'s is_valid check and the loader '
+                        'silently yields nothing. Use 24 to match the pretrain.')
+    p.add_argument('--sample_step',   type=int, default=1,
+                   help='Align window starts to a multiple of this; 4 = one '
+                        'I-IV-V-I cycle. Must match the pretrain.')
     p.add_argument('--run_name',      type=str, default=None)
     p.add_argument('--seed',          type=int, default=42,
                    help='Seed for pl.seed_everything. Pass a distinct --run_name '
