@@ -87,7 +87,9 @@ def main(args):
         optimizer = torch.optim.AdamW(net.parameters(), lr=ft_lr, weight_decay=1e-2)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=ft_lr,
-            total_steps=args.max_steps,
+            total_steps=args.max_steps + 1,   # Lightning steps once more than
+            # max_steps at the end of a run; without the pad OneCycleLR
+            # raises 'Tried to step N+1 times' after the last batch.
             pct_start=0.01,       # 1% warmup → shorter spike than pretrain
             anneal_strategy='cos',
         )

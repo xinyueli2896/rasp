@@ -324,14 +324,14 @@ def main(args):
     # boundary so position encodes phase. Must match whatever the base was
     # pretrained with, or the adapter sees a different alignment than its host.
     train_ds = BassFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
-                                 sample_step=args.sample_step,
-                                  split=args.train_split, sample_step=SUBBEATS_PER_BAR)
+                                 split=args.train_split,
+                                 sample_step=args.sample_step)
     train_ds.preload(_cache)
 
     if args.pretrain_data and os.path.exists(args.pretrain_data):
         pretrain_ds = BassFramedDataset(args.pretrain_data, TRAIN_LENGTH, args.batch_size,
-                                        sample_step=args.sample_step,
-                                        split=args.train_split, sample_step=SUBBEATS_PER_BAR)
+                                        split=args.train_split,
+                                        sample_step=args.sample_step)
         pretrain_ds.preload(_cache)
         effective_train_ds = InterleavedDataset(pretrain_ds, train_ds)
         print(f'Training on interleaved: {args.pretrain_data}  +  {args.train_data}')
@@ -505,9 +505,13 @@ def get_args():
                         'needs every dimension in [0, 1].')
     p.add_argument('--rule_enc_hidden',    type=int, default=64,
                    help='Hidden width for --rule_enc_type mlp.')
-    p.add_argument('--sample_step',        type=int, default=1,
-                   help='Align training window starts to a multiple of this. '
-                        '4 = one I-IV-V-I cycle. Must match the base pretrain.')
+    p.add_argument('--sample_step',        type=int, default=SUBBEATS_PER_BAR,
+                   help='Align training window starts to a multiple of this. This '
+                        'trainer always used SUBBEATS_PER_BAR (one I-IV-V-I cycle); '
+                        'that is now the default rather than hardcoded. '
+                        'pretrain_cp_bass defaults to 1, so the two can disagree -- '
+                        'they must match or the adapter sees a different window '
+                        'alignment than its host was trained on.')
     p.add_argument('--ckpt_dir',           type=str, default='checkpoints')
     p.add_argument('--run_name',           type=str, default=None)
     p.add_argument('--resume_ckpt',        type=str, default=None)
