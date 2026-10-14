@@ -495,6 +495,7 @@ class CPYinyangTransformer(nn.Module):
         max_seq_len: int   = 384,
         temperature: float = 1.0,
         sampling_func = None,
+        correct_all_positions: bool = True,
     ) -> list:
         base = self.base
         batch_size, seed_len, _ = x.shape
@@ -542,10 +543,27 @@ class CPYinyangTransformer(nn.Module):
                     # the cross-attention query (last position) can then attend to the full
                     # AR-derived rule trajectory up to step i.
                     rule_h = self.ar_to_rule[adapter_idx](h_out) if self.bidirectional else rule_hidden
-                    correction = self.yinyang_attn[adapter_idx](
-                        h_out[:, -1:, :], rule_h, sub_offset=i
-                    )
-                    h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
+                    if correct_all_positions:
+                        # Exactly the training forward (see forward()): every
+                        # position is corrected, with absolute beat 0 at index
+                        # 0, so the host's self-attention at the last position
+                        # reads CORRECTED earlier beats, as it did in training.
+                        h_out = h_out + self.yinyang_attn[adapter_idx](
+                            h_out, rule_h, sub_offset=0)
+                    else:
+                        # Legacy path, kept only to reproduce numbers measured
+                        # before the mismatch was found. Correcting the last
+                        # position alone leaves every earlier position at its
+                        # uncorrected base representation -- the full global
+                        # stack is recomputed from `h` each step, and `h`
+                        # accumulates only local-encoded beats, so an earlier
+                        # correction is neither persisted nor recomputed. On
+                        # cp_yy_frozen this cost 0.500 accuracy on unseen keys
+                        # (0.348 vs 0.848) and 0.228 overall.
+                        correction = self.yinyang_attn[adapter_idx](
+                            h_out[:, -1:, :], rule_h, sub_offset=i
+                        )
+                        h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 
             # Sample next subbeat from last global hidden state
             y_next = base.local_sampling(
