@@ -139,8 +139,13 @@ def acc_teacher_forced(model, key, n_prompt, n_gen, device) -> float:
     total = n_prompt + n_gen
     x = _prompt_from_key(key, n_prompt_bars=0, device=device,
                          base=model.base, n_prompt_beats=total)
-    logits = model(x)                       # (B, T, subseq, vocab)
-    pred   = logits.argmax(-1)              # (B, T, subseq)
+    B, T, S = x.shape
+    # local_encode flattens (B, T, subseq) -> (B*T, subseq), so local_decode
+    # returns (B*T, subseq, vocab) rather than (B, T, subseq, vocab).
+    logits = model(x)
+    assert logits.shape[:2] == (B * T, S), \
+        f'unexpected logits shape {tuple(logits.shape)}; expected ({B*T}, {S}, vocab)'
+    pred = logits.argmax(-1).view(B, T, S)
     hits = [int(_pc(pred[0, t]) == _expected_pc(key, t))
             for t in range(n_prompt, total)]
     return float(np.mean(hits))
