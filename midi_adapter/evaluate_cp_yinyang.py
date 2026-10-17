@@ -155,6 +155,30 @@ def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_d
 # Model loading
 # ---------------------------------------------------------------------------
 
+def _report_load(missing: list, unexpected: list) -> None:
+    """Report BOTH sides of a strict=False load.
+
+    Discarding `unexpected` hid the worst rebuild error this script can make:
+    an adapter trained with n_skip=1 holds 12 yinyang_attn blocks, and
+    rebuilding it at n_skip=4 builds 3. The 3 load, the other 9 land in
+    `unexpected`, `missing` is empty -- and a wrong model scored a plausible
+    table in silence. Adapter-block mismatches are called out by name.
+    """
+    import re as _re
+    if missing:
+        print(f'  WARNING missing keys ({len(missing)}): {missing[:3]}')
+    if unexpected:
+        print(f'  WARNING unexpected keys ({len(unexpected)}): {unexpected[:3]}')
+    def _n_adapters(keys):
+        return len({int(m.group(1)) for k in keys
+                    for m in [_re.search(r'yinyang_attn\.(\d+)\.', k)] if m})
+    extra = _n_adapters(unexpected)
+    if extra:
+        print(f'  WARNING: the checkpoint carries {extra} adapter block(s) this '
+              f'model does not have -- n_skip is almost certainly wrong, and '
+              f'the loaded adapters are only a prefix of the trained ones.')
+
+
 def load_model(base_ckpt: str | None, adapter_ckpt: str,
                model_size: int, adapter_rank: int, n_skip: int,
                bidirectional: bool, encoder_injected: bool,
@@ -188,9 +212,8 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
         # Lightning .ckpt — contains full model (base + adapter)
         full_state = {k[len('model.'):]: v for k, v in raw['state_dict'].items()
                       if k.startswith('model.')}
-        missing, _ = model.load_state_dict(full_state, strict=False)
-        if missing:
-            print(f'  WARNING missing keys: {missing[:3]}')
+        missing, unexpected = model.load_state_dict(full_state, strict=False)
+        _report_load(missing, unexpected)
         print(f'  Loaded (Lightning ckpt, base+adapter): {adapter_ckpt}')
     else:
         # Lightweight .pt — adapter weights only; need base ckpt separately
@@ -202,9 +225,8 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
             print(f'  Base model   : {base_ckpt}')
         else:
             print(f'  WARNING: adapter is adapter-only .pt but no base_ckpt — random base weights')
-        missing, _ = model.load_state_dict(raw, strict=False)
-        if missing:
-            print(f'  WARNING missing keys: {missing[:3]}')
+        missing, unexpected = model.load_state_dict(raw, strict=False)
+        _report_load(missing, unexpected)
         print(f'  Adapter      : {adapter_ckpt}')
 
     return model.to(device).eval()

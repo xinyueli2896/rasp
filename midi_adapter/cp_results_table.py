@@ -85,7 +85,17 @@ def inspect(ckpt_path: str) -> dict:
     sd  = raw.get('state_dict', raw) if isinstance(raw, dict) else {}
     info = {'rule_mode': 'current', 'rule_view': 'key_phase',
             'lora_rank': 0, 'rule_input': 'tokens', 'enc': None,
-            'enc_hidden': 64}
+            'enc_hidden': 64, 'n_adapters': 0}
+
+    # n_skip was the one rebuild parameter still taken on trust from the
+    # command line, and it is the one that fails silently: load_model calls
+    # load_state_dict(strict=False) and discards the `unexpected` list, so
+    # rebuilding an n_skip=1 checkpoint (12 adapters) at n_skip=4 (3 adapters)
+    # loads the first three, reports nothing, and still prints a table.
+    # n_adapters = n_global_layers / n_skip, so counting them recovers it.
+    info['n_adapters'] = len({int(m.group(1)) for k in sd
+                              for m in [re.search(r'yinyang_attn\.(\d+)\.', k)]
+                              if m})
 
     for k, v in sd.items():
         if k.endswith('k_proj.weight'):
@@ -160,12 +170,26 @@ def main():
             print(f'  {run:<26} NO CHECKPOINT in {d} -- skipped')
             continue
         info = inspect(c)
+        # n_global_layers for this model_size (cp_transformer.py:37)
+        n_layers = [6, 12, 24, 32][args.model_size]
+        n_skip = args.n_skip
+        if info['n_adapters']:
+            if n_layers % info['n_adapters']:
+                raise SystemExit(
+                    f'{c}: {info["n_adapters"]} adapters does not divide '
+                    f'{n_layers} global layers -- wrong --model_size?')
+            n_skip = n_layers // info['n_adapters']
+            if n_skip != args.n_skip:
+                print(f'  {run:<26} n_skip {args.n_skip} on the command line, but '
+                      f'the checkpoint holds {info["n_adapters"]} adapters '
+                      f'-> n_skip={n_skip}. Using the checkpoint.')
         print(f'  {run:<26} {os.path.basename(c)}')
         print(f'  {"":<26} rule_mode={info["rule_mode"]} view={info["rule_view"]} '
-              f'lora_rank={info["lora_rank"]} rule_input={info["rule_input"]}'
+              f'lora_rank={info["lora_rank"]} rule_input={info["rule_input"]} '
+              f'n_skip={n_skip}'
               + (f' enc={info["enc"]}' if info['enc'] else ''))
         model = load_adapter_model(
-            args.base_ckpt, c, args.model_size, args.adapter_rank, args.n_skip,
+            args.base_ckpt, c, args.model_size, args.adapter_rank, n_skip,
             False, False, 'embedding', info['rule_mode'], device,
             rule_view       = info['rule_view'],
             lora_rank       = info['lora_rank'],
