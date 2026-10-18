@@ -62,7 +62,15 @@ RUN_SUFFIX="${RUN_SUFFIX:-}"
 GATE_INIT="${GATE_INIT:-0.0}"
 FREEZE_BASE_EVAL="${FREEZE_BASE_EVAL:-0}"
 LORA_RANK="${LORA_RANK:-16}"
-RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT")
+#   BEATS_PER_CHORD=4  --cycle_unit bar data: the root is held for a bar, so
+#                      the rule model holds each phase 4 steps and the probe
+#                      scores downbeats only. 1 (default) is the per-beat data.
+#   TRAIN_LENGTH=<n>   window in beats. A cycle is 4*BEATS_PER_CHORD beats, so
+#                      use >= 32 when BEATS_PER_CHORD=4.
+BEATS_PER_CHORD="${BEATS_PER_CHORD:-1}"
+TRAIN_LENGTH="${TRAIN_LENGTH:-24}"
+RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT"
+           --beats_per_chord "$BEATS_PER_CHORD" --train_length "$TRAIN_LENGTH")
 FROZEN_OPTS=()
 [[ "$FREEZE_BASE_EVAL" == "1" ]] && FROZEN_OPTS+=(--freeze_base_eval)
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)

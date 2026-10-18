@@ -378,7 +378,24 @@ def main(args):
     # Shared cache so datasets pointing to the same file reuse one tensor copy
     _cache: dict = {}
 
-    # See pretrain_cp_bass: sample_step=4 aligns each window to a cycle
+    # Window starts must land on a CYCLE boundary, because the rule model
+    # derives phase from position: a window beginning mid-cycle would have
+    # position 0 treated as phase 0 when it is not. A cycle is
+    # SUBBEATS_PER_BAR * beats_per_chord beats -- 4 with one chord per beat,
+    # 16 with one chord per bar -- so the default follows beats_per_chord
+    # rather than being fixed at 4.
+    if args.sample_step is None:
+        args.sample_step = SUBBEATS_PER_BAR * args.beats_per_chord
+    if args.sample_step % (SUBBEATS_PER_BAR * args.beats_per_chord):
+        raise SystemExit(
+            f'--sample_step {args.sample_step} is not a multiple of the '
+            f'{SUBBEATS_PER_BAR * args.beats_per_chord}-beat cycle; windows '
+            f'would start at a random phase and the rule model would be '
+            f'misaligned for the whole window.')
+    print(f'window alignment   : sample_step={args.sample_step} '
+          f'(cycle = {SUBBEATS_PER_BAR * args.beats_per_chord} beats)')
+
+    # See pretrain_cp_bass: sample_step aligns each window to a cycle
     # boundary so position encodes phase. Must match whatever the base was
     # pretrained with, or the adapter sees a different alignment than its host.
     train_ds = BassFramedDataset(args.train_data, args.train_length, args.batch_size,
@@ -397,7 +414,7 @@ def main(args):
         effective_train_ds = train_ds
 
     val_ds = BassFramedDataset(args.val_data, args.train_length, args.batch_size,
-                                split=args.val_split, sample_step=SUBBEATS_PER_BAR,
+                                split=args.val_split, sample_step=args.sample_step,
                                 repeat=True)
     val_ds.preload(_cache)
 
@@ -410,7 +427,7 @@ def main(args):
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
         unseen_ds = BassFramedDataset(args.unseen_data, args.train_length, args.batch_size,
-                                       split='val', sample_step=SUBBEATS_PER_BAR,
+                                       split='val', sample_step=args.sample_step,
                                        repeat=True)
         unseen_ds.preload(_cache)
         unseen_loader = DataLoader(unseen_ds, batch_size=None, num_workers=0)
@@ -627,7 +644,7 @@ def get_args():
                         'still reachable at j = t-4, so the adapter must '
                         'learn a -4 offset, and the first few generated beats '
                         'have no same-phase row to read at all.')
-    p.add_argument('--sample_step',        type=int, default=SUBBEATS_PER_BAR,
+    p.add_argument('--sample_step',        type=int, default=None,
                    help='Align training window starts to a multiple of this. This '
                         'trainer always used SUBBEATS_PER_BAR (one I-IV-V-I cycle); '
                         'that is now the default rather than hardcoded. '

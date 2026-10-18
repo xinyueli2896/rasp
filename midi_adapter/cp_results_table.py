@@ -133,7 +133,8 @@ def inspect(ckpt_path: str) -> dict:
 def eval_model(model, is_adapter, keys, args, device) -> float:
     rfa = adapter_rule_following_acc if is_adapter else base_rule_following_acc
     per_key, _ = rfa(model, keys, args.n_gen_beats, args.n_trials,
-                     device, args.temperature, args.n_prompt_beats)
+                     device, args.temperature, args.n_prompt_beats,
+                     beats_per_chord=args.beats_per_chord)
     return float(np.mean([per_key[k] for k in keys]))
 
 
@@ -149,6 +150,9 @@ def main():
     p.add_argument('--n_prompt_beats', type=int, default=1)
     p.add_argument('--n_gen_beats',    type=int, default=23)
     p.add_argument('--n_trials',       type=int, default=1)
+    p.add_argument('--beats_per_chord', type=int, default=1,
+                   help='Beats the root is held for; 4 for --cycle_unit bar '
+                        'data, where only downbeats carry a target.')
     p.add_argument('--temperature',    type=float, default=0.0)
     p.add_argument('--device',         type=str, default=None)
     args = p.parse_args()

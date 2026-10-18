@@ -105,29 +105,30 @@ def rule_following_acc(
 # ---------------------------------------------------------------------------
 
 def _print_qualitative(model, keys, cat_label, n_gen, device, temperature,
-                       n_prompt_beats: int = 2, show_beats: int = 16) -> None:
+                       n_prompt_beats: int = 2, show_beats: int = 16,
+                       beats_per_chord: int = 1) -> None:
     print(f'\n  [{cat_label}]')
     for key in keys:
         pcs  = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
         show = min(show_beats, n_gen)
 
-        prompt_notes = [ROOT_NAMES[_expected_pc(key, i)] for i in range(n_prompt_beats)]
+        prompt_notes = [ROOT_NAMES[_expected_pc(key, i, beats_per_chord)] for i in range(n_prompt_beats)]
         prompt_str   = ', '.join(prompt_notes)
 
         beat_row = '  '.join(f'{i+1:>4}' for i in range(show))
         exp_row  = '  '.join(
-            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats)]:>4}' for i in range(show)
+            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats, beats_per_chord)]:>4}' for i in range(show)
         )
         got_row  = '  '.join(
             f'{ROOT_NAMES[pc] if pc is not None else "?":>4}' for pc in pcs[:show]
         )
         mark_row = '  '.join(
-            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats) else "✗":>4}'
+            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats, beats_per_chord) else "✗":>4}'
             for i in range(show)
         )
         acc = sum(
             1 for i, pc in enumerate(pcs)
-            if pc == _expected_pc(key, i + n_prompt_beats)
+            if pc == _expected_pc(key, i + n_prompt_beats, beats_per_chord)
         ) / len(pcs)
 
         print(f'    Key={ROOT_NAMES[key]:<3}  acc={acc:.3f}  (prompt=[{prompt_str}])')
@@ -297,6 +298,7 @@ def run_evaluation(args) -> None:
         per_key, errors = rule_following_acc(
             model, keys, args.n_gen_beats, args.n_trials,
             device, args.temperature, args.n_prompt_beats,
+            beats_per_chord=args.beats_per_chord,
         )
         all_errors.extend(errors)
         vals = list(per_key.values())
@@ -342,6 +344,10 @@ def get_args():
                         'keep n_prompt_beats + n_gen_beats <= TRAIN_LENGTH=24)')
     p.add_argument('--n_prompt_beats', type=int, default=2)
     p.add_argument('--n_trials',      type=int, default=1)
+    p.add_argument('--beats_per_chord', type=int, default=1,
+                   help='Beats the root is held for. 1 (default) scores every '
+                        'beat. 4 matches --cycle_unit bar: only the DOWNBEAT '
+                        'is pinned to the root, so only downbeats are scored.')
     p.add_argument('--temperature',   type=float, default=0)
     p.add_argument('--verbose',        action='store_true')
     p.add_argument('--bidirectional',    action='store_true',

@@ -196,22 +196,22 @@ def _print_qualitative(base, keys, cat_label, n_gen, device, temperature,
         pcs  = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats)
         show = min(show_beats, n_gen)
 
-        prompt_notes = [ROOT_NAMES[_expected_pc(key, i)] for i in range(n_prompt_beats)]
+        prompt_notes = [ROOT_NAMES[_expected_pc(key, i, beats_per_chord)] for i in range(n_prompt_beats)]
         prompt_str   = ', '.join(prompt_notes)
 
         beat_row = '  '.join(f'{i+1:>4}' for i in range(show))
         exp_row  = '  '.join(
-            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats)]:>4}' for i in range(show)
+            f'{ROOT_NAMES[_expected_pc(key, i + n_prompt_beats, beats_per_chord)]:>4}' for i in range(show)
         )
         got_row  = '  '.join(f'{ROOT_NAMES[pc] if pc is not None else "?":>4}'
                              for pc in pcs[:show])
         mark_row = '  '.join(
-            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats) else "✗":>4}'
+            f'{"✓" if pcs[i] == _expected_pc(key, i + n_prompt_beats, beats_per_chord) else "✗":>4}'
             for i in range(show)
         )
         acc = sum(
             1 for i, pc in enumerate(pcs)
-            if pc == _expected_pc(key, i + n_prompt_beats)
+            if pc == _expected_pc(key, i + n_prompt_beats, beats_per_chord)
         ) / len(pcs)
 
         print(f'    Key={ROOT_NAMES[key]:<3}  acc={acc:.3f}  '
@@ -320,6 +320,7 @@ def run_evaluation(args) -> None:
         per_key, errors = rule_following_acc(
             base, keys, args.n_gen_beats, args.n_trials, device, args.temperature,
             n_prompt_beats=args.n_prompt_beats,
+            beats_per_chord=args.beats_per_chord,
         )
         all_errors.extend(errors)
         vals = list(per_key.values())
@@ -366,6 +367,12 @@ def get_args():
                    help='If set, save one MIDI per key to this directory')
     p.add_argument('--n_prompt_beats', type=int, default=2,
                    help='Beats to use as prompt (default 2: x, x+5 — uniquely pins cycle phase)')
+    p.add_argument('--beats_per_chord', type=int, default=1,
+                   help='Beats the root is held for. 1 (default) matches '
+                        '--cycle_unit beat, where every beat carries a target. '
+                        '4 matches --cycle_unit bar: the root is held for a '
+                        'bar, the bar may be realised with chord tones or '
+                        'rests, and only the DOWNBEAT is scored.')
     p.add_argument('--verbose',     action='store_true',
                    help='Print per-key accuracy breakdown')
     return p.parse_args()
