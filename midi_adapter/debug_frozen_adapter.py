@@ -85,7 +85,7 @@ def generate(model: CPYinyangTransformer, x: torch.Tensor, max_seq_len: int,
     correct_all=True  reproduces the training forward's correction pattern.
     """
     base = model.base
-    batch_size, seed_len, _ = x.shape
+    batch_size, seed_len, subseq_len = x.shape
     rule_hidden = _rule_hidden_for_sampling(model, x, max_seq_len)
 
     h_seed, _ = base.local_encode(x)
@@ -116,7 +116,8 @@ def generate(model: CPYinyangTransformer, x: torch.Tensor, max_seq_len: int,
                 corr = model.yinyang_attn[k](h_out[:, -1:, :], rule_h, sub_offset=i)
                 h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + corr], dim=1)
 
-        y_next = base.local_sampling(h_out[:, -1], temperature=0)
+        y_next = base.local_sampling(h_out[:, -1], max_subseq_len=subseq_len,
+                                     temperature=0)
         y.append(y_next)
         h_enc = base.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
         h = torch.cat([h, h_enc], dim=1)

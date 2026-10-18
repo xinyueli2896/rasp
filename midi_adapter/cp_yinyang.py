@@ -498,7 +498,7 @@ class CPYinyangTransformer(nn.Module):
         correct_all_positions: bool = True,
     ) -> list:
         base = self.base
-        batch_size, seed_len, _ = x.shape
+        batch_size, seed_len, subseq_len = x.shape
 
         # Pre-compute rule_hidden for standard and encoder_injected modes.
         # Bidirectional computes rule_hidden on-the-fly from AR states each step.
@@ -566,8 +566,9 @@ class CPYinyangTransformer(nn.Module):
                         h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 
             # Sample next subbeat from last global hidden state
+            # subseq_len, not the default 32: see cp_transformer.global_sampling.
             y_next = base.local_sampling(
-                h_out[:, -1], temperature=temperature,
+                h_out[:, -1], max_subseq_len=subseq_len, temperature=temperature,
                 global_step=i, sampling_func=sampling_func,
             )
             y.append(y_next)

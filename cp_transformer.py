@@ -142,7 +142,15 @@ class RoFormerSymbolicTransformer(L.LightningModule):
                 print('Sampling', i, '/', max_seq_len)
             mask = self.buffered_future_mask(h)
             h_out = self.model(h, attention_mask=mask, return_dict=False)[0]
-            y_next = self.local_sampling(h_out[:, -1], temperature=temperature, global_step=i, sampling_func=sampling_func)
+            # max_subseq_len must be the DATA's tokens-per-beat. Left at the
+            # default 32, local_sampling pads every generated beat out to 32
+            # while training beats are subseq_len wide -- and local_encode
+            # does not mask pads (its encoder_attention_mask argument is for
+            # cross-attention and is ignored), so the same beat encodes to a
+            # different vector depending on its width. It also lets a beat
+            # run 32 tokens when the data carries no EOS slot, which is the
+            # case at max_polyphony=1.
+            y_next = self.local_sampling(h_out[:, -1], max_subseq_len=subseq_len, temperature=temperature, global_step=i, sampling_func=sampling_func)
             y.append(y_next)
             h_enc = self.local_encode(y_next.unsqueeze(1))[0].unsqueeze(1)
             h = torch.cat([h, h_enc], dim=1)
