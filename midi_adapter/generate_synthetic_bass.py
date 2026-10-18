@@ -284,6 +284,7 @@ def generate_dataset(
     max_polyphony: int       = 4,
     allowed_keys:  list[int] | None = None,
     seed:          int       = 42,
+    write_midi:    bool      = True,
 ) -> None:
     """
     Generate n_songs synthetic bass songs and save all output files.
@@ -292,10 +293,17 @@ def generate_dataset(
     ----------
     out_dir  : folder where individual .mid files are written
     out_pt   : prefix for the dataset files (e.g. 'data/synthetic_bass_cp4')
+    write_midi : write the per-song .mid files. Training never reads them --
+        the CP tensors are built from the in-memory PrettyMIDI object below,
+        and the loaders open only <out_pt>.pt / .length.pt /
+        .pitch_shift_range.pt. At a few thousand songs the .mid files are
+        usually the largest thing on disk, so pass False unless you want to
+        listen to them.
     """
     random.seed(seed)
     np.random.seed(seed)
-    os.makedirs(out_dir, exist_ok=True)
+    if write_midi:
+        os.makedirs(out_dir, exist_ok=True)
 
     all_data:   list[torch.Tensor] = []
     all_shift:  list[torch.Tensor] = []
@@ -310,10 +318,10 @@ def generate_dataset(
             allowed_keys = allowed_keys,
         )
 
-        # Save MIDI file
+        # Save MIDI file (optional -- nothing downstream reads it)
         rel_path = f'bass_{i:06d}.mid'
-        midi_path = os.path.join(out_dir, rel_path)
-        pm.write(midi_path)
+        if write_midi:
+            pm.write(os.path.join(out_dir, rel_path))
         txt_lines.append(f'{i}\t{rel_path}')
 
         # Preprocess to CP tensor
@@ -355,6 +363,10 @@ def main():
     p.add_argument('--out_pt',        type=str,   required=True,
                    help='Output prefix for .pt dataset files')
     p.add_argument('--max_polyphony', type=int,   default=4)
+    p.add_argument('--no_midi', action='store_true',
+                   help='Skip writing the per-song .mid files. Training never '
+                        'reads them, and they are usually the bulk of the '
+                        'dataset on disk.')
     p.add_argument('--keys',          type=int,   nargs='*', default=None,
                    help='Allowed root semitones (0-11). Default: all 12.')
     p.add_argument('--seed',          type=int,   default=42)
@@ -370,6 +382,7 @@ def main():
         out_pt        = args.out_pt,
         n_bars        = args.n_bars,
         max_polyphony = args.max_polyphony,
+        write_midi    = not args.no_midi,
         allowed_keys  = args.keys,
         seed          = args.seed,
     )
