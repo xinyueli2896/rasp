@@ -131,18 +131,31 @@ def _prompt_from_midi(path: str, n_prompt_bars: int, device: torch.device,
 
 def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
                      base: RoFormerSymbolicTransformer,
-                     n_prompt_beats: int | None = None) -> torch.Tensor:
+                     n_prompt_beats: int | None = None,
+                     max_polyphony: int = 4,
+                     cycle_unit: str = 'beat') -> torch.Tensor:
     """Generate a synthetic prompt in the given key.
-    n_prompt_beats overrides n_prompt_bars if given (finer granularity)."""
+
+    n_prompt_beats overrides n_prompt_bars if given (finer granularity).
+
+    max_polyphony and cycle_unit MUST match the data the model was trained on.
+    Both were previously left at their defaults, which meant a model trained
+    on max_polyphony=2 (4 tokens per beat) was evaluated with an 8-token
+    prompt -- and since local_encode does not mask padding, that is a
+    different beat vector, i.e. an out-of-distribution prompt in every
+    evaluation. cycle_unit likewise: a bar-cycle model would have been
+    prompted with a whole I-IV-V-I crammed into its first bar.
+    """
     n_subbeats = (n_prompt_beats if n_prompt_beats is not None
                   else n_prompt_bars * SUBBEATS_PER_BAR)
     if n_subbeats == 0:
-        dummy = torch.zeros(1, 1, 16, dtype=torch.uint8, device=device)
+        dummy = torch.zeros(1, 1, max_polyphony * 4, dtype=torch.uint8, device=device)
         pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
         return base.preprocess(dummy, pitch_shift)
 
-    pm, _ = generate_song(n_bars=max(1, -(-n_subbeats // SUBBEATS_PER_BAR)), key=key)
-    data, _ = _preprocess_pm(pm, n_subbeats)
+    pm, _ = generate_song(n_bars=max(1, -(-n_subbeats // SUBBEATS_PER_BAR)),
+                          key=key, cycle_unit=cycle_unit)
+    data, _ = _preprocess_pm(pm, n_subbeats, max_polyphony=max_polyphony)
     data = data.unsqueeze(0).to(device)
     pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
     return base.preprocess(data, pitch_shift)

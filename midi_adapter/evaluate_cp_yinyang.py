@@ -50,10 +50,14 @@ from midi_adapter.evaluate_cp_bass import (
 def _gen_pcs(model: CPYinyangTransformer,
              key: int, n_gen: int,
              device: torch.device, temperature: float,
-             n_prompt_beats: int = 2) -> list[int | None]:
+             n_prompt_beats: int = 2,
+             max_polyphony: int = 4,
+             beats_per_chord: int = 1) -> list[int | None]:
     """Generate n_gen beats with rule conditioning and return pitch classes."""
     prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                              base=model.base, n_prompt_beats=n_prompt_beats)
+                              base=model.base, n_prompt_beats=n_prompt_beats,
+                              max_polyphony=max_polyphony,
+                              cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
 
     total = n_prompt_beats + n_gen
     sampled = model.global_sampling(
@@ -76,6 +80,7 @@ def rule_following_acc(
     temperature: float,
     n_prompt_beats: int = 2,
     beats_per_chord: int = 1,
+    max_polyphony: int = 4,
 ) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
     per_key: dict[int, float] = {}
     errors:  list[tuple[int, int | None]] = []
@@ -83,7 +88,8 @@ def rule_following_acc(
     for key in keys:
         trial_accs = []
         for _ in range(n_trials):
-            pcs = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
+            pcs = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats,
+                           max_polyphony, beats_per_chord)
             total = n_prompt_beats + len(pcs)
             scored = _scored_positions(n_prompt_beats, total, beats_per_chord)
             n_correct = 0
@@ -299,6 +305,7 @@ def run_evaluation(args) -> None:
             model, keys, args.n_gen_beats, args.n_trials,
             device, args.temperature, args.n_prompt_beats,
             beats_per_chord=args.beats_per_chord,
+            max_polyphony=args.max_polyphony,
         )
         all_errors.extend(errors)
         vals = list(per_key.values())
@@ -344,6 +351,9 @@ def get_args():
                         'keep n_prompt_beats + n_gen_beats <= TRAIN_LENGTH=24)')
     p.add_argument('--n_prompt_beats', type=int, default=2)
     p.add_argument('--n_trials',      type=int, default=1)
+    p.add_argument('--max_polyphony', type=int, default=4,
+                   help='Note-slots per beat in the TRAINING data; must match '
+                        'or the prompt is out of distribution.')
     p.add_argument('--beats_per_chord', type=int, default=1,
                    help='Beats the root is held for. 1 (default) scores every '
                         'beat. 4 matches --cycle_unit bar: only the DOWNBEAT '
