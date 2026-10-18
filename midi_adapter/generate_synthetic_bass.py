@@ -193,6 +193,7 @@ def generate_song(
     quality:                 str | None = None,   # None = random once per song
     bass_instrument_program: int        = 33,     # Electric Bass, finger
     cycle_unit:              str        = 'beat',
+    pattern:                 str | None = None,   # None = random once per song
 ) -> tuple[pretty_midi.PrettyMIDI, list[list]]:
     """
     Generate one song following the exact RASP rule:
@@ -216,6 +217,11 @@ def generate_song(
         key = random.choice(allowed_keys)
 
     song_quality = quality if quality is not None else random.choice(list(COMMON_CHORDS.keys()))
+    # One pattern for the whole song, like the quality. A training window is
+    # drawn from a single song, so this keeps the realisation consistent within
+    # a sample: the model sees one way of playing a bar and has to apply it to
+    # whatever root the rule supplies, rather than a new pattern every bar.
+    song_pattern = pattern if pattern is not None else random.choice(BAR_PATTERNS)
 
     pm   = pretty_midi.PrettyMIDI(initial_tempo=CONSTANT_TEMPO)
     pm.time_signature_changes = [pretty_midi.TimeSignature(4, 4, 0.0)]
@@ -249,7 +255,7 @@ def generate_song(
             xf_chords.append([float(bar_start),
                               f'{ROOT_NAMES[bar_root]}:{song_quality}'])
             bass.notes.extend(_bar_notes(bar_root, song_quality, bar_start,
-                                         random.choice(BAR_PATTERNS)))
+                                         song_pattern))
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -315,6 +321,7 @@ def generate_dataset(
     seed:          int       = 42,
     write_midi:    bool      = True,
     cycle_unit:    str       = 'beat',
+    pattern:       str | None = None,
 ) -> None:
     """
     Generate n_songs synthetic bass songs and save all output files.
@@ -347,6 +354,7 @@ def generate_dataset(
             n_bars       = n_bars,
             allowed_keys = allowed_keys,
             cycle_unit   = cycle_unit,
+            pattern      = pattern,
         )
 
         # Save MIDI file (optional -- nothing downstream reads it)
@@ -400,6 +408,12 @@ def main():
                         'changes every BAR, a cycle spans 4 bars (16 beats), '
                         'and the bar is realised by a pattern that may use '
                         'chord tones -- the rule fixes harmony, not the notes.')
+    p.add_argument('--bar_pattern', type=str, default=None,
+                   choices=BAR_PATTERNS,
+                   help='Fix the bar realisation for every song. Default: one '
+                        'pattern drawn per SONG, so it is consistent within a '
+                        'training window but varies across the dataset. Only '
+                        'used with --cycle_unit bar.')
     p.add_argument('--no_midi', action='store_true',
                    help='Skip writing the per-song .mid files. Training never '
                         'reads them, and they are usually the bulk of the '
@@ -421,6 +435,7 @@ def main():
         max_polyphony = args.max_polyphony,
         write_midi    = not args.no_midi,
         cycle_unit    = args.cycle_unit,
+        pattern       = args.bar_pattern,
         allowed_keys  = args.keys,
         seed          = args.seed,
     )
