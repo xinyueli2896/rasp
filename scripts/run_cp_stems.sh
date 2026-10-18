@@ -35,6 +35,18 @@ MAX_STEPS="${MAX_STEPS:-10000}"
 # model_size 1 has 12 global layers, so n_skip=1 gives 12 adapters (4.81M
 # trainable, 4.12% of the host) against 3 at n_skip=4 (1.20M, 1.06%).
 N_SKIP="${N_SKIP:-1}"
+# Rule-model and masking options, so a run's configuration lives in the
+# command rather than in a trainer default.
+#   KEY_SELECT=first   the head attends exactly the slot holding beat 0,
+#                      satisfying Tracr Appendix D.1, instead of averaging
+#                      every phase-0 slot.
+#   STRICT_CAUSAL=1    mask the adapter to j < t, so the rule's answer FOR
+#                      beat t is withheld and the same-phase row at t-4 must
+#                      be used instead.
+KEY_SELECT="${KEY_SELECT:-phase0}"
+STRICT_CAUSAL="${STRICT_CAUSAL:-0}"
+RULE_OPTS=(--rule_key_select "$KEY_SELECT")
+[[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -48,6 +60,7 @@ COMMON=(
   --unseen_data "$UNSEEN_DATA"
   --model_size 1 --batch_size 8 --n_skip "$N_SKIP"
   --rule_mode compiled --rule_view root_next
+  "${RULE_OPTS[@]}"
   --max_steps "$MAX_STEPS" --val_check_interval 500
   --ckpt_dir "$CKPT_DIR"
   --no_tensorboard
@@ -80,6 +93,7 @@ stem () {
           --val_data "$VAL_DATA" --unseen_data "$UNSEEN_DATA" \
           --model_size 1 --batch_size 8 --n_skip "$N_SKIP" \
           --rule_mode compiled --rule_view root_next \
+          "${RULE_OPTS[@]}" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --no_tensorboard \
           --unfreeze_base --run_name cp_yy_scratch \
