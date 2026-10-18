@@ -37,7 +37,7 @@ from midi_adapter.evaluate_cp_bass import (
     ROOT_NAMES,
     PRETRAIN_ONLY, FINETUNE_ONLY, BOTH_SEEN, UNSEEN, CATEGORIES,
     PRETRAIN_KEYS, FINETUNE_NEW, ALL_SEEN,   # backward-compat aliases
-    _expected_pc, _extract_pc,
+    _expected_pc, _extract_pc, _scored_positions,
     _print_summary_table, _print_per_key, _print_error_dist,
 )
 
@@ -75,6 +75,7 @@ def rule_following_acc(
     device: torch.device,
     temperature: float,
     n_prompt_beats: int = 2,
+    beats_per_chord: int = 1,
 ) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
     per_key: dict[int, float] = {}
     errors:  list[tuple[int, int | None]] = []
@@ -83,14 +84,17 @@ def rule_following_acc(
         trial_accs = []
         for _ in range(n_trials):
             pcs = _gen_pcs(model, key, n_gen, device, temperature, n_prompt_beats)
+            total = n_prompt_beats + len(pcs)
+            scored = _scored_positions(n_prompt_beats, total, beats_per_chord)
             n_correct = 0
-            for pos, pc in enumerate(pcs):
-                exp = _expected_pc(key, pos + n_prompt_beats)
+            for t in scored:
+                pc  = pcs[t - n_prompt_beats]
+                exp = _expected_pc(key, t, beats_per_chord)
                 if pc == exp:
                     n_correct += 1
                 else:
                     errors.append((exp, pc))
-            trial_accs.append(n_correct / len(pcs))
+            trial_accs.append(n_correct / max(len(scored), 1))
         per_key[key] = float(np.mean(trial_accs))
 
     return per_key, errors

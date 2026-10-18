@@ -99,12 +99,12 @@ def main(args):
     # 1-beat prompt leaves it guessing. sample_step=4 (one cycle) makes
     # position 0 of every window phase 0, as it already is for the integer
     # experiment, whose sequences always start at phase 0.
-    train_ds = FramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+    train_ds = FramedDataset(args.train_data, args.train_length, args.batch_size,
                              sample_step=args.sample_step,
                              split=args.train_split)
     _preload(train_ds, _cache)
 
-    val_ds = FramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+    val_ds = FramedDataset(args.val_data, args.train_length, args.batch_size,
                            split=args.val_split, sample_step=16, repeat=True)
     _preload(val_ds, _cache)
 
@@ -204,6 +204,10 @@ def get_args():
                    help='FramedDataset split for val loader (default: val)')
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',  type=int, default=8)
+    p.add_argument('--train_length',       type=int, default=TRAIN_LENGTH,
+                   help=f'Window length in beats (default {TRAIN_LENGTH}). With '
+                        'one chord per bar a cycle is 16 beats, so use 32 or '
+                        'more. Must match what the adapter trainer uses.')
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
     p.add_argument('--pct_start',    type=float, default=0.3,
                    help='OneCycleLR warmup fraction. 0.3 (3000 warmup steps at '

@@ -265,6 +265,7 @@ class CPYinyangTransformer(nn.Module):
         rule_enc_type:    str  = 'mlp',        # 'linear' | 'mlp'
         rule_enc_hidden:  int  = 64,
         rule_key_select:  str  = 'phase0',
+        rule_subbeats_per_chord: int = 1,
         strict_causal:    bool = False,
         gate_init:        float = 0.0,
         freeze_base_eval: bool = False,
@@ -314,9 +315,13 @@ class CPYinyangTransformer(nn.Module):
             # is fed the same shifted view, which keeps it causal, and its
             # SequenceMap then emits the root for beat t -- the beat the
             # adapter is about to influence.
-            self.rule_model = RaspCompiledRule(shift=1, input_shift=-1,
-                                               view=rule_view,
-                                               key_select=rule_key_select)
+            # subbeats_per_chord>1: the root is held for that many beats, so
+            # phase_at divides before the modulo and a cycle spans
+            # 4*subbeats_per_chord positions. Required for --cycle_unit bar.
+            self.rule_model = RaspCompiledRule(
+                subbeats_per_chord=rule_subbeats_per_chord,
+                shift=1, input_shift=-1,
+                view=rule_view, key_select=rule_key_select)
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
         # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the

@@ -60,9 +60,26 @@ CATEGORIES = [
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _expected_pc(key: int, pos: int) -> int:
-    """Expected pitch class at absolute beat position pos (0 = prompt note)."""
-    return (key + OFFSETS[pos % 4]) % 12
+def _expected_pc(key: int, pos: int, beats_per_chord: int = 1) -> int:
+    """Expected pitch class at absolute beat position pos (0 = prompt note).
+
+    beats_per_chord=1 is the original data: the root changes every beat, so a
+    cycle fills one bar. beats_per_chord=4 is --cycle_unit bar: the root is
+    held for a whole bar and a cycle spans four bars.
+    """
+    return (key + OFFSETS[(pos // beats_per_chord) % 4]) % 12
+
+
+def _scored_positions(n_prompt: int, total: int, beats_per_chord: int = 1):
+    """Which absolute beats carry a rule target.
+
+    With one chord per beat, every beat does. With one chord per BAR the bar
+    is realised by a pattern that may use chord tones, so only the DOWNBEAT is
+    pinned to the root -- every pattern starts there, and it is the one beat
+    guaranteed to carry an onset.
+    """
+    return [t for t in range(n_prompt, total)
+            if beats_per_chord == 1 or t % beats_per_chord == 0]
 
 
 def _extract_pc(tok: torch.Tensor, tokenizer) -> int | None:
@@ -106,6 +123,7 @@ def rule_following_acc(
     device: torch.device,
     temperature: float,
     n_prompt_beats: int = 2,
+    beats_per_chord: int = 1,
 ) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
     """
     Returns
@@ -120,14 +138,17 @@ def rule_following_acc(
         trial_accs = []
         for _ in range(n_trials):
             pcs = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats)
+            total = n_prompt_beats + len(pcs)
+            scored = _scored_positions(n_prompt_beats, total, beats_per_chord)
             n_correct = 0
-            for pos, pc in enumerate(pcs):
-                exp = _expected_pc(key, pos + n_prompt_beats)
+            for t in scored:
+                pc  = pcs[t - n_prompt_beats]
+                exp = _expected_pc(key, t, beats_per_chord)
                 if pc == exp:
                     n_correct += 1
                 else:
                     errors.append((exp, pc))
-            trial_accs.append(n_correct / len(pcs))
+            trial_accs.append(n_correct / max(len(scored), 1))
         per_key[key] = float(np.mean(trial_accs))
 
     return per_key, errors

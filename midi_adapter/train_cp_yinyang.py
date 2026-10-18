@@ -160,11 +160,13 @@ class UnseenAccuracyCallback(L.Callback):
     """
 
     def __init__(self, dataloader: DataLoader, n_batches: int = 5,
-                 n_prompt_beats: int = 1, n_gen_beats: int = 23):
+                 n_prompt_beats: int = 1, n_gen_beats: int = 23,
+                 beats_per_chord: int = 1):
         self.dataloader     = dataloader
         self.n_batches      = n_batches
         self.n_prompt_beats = n_prompt_beats
         self.n_gen_beats    = n_gen_beats
+        self.beats_per_chord = beats_per_chord
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
@@ -202,7 +204,12 @@ class UnseenAccuracyCallback(L.Callback):
 
                 # sampled[t] is (B, subseq_len) preprocessed token for beat t.
                 # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
+                # With one chord per bar only the downbeat is pinned to the
+                # root; the other beats may legitimately be chord tones or rests.
+                bpc = self.beats_per_chord
                 for t in range(self.n_prompt_beats, total_beats):
+                    if bpc > 1 and t % bpc != 0:
+                        continue
                     y_t         = sampled[t]                   # (B, subseq)
                     # A beat that emitted no note must count as WRONG, not as
                     # whatever its control token happens to decode to. Taking
@@ -214,7 +221,7 @@ class UnseenAccuracyCallback(L.Callback):
                     prog, pitch_dur = y_t[:, 0], y_t[:, 1]
                     valid       = (prog < 128) & (pitch_dur >= 128)
                     pred_pc     = (pitch_dur % 128) % 12      # (B,)
-                    expected_pc = (key + OFFSETS[t % 4]) % 12 # (B,)
+                    expected_pc = (key + OFFSETS[(t // bpc) % 4]) % 12
                     correct    += ((pred_pc == expected_pc) & valid).sum().item()
                     degenerate += (~valid).sum().item()
                     total      += len(pred_pc)
@@ -345,6 +352,7 @@ def main(args):
         rule_enc_type     = args.rule_enc_type,
         rule_enc_hidden   = args.rule_enc_hidden,
         rule_key_select   = args.rule_key_select,
+        rule_subbeats_per_chord = args.beats_per_chord,
         strict_causal     = args.strict_causal,
         gate_init         = args.gate_init,
         freeze_base_eval  = args.freeze_base_eval,
@@ -373,13 +381,13 @@ def main(args):
     # See pretrain_cp_bass: sample_step=4 aligns each window to a cycle
     # boundary so position encodes phase. Must match whatever the base was
     # pretrained with, or the adapter sees a different alignment than its host.
-    train_ds = BassFramedDataset(args.train_data, TRAIN_LENGTH, args.batch_size,
+    train_ds = BassFramedDataset(args.train_data, args.train_length, args.batch_size,
                                  split=args.train_split,
                                  sample_step=args.sample_step)
     train_ds.preload(_cache)
 
     if args.pretrain_data and os.path.exists(args.pretrain_data):
-        pretrain_ds = BassFramedDataset(args.pretrain_data, TRAIN_LENGTH, args.batch_size,
+        pretrain_ds = BassFramedDataset(args.pretrain_data, args.train_length, args.batch_size,
                                         split=args.train_split,
                                         sample_step=args.sample_step)
         pretrain_ds.preload(_cache)
@@ -388,7 +396,7 @@ def main(args):
     else:
         effective_train_ds = train_ds
 
-    val_ds = BassFramedDataset(args.val_data, TRAIN_LENGTH, args.batch_size,
+    val_ds = BassFramedDataset(args.val_data, args.train_length, args.batch_size,
                                 split=args.val_split, sample_step=SUBBEATS_PER_BAR,
                                 repeat=True)
     val_ds.preload(_cache)
@@ -401,7 +409,7 @@ def main(args):
     val_loaders   = [val_loader]
     unseen_acc_cb = None
     if args.unseen_data and os.path.exists(args.unseen_data):
-        unseen_ds = BassFramedDataset(args.unseen_data, TRAIN_LENGTH, args.batch_size,
+        unseen_ds = BassFramedDataset(args.unseen_data, args.train_length, args.batch_size,
                                        split='val', sample_step=SUBBEATS_PER_BAR,
                                        repeat=True)
         unseen_ds.preload(_cache)
@@ -410,12 +418,13 @@ def main(args):
         unseen_acc_cb = UnseenAccuracyCallback(
             unseen_loader, n_batches=5,
             n_prompt_beats=args.probe_prompt_beats,
-            n_gen_beats=args.probe_gen_beats)
+            n_gen_beats=args.probe_gen_beats,
+            beats_per_chord=args.beats_per_chord)
         print(f'Unseen eval data: {args.unseen_data}')
-        if args.probe_prompt_beats > TRAIN_LENGTH:
+        if args.probe_prompt_beats > args.train_length:
             raise SystemExit(
                 f'--probe_prompt_beats {args.probe_prompt_beats} exceeds the '
-                f'{TRAIN_LENGTH}-beat window, so the prompt slice is silently '
+                f'{args.train_length}-beat window, so the prompt slice is silently '
                 f'truncated and unseen_acc scores the wrong beats.')
         print(f'unseen_acc probe   : {args.probe_prompt_beats}-beat prompt, '
               f'{args.probe_gen_beats} generated')
@@ -578,6 +587,18 @@ def get_args():
                    help='Seed for pl.seed_everything. Pass a distinct '
                         '--run_name per seed so the runs do not share a '
                         'checkpoint directory.')
+    p.add_argument('--beats_per_chord',    type=int, default=1,
+                   help='Beats the root is held for. 1 (default) is the '
+                        'original data, where the root changes every beat and '
+                        'a cycle fills one bar. 4 matches --cycle_unit bar: '
+                        'the root is held for a whole bar, a cycle spans four '
+                        'bars, and only the downbeat is pinned to it -- so the '
+                        'rule model holds each phase for 4 steps and the probe '
+                        'scores downbeats only.')
+    p.add_argument('--train_length',       type=int, default=TRAIN_LENGTH,
+                   help=f'Window length in beats (default {TRAIN_LENGTH}). With '
+                        '--beats_per_chord 4 a cycle is 16 beats, so use 32 or '
+                        'more to cover at least two cycles.')
     p.add_argument('--gate_init',          type=float, default=0.0,
                    help='Initial value of each adapter block\'s output gate. '
                         '0.0 (default) means the adapter contributes nothing '
