@@ -49,7 +49,22 @@ STRICT_CAUSAL="${STRICT_CAUSAL:-0}"
 #                      the runs do not share a checkpoint directory.
 SEED="${SEED:-42}"
 RUN_SUFFIX="${RUN_SUFFIX:-}"
-RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED")
+#   GATE_INIT=<f>      adapter output-gate init. 0.0 (default) starts the
+#                      adapter at zero contribution; 1.0 reproduces runs made
+#                      before the flag existed.
+#   FREEZE_BASE_EVAL=1 hold the frozen host in eval mode (dropout off). Only
+#                      the frozen-host stems take it; it is rejected alongside
+#                      --unfreeze_base.
+#   LORA_RANK=<n>      rank for the lora stem. 16 matches the reference
+#                      implementation and the hand-written launch blocks; this
+#                      script previously hardcoded 8, so runs launched through
+#                      it are not comparable to those on that axis.
+GATE_INIT="${GATE_INIT:-0.0}"
+FREEZE_BASE_EVAL="${FREEZE_BASE_EVAL:-0}"
+LORA_RANK="${LORA_RANK:-16}"
+RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT")
+FROZEN_OPTS=()
+[[ "$FREEZE_BASE_EVAL" == "1" ]] && FROZEN_OPTS+=(--freeze_base_eval)
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
@@ -81,9 +96,9 @@ run () {            # run <run_name> <extra args...>
 stem () {
   case "$1" in
     # Frozen AR + adapter: the headline uni-directional FA setup.
-    frozen)  run cp_yy_frozen ;;
+    frozen)  run cp_yy_frozen "${FROZEN_OPTS[@]}" ;;
     # Same, with LoRA on the base Q/V.
-    lora)    run cp_yy_lora    --lora_rank 8 ;;
+    lora)    run cp_yy_lora    --lora_rank "$LORA_RANK" "${FROZEN_OPTS[@]}" ;;
     # Same, base fully trainable from the pretrained checkpoint.
     trainar) run cp_yy_trainar --unfreeze_base ;;
     # Base from scratch, trained jointly with the adapter on A+B interleaved.
@@ -108,7 +123,7 @@ stem () {
     # the variant that reached 1.000 on the integer experiment.
     noinput) run cp_yy_noinput_mlp_aux1 \
                  --rule_input ar_state --rule_enc_type mlp --rule_enc_hidden 64 \
-                 --enc_loss_weight 1.0 ;;
+                 --enc_loss_weight 1.0 "${FROZEN_OPTS[@]}" ;;
     *) echo "unknown stem: $1  (frozen lora trainar scratch noinput all)" >&2
        exit 1 ;;
   esac
