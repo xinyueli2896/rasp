@@ -176,8 +176,9 @@ class UnseenAccuracyCallback(L.Callback):
         device      = pl_module.device
         total_beats = self.n_prompt_beats + self.n_gen_beats
 
-        correct = 0
-        total   = 0
+        correct    = 0
+        total      = 0
+        degenerate = 0          # beats that emitted no note at all
 
         torch.cuda.empty_cache()
         model.eval()
@@ -203,13 +204,28 @@ class UnseenAccuracyCallback(L.Callback):
                 # Slot 1 = pitch + (dur+1)*128  →  token % 128 = pitch  →  % 12 = pc
                 for t in range(self.n_prompt_beats, total_beats):
                     y_t         = sampled[t]                   # (B, subseq)
-                    pred_pc     = (y_t[:, 1] % 128) % 12      # (B,)
+                    # A beat that emitted no note must count as WRONG, not as
+                    # whatever its control token happens to decode to. Taking
+                    # slot 1 % 128 % 12 unconditionally scored pad(3330) as
+                    # pc 2, eos(3329) as pc 1 and sos(3328) as pc 0, so one
+                    # degenerate beat in twelve was counted CORRECT. Same
+                    # validity test as evaluate_cp_bass._extract_pc, which the
+                    # results table already used.
+                    prog, pitch_dur = y_t[:, 0], y_t[:, 1]
+                    valid       = (prog < 128) & (pitch_dur >= 128)
+                    pred_pc     = (pitch_dur % 128) % 12      # (B,)
                     expected_pc = (key + OFFSETS[t % 4]) % 12 # (B,)
-                    correct    += (pred_pc == expected_pc).sum().item()
+                    correct    += ((pred_pc == expected_pc) & valid).sum().item()
+                    degenerate += (~valid).sum().item()
                     total      += len(pred_pc)
 
         acc = correct / max(total, 1)
         pl_module.log('unseen_acc', acc, prog_bar=True)
+        # Surfaced because a rising degenerate rate means the adapter's write is
+        # disturbing the local decoder's EOS decision rather than the pitch
+        # field -- a different failure from simply naming the wrong root.
+        pl_module.log('unseen_degenerate', degenerate / max(total, 1),
+                      prog_bar=False)
 
 
 # ---------------------------------------------------------------------------
