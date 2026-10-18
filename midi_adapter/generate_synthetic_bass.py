@@ -134,7 +134,12 @@ def _bar_notes(root_semitone: int, quality: str,
     root  = tones[0]
     fifth = tones[min(2, len(tones) - 1)]
 
-    T = SUBBEATS_PER_BAR   # 16
+    T = SUBBEATS_PER_BAR   # 4 -- BEAT_DIV is 1, so one subbeat IS one beat
+                           # (quarter note) and a bar holds 4 of them. Nothing
+                           # in this data is subdivided below a beat. Note
+                           # chord_dataset.py defines its own SUBBEATS_PER_BAR
+                           # = 16; that constant belongs to a different
+                           # representation and does not apply here.
 
     if pattern == 'whole':
         return [_make_note(root, bar_start, T)]
