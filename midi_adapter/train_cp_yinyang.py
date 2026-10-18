@@ -302,6 +302,12 @@ class CPYinyangLightning(L.LightningModule):
 # ---------------------------------------------------------------------------
 
 def main(args):
+    # Unlike pretrain_cp_bass and finetune_cp_bass, this trainer was never
+    # seeded, so every launch drew a different adapter init, data order and
+    # dropout pattern. With one run per stem that left run-to-run variance
+    # indistinguishable from a real effect -- frozen and lora swapped places
+    # between two runs whose rule-model changes were provably bit-identical.
+    L.seed_everything(args.seed, workers=True)
     n_gpus   = max(torch.cuda.device_count(), 1)
     max_lr   = 5e-5 if args.model_size >= 2 else 1e-4
     lora_suffix  = f'_lora{args.lora_rank}' if args.lora_rank > 0 else ''
@@ -561,6 +567,10 @@ def get_args():
                         'holding beat 0, so the head attends exactly one '
                         'token. Identical outputs on rule-following input; '
                         'they differ only when the stream breaks the rule.')
+    p.add_argument('--seed',               type=int, default=42,
+                   help='Seed for pl.seed_everything. Pass a distinct '
+                        '--run_name per seed so the runs do not share a '
+                        'checkpoint directory.')
     p.add_argument('--strict_causal',      action='store_true',
                    help='Mask the adapter cross-attention to j < t instead of '
                         'j <= t, in training AND generation. By default the '

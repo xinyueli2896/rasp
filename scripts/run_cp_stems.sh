@@ -45,7 +45,11 @@ N_SKIP="${N_SKIP:-1}"
 #                      be used instead.
 KEY_SELECT="${KEY_SELECT:-phase0}"
 STRICT_CAUSAL="${STRICT_CAUSAL:-0}"
-RULE_OPTS=(--rule_key_select "$KEY_SELECT")
+#   SEED=<n>           adapter seed; pass a distinct RUN_SUFFIX per seed so
+#                      the runs do not share a checkpoint directory.
+SEED="${SEED:-42}"
+RUN_SUFFIX="${RUN_SUFFIX:-}"
+RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED")
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
@@ -67,7 +71,7 @@ COMMON=(
 )
 
 run () {            # run <run_name> <extra args...>
-  local name="$1"; shift
+  local name="$1$RUN_SUFFIX"; shift
   echo "=== $name ==="
   python -m midi_adapter.train_cp_yinyang \
       "${COMMON[@]}" --run_name "$name" "$@" \
@@ -96,8 +100,8 @@ stem () {
           "${RULE_OPTS[@]}" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --no_tensorboard \
-          --unfreeze_base --run_name cp_yy_scratch \
-          2>&1 | tee "$LOG_DIR/cp_yy_scratch.log"
+          --unfreeze_base --run_name "cp_yy_scratch$RUN_SUFFIX" \
+          2>&1 | tee "$LOG_DIR/cp_yy_scratch$RUN_SUFFIX.log"
       ;;
     # No input to the rule model: the host's pre-block state is encoded into
     # the rule model's token subspace. MLP encoder + aux CE on the current pc,
