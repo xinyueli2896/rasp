@@ -85,7 +85,7 @@ def inspect(ckpt_path: str) -> dict:
     sd  = raw.get('state_dict', raw) if isinstance(raw, dict) else {}
     info = {'rule_mode': 'current', 'rule_view': 'key_phase',
             'lora_rank': 0, 'rule_input': 'tokens', 'enc': None,
-            'enc_hidden': 64, 'n_adapters': 0}
+            'enc_hidden': 64, 'n_adapters': 0, 'strict_causal': False}
 
     # n_skip was the one rebuild parameter still taken on trust from the
     # command line, and it is the one that fails silently: load_model calls
@@ -111,6 +111,12 @@ def inspect(ckpt_path: str) -> dict:
         if 'lora_A' in k:
             info['lora_rank'] = v.shape[0]
             break
+    # Saved as a buffer by CPYinyangCrossAttention; absent on older
+    # checkpoints, which were all trained with the inclusive mask.
+    sc = next((v for k, v in sd.items() if k.endswith('strict_causal')), None)
+    if sc is not None:
+        info['strict_causal'] = bool(sc.item())
+
     if any('rule_input_encoder.fc_out' in k for k in sd):
         info['rule_input'] = 'ar_state'
         w1 = next((v for k, v in sd.items() if k.endswith('rule_input_encoder.fc1.weight')),
@@ -186,7 +192,7 @@ def main():
         print(f'  {run:<26} {os.path.basename(c)}')
         print(f'  {"":<26} rule_mode={info["rule_mode"]} view={info["rule_view"]} '
               f'lora_rank={info["lora_rank"]} rule_input={info["rule_input"]} '
-              f'n_skip={n_skip}'
+              f'n_skip={n_skip} strict_causal={info["strict_causal"]}'
               + (f' enc={info["enc"]}' if info['enc'] else ''))
         model = load_adapter_model(
             args.base_ckpt, c, args.model_size, args.adapter_rank, n_skip,
@@ -195,7 +201,8 @@ def main():
             lora_rank       = info['lora_rank'],
             rule_input      = info['rule_input'],
             rule_enc_type   = info['enc'] or 'mlp',
-            rule_enc_hidden = info['enc_hidden'])
+            rule_enc_hidden = info['enc_hidden'],
+            strict_causal   = info['strict_causal'])
         entries.append((run, model, True))
 
     print()

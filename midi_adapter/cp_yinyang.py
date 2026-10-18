@@ -144,8 +144,14 @@ class CPYinyangCrossAttention(nn.Module):
         n_heads:      int   = 8,
         dropout:      float = 0.1,
         max_beats:    int   = 512,
+        strict_causal: bool = False,
     ):
         super().__init__()
+        # Saved as a buffer so a checkpoint carries its own masking rule --
+        # rebuilding with the wrong one changes no shape and would otherwise
+        # pass silently, the same trap n_skip had.
+        self.register_buffer('strict_causal',
+                             torch.tensor(bool(strict_causal)))
         assert embed_dim % n_heads == 0
         self.n_heads  = n_heads
         self.head_dim = embed_dim // n_heads
@@ -189,15 +195,34 @@ class CPYinyangCrossAttention(nn.Module):
 
         scores = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, H, T_q, T_k)
 
-        # Plain causal mask: beat (sub_offset + i) may attend to beat j iff j <= sub_offset + i
+        # Causal mask over the rule stream.
+        #   strict_causal=False (default): j <= t. rule_hidden[t] is the rule's
+        #     prediction FOR beat t, computed from the key and position and
+        #     independent of beat t itself, so this leaks nothing and is the
+        #     only row carrying the answer for the step being produced.
+        #   strict_causal=True: j < t. The newest visible row is the prediction
+        #     for beat t-1, so the answer for beat t is NOT handed over. Under
+        #     a period-4 rule it is still reachable at j = t-4, which carries
+        #     the same phase and therefore the same root -- but only once
+        #     t-4 is a valid, non-zero row, so the first few generated beats
+        #     have no same-phase reference at all.
         abs_q = torch.arange(sub_offset, sub_offset + T_q, device=ar_hidden.device)
         k_rng = torch.arange(T_k, device=ar_hidden.device)
-        causal = abs_q.unsqueeze(1) >= k_rng.unsqueeze(0)              # (T_q, T_k)
+        causal = (abs_q.unsqueeze(1) > k_rng.unsqueeze(0)
+                  if bool(self.strict_causal)
+                  else abs_q.unsqueeze(1) >= k_rng.unsqueeze(0))       # (T_q, T_k)
+        # A query with NO visible key (t=0 under strict_causal) would softmax
+        # over all -inf and produce NaN. Let it attend freely so the softmax is
+        # finite, then zero its contribution: nothing is visible, so the
+        # adapter has nothing to say about that position.
+        no_key = ~causal.any(dim=-1)                                   # (T_q,)
+        causal = causal | no_key.unsqueeze(1)
         scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), float('-inf'))
 
         attn = self.attn_drop(F.softmax(scores, dim=-1))
         out  = (attn @ V).transpose(1, 2).contiguous().view(B, T_q, self.embed_dim)
-        return self.out_proj(out) * self.gate
+        out  = self.out_proj(out) * self.gate
+        return out.masked_fill(no_key.view(1, T_q, 1), 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +259,7 @@ class CPYinyangTransformer(nn.Module):
         rule_enc_type:    str  = 'mlp',        # 'linear' | 'mlp'
         rule_enc_hidden:  int  = 64,
         rule_key_select:  str  = 'phase0',
+        strict_causal:    bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -314,6 +340,7 @@ class CPYinyangTransformer(nn.Module):
                 rule_d_model = rule_width,
                 embed_dim    = adapter_rank,
                 n_heads      = 8,
+                strict_causal= strict_causal,
             )
             for _ in range(n_adapters)
         ])

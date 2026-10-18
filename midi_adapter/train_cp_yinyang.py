@@ -339,6 +339,7 @@ def main(args):
         rule_enc_type     = args.rule_enc_type,
         rule_enc_hidden   = args.rule_enc_hidden,
         rule_key_select   = args.rule_key_select,
+        strict_causal     = args.strict_causal,
     )
 
     if args.unfreeze_base:
@@ -560,6 +561,17 @@ def get_args():
                         'holding beat 0, so the head attends exactly one '
                         'token. Identical outputs on rule-following input; '
                         'they differ only when the stream breaks the rule.')
+    p.add_argument('--strict_causal',      action='store_true',
+                   help='Mask the adapter cross-attention to j < t instead of '
+                        'j <= t, in training AND generation. By default the '
+                        "query at t may read rule_hidden[t], the rule's "
+                        'prediction FOR beat t -- which is derived from the '
+                        'key and position, not from beat t, so it leaks '
+                        'nothing. With this flag the answer for beat t is '
+                        'withheld; under a period-4 rule the same root is '
+                        'still reachable at j = t-4, so the adapter must '
+                        'learn a -4 offset, and the first few generated beats '
+                        'have no same-phase row to read at all.')
     p.add_argument('--sample_step',        type=int, default=SUBBEATS_PER_BAR,
                    help='Align training window starts to a multiple of this. This '
                         'trainer always used SUBBEATS_PER_BAR (one I-IV-V-I cycle); '
