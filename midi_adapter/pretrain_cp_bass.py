@@ -69,7 +69,7 @@ def main(args):
         optimizer = torch.optim.AdamW(net.parameters(), lr=max_lr)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=max_lr,
-            total_steps=args.max_steps, pct_start=0.005,
+            total_steps=args.max_steps, pct_start=args.pct_start,
         )
         return {'optimizer': optimizer,
                 'lr_scheduler': {'scheduler': scheduler,
@@ -205,6 +205,14 @@ def get_args():
     p.add_argument('--model_size',  type=int, default=1, choices=[0, 1, 2, 3])
     p.add_argument('--batch_size',  type=int, default=8)
     p.add_argument('--max_steps',          type=int, default=MAX_STEPS)
+    p.add_argument('--pct_start',    type=float, default=0.005,
+                   help='OneCycleLR warmup fraction. 0.005 of max_steps is 50 '
+                        'warmup steps at max_steps=10000, which reaches '
+                        'max_lr very fast. NOTE: the cp_bass_pre_A_aligned '
+                        'base that worked was trained with 0.3 by accident, '
+                        'when a comment swallowed this line and OneCycleLR '
+                        'fell back to its own default. If a pretrain diverges '
+                        'early, try 0.3 to reproduce that schedule.')
     p.add_argument('--val_check_interval', type=int, default=2500)
     p.add_argument('--ckpt_dir',      type=str,  default='ckpt')
     p.add_argument('--sample_step',   type=int,  default=1,
