@@ -194,19 +194,26 @@ class RaspCompiledRule(nn.Module):
         self.d_model    = D_MODEL
         self.rule_d_model = VIEW_WIDTH[view]
 
+        # Every weight below is a deterministic constant rebuilt by this
+        # constructor, so persistent=False keeps them OUT of state_dict.
+        # Saving them made each checkpoint carry a copy of the compiled
+        # program, which meant any change to the rule model's dimensions --
+        # adding the is_first dim took D_MODEL from 44 to 45 -- turned every
+        # older checkpoint into a load-time size mismatch for weights that
+        # were never trained.
         V, d = N_ROOTS, D_MODEL
 
         W_E = torch.zeros(V, d)
         W_E[:, TOK_BASE:TOK_BASE + V] = torch.eye(V)
-        self.register_buffer('W_E', W_E)
+        self.register_buffer('W_E', W_E, persistent=False)
 
         W_phase = torch.zeros(N_POS, d)
         W_phase_next = torch.zeros(N_POS, d)
         for p in range(N_POS):
             W_phase[p, PH_BASE + p]       = 1.0
             W_phase_next[p, PHN_BASE + p] = 1.0
-        self.register_buffer('W_phase', W_phase)
-        self.register_buffer('W_phase_next', W_phase_next)
+        self.register_buffer('W_phase', W_phase, persistent=False)
+        self.register_buffer('W_phase_next', W_phase_next, persistent=False)
 
         # is_first: 1 at the stream slot holding beat 0. The beat at stream
         # index t is beat t + input_shift, so beat 0 sits at t = -input_shift
@@ -228,16 +235,16 @@ class RaspCompiledRule(nn.Module):
             for p in range(N_POS):
                 W_Q[FIRST_BASE, PH_BASE + p] = 1.0
             W_K[FIRST_BASE, FIRST_BASE] = 1.0
-        self.register_buffer('W_Q', W_Q)
-        self.register_buffer('W_K', W_K)
+        self.register_buffer('W_Q', W_Q, persistent=False)
+        self.register_buffer('W_K', W_K, persistent=False)
 
         W_V = torch.zeros(d, d)
         W_O = torch.zeros(d, d)
         for i in range(V):
             W_V[KEY_BASE + i, TOK_BASE + i] = 1.0
             W_O[KEY_BASE + i, KEY_BASE + i] = 1.0
-        self.register_buffer('W_V', W_V)
-        self.register_buffer('W_O', W_O)
+        self.register_buffer('W_V', W_V, persistent=False)
+        self.register_buffer('W_O', W_O, persistent=False)
 
         # --- MLP: SequenceMap((key, phase_next) -> root_next) -------------
         n_pairs = V * N_POS
@@ -250,13 +257,13 @@ class RaspCompiledRule(nn.Module):
                 W_in[n, KEY_BASE + k]  = 1.0
                 W_in[n, PHN_BASE + p]  = 1.0
                 W_out[ROOT_BASE + (k + OFFSETS[p]) % V, n] = 1.0
-        self.register_buffer('W_in',  W_in)
-        self.register_buffer('b_in',  b_in)
-        self.register_buffer('W_out', W_out)
+        self.register_buffer('W_in',  W_in, persistent=False)
+        self.register_buffer('b_in',  b_in, persistent=False)
+        self.register_buffer('W_out', W_out, persistent=False)
 
-        self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long))
+        self.register_buffer('_offsets', torch.tensor(OFFSETS, dtype=torch.long), persistent=False)
         self.register_buffer('_view_dims', torch.tensor(view_dims(view),
-                                                        dtype=torch.long))
+                                                        dtype=torch.long), persistent=False)
 
     # ------------------------------------------------------------------
 
