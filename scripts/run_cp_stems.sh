@@ -69,8 +69,16 @@ LORA_RANK="${LORA_RANK:-16}"
 #                      use >= 32 when BEATS_PER_CHORD=4.
 BEATS_PER_CHORD="${BEATS_PER_CHORD:-1}"
 TRAIN_LENGTH="${TRAIN_LENGTH:-24}"
+#   PROBE_PROMPT / PROBE_GEN  protocol for the in-training unseen_acc probe,
+#                      which also drives checkpoint selection. Keep it equal to
+#                      what the results table reports with. With one chord per
+#                      bar a cycle is 16 beats, so a 1-beat prompt is a thin
+#                      basis for the key: use 4 (one full bar) and 28.
+PROBE_PROMPT="${PROBE_PROMPT:-1}"
+PROBE_GEN="${PROBE_GEN:-23}"
 RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT"
-           --beats_per_chord "$BEATS_PER_CHORD" --train_length "$TRAIN_LENGTH")
+           --beats_per_chord "$BEATS_PER_CHORD" --train_length "$TRAIN_LENGTH"
+           --probe_prompt_beats "$PROBE_PROMPT" --probe_gen_beats "$PROBE_GEN")
 FROZEN_OPTS=()
 [[ "$FREEZE_BASE_EVAL" == "1" ]] && FROZEN_OPTS+=(--freeze_base_eval)
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
