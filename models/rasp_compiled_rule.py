@@ -324,33 +324,39 @@ class RaspCompiledRule(nn.Module):
 
     def build_rule_hidden_analytic(self, pc_0: torch.Tensor, T: int,
                                    device, view: str | None = None) -> torch.Tensor:
-        """rule_hidden for a KNOWN key, without reading a stream.
+        """rule_hidden for a KNOWN key, by RUNNING the compiled program.
 
-        The sampling path knows the key from the prompt and needs the whole
-        window up front, before the notes it describes exist. Everything the
-        compiled program computes is a function of (key, position), so it can
-        be written directly: the head would retrieve `key`, and the MLP would
-        emit (key + OFFSETS[phase_next]) % 12.
+        The sampling path knows the key from the prompt but needs the whole
+        window up front, before the notes it describes exist. Only the input
+        is reconstructed here: under the rule the slot at stream index t
+        carries (key + OFFSETS[phase(t)]) % 12, so the stream the compiled
+        model would have read can be written down from pc_0 alone. Everything
+        after that is the real forward pass -- embed, the attention head that
+        retrieves the key, and the MLP that computes the root.
 
-        Built to agree exactly with rule_hidden() on a rule-following stream,
-        including the zeroed index 0 when input_shift < 0, where the host has
-        not yet seen a beat and nothing is knowable.
+        This used to write the key and root one-hots directly, which made the
+        generation path a closed-form stand-in rather than the compiled model:
+        neither W_Q/W_K/W_V/W_O nor W_in/W_out executed at inference, and the
+        head's retrieval behaviour (key_select) could not matter. The output
+        is unchanged -- it agreed with the forward pass by construction, and
+        the tests assert it still does -- but the claim that a compiled
+        transformer supplies the signal is now literally true at inference,
+        and key_select is exercised where it is actually used.
+
+        Index 0 is zeroed when input_shift < 0: the host has not seen a beat
+        there, so nothing is derivable. The token placed at that slot is never
+        read -- its phase label is (0 - 1) % 4 = 3, which no Select matches,
+        and it carries no is_first marker.
         """
-        B = pc_0.shape[0]
         pc_0 = pc_0.to(device).long()
         ph   = self.phase_at(T, device, self.input_shift)
-        phn  = self.phase_at(T, device, self.input_shift + self.shift)
 
-        tok_r  = (pc_0[:, None] + self._offsets.to(device)[ph][None, :]) % N_ROOTS
-        root_r = (pc_0[:, None] + self._offsets.to(device)[phn][None, :]) % N_ROOTS
+        # The stream the rule implies, which is what the model would have read.
+        tok_r = (pc_0[:, None] + self._offsets.to(device)[ph][None, :]) % N_ROOTS
 
-        h = torch.zeros(B, T, self.d_model, device=device)
-        h[:, :, TOK_BASE:TOK_BASE + N_ROOTS]   = F.one_hot(tok_r,  N_ROOTS).float()
-        h[:, :, KEY_BASE:KEY_BASE + N_ROOTS]   = F.one_hot(
-            pc_0[:, None].expand(-1, T), N_ROOTS).float()
-        h[:, :, ROOT_BASE:ROOT_BASE + N_ROOTS] = F.one_hot(root_r, N_ROOTS).float()
-        h = h + self.W_phase[ph].unsqueeze(0) + self.W_phase_next[phn].unsqueeze(0)
+        h = self.mlp(self.attention(self.embed(tok_r)))
         if self.input_shift < 0:
+            h = h.clone()
             h[:, 0] = 0.0
 
         dims = (self._view_dims if view is None
