@@ -156,6 +156,17 @@ def _bar_notes(root_semitone: int, quality: str,
         pitches = [_bass_root((root_semitone + offset) % 12) for offset in OFFSETS]
         return [_make_note(p, bar_start + i * step, step) for i, p in enumerate(pitches)]
 
+    if pattern == 'root4':
+        # The bar's root, four times -- 'C C C C'. Distinct from 'quarter',
+        # which puts a whole I-IV-V-I cycle inside one bar.
+        step = T // 4
+        return [_make_note(root, bar_start + i * step, step) for i in range(4)]
+
+    if pattern == 'root2':
+        # Root held for two beats, twice.
+        step = T // 2
+        return [_make_note(root, bar_start + i * step, step) for i in range(2)]
+
     if pattern == 'walking':
         # Walk through chord tones across 4 beats
         step    = T // 4
@@ -170,6 +181,9 @@ def _bar_notes(root_semitone: int, quality: str,
 # ---------------------------------------------------------------------------
 
 PATTERNS = ['whole', 'half', 'quarter', 'walking']
+# Patterns that realise ONE chord across a bar. Every one begins on the root,
+# which is what keeps the downbeat a clean target for the rule.
+BAR_PATTERNS = ['root4', 'root2', 'whole', 'half', 'walking']
 
 
 def generate_song(
@@ -178,6 +192,7 @@ def generate_song(
     allowed_keys:            list[int]  | None = None,
     quality:                 str | None = None,   # None = random once per song
     bass_instrument_program: int        = 33,     # Electric Bass, finger
+    cycle_unit:              str        = 'beat',
 ) -> tuple[pretty_midi.PrettyMIDI, list[list]]:
     """
     Generate one song following the exact RASP rule:
@@ -210,17 +225,31 @@ def generate_song(
 
     beat_step = SUBBEATS_PER_BAR // BEATS_PER_BAR  # 4 subbeats per beat
 
+    if cycle_unit not in ('beat', 'bar'):
+        raise ValueError(f"cycle_unit must be 'beat' or 'bar', got {cycle_unit!r}")
+
     for b in range(n_bars):
         bar_start = b * SUBBEATS_PER_BAR
-        # I-IV-V-I within each bar — 4 chord entries per bar, one per beat
-        for j, offset in enumerate(OFFSETS):
-            beat_root  = (key + offset) % 12
-            beat_start = bar_start + j * beat_step
-            chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
-            xf_chords.append([float(beat_start), chord_str])
-        # All bars play the same I-IV-V-I pattern rooted on key:
-        # notes are: key, key+5, key+7, key  (one quarter note each)
-        bass.notes.extend(_bar_notes(key, song_quality, bar_start, 'quarter'))
+        if cycle_unit == 'beat':
+            # One cycle per bar: the root changes every BEAT, so a bar holds a
+            # whole I-IV-V-I and every note follows from the key.
+            for j, offset in enumerate(OFFSETS):
+                beat_root  = (key + offset) % 12
+                beat_start = bar_start + j * beat_step
+                chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
+                xf_chords.append([float(beat_start), chord_str])
+            bass.notes.extend(_bar_notes(key, song_quality, bar_start, 'quarter'))
+        else:
+            # One chord per BAR: the root changes every bar, so a cycle spans
+            # four bars (16 beats). The bar is realised by a pattern which may
+            # use chord tones, so the rule fixes the bar's HARMONY while the
+            # surface notes are free. Every pattern starts on the root, which
+            # keeps the downbeat the clean target.
+            bar_root = (key + OFFSETS[b % 4]) % 12
+            xf_chords.append([float(bar_start),
+                              f'{ROOT_NAMES[bar_root]}:{song_quality}'])
+            bass.notes.extend(_bar_notes(bar_root, song_quality, bar_start,
+                                         random.choice(BAR_PATTERNS)))
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -285,6 +314,7 @@ def generate_dataset(
     allowed_keys:  list[int] | None = None,
     seed:          int       = 42,
     write_midi:    bool      = True,
+    cycle_unit:    str       = 'beat',
 ) -> None:
     """
     Generate n_songs synthetic bass songs and save all output files.
@@ -316,6 +346,7 @@ def generate_dataset(
         pm, xf_chords = generate_song(
             n_bars       = n_bars,
             allowed_keys = allowed_keys,
+            cycle_unit   = cycle_unit,
         )
 
         # Save MIDI file (optional -- nothing downstream reads it)
@@ -363,6 +394,12 @@ def main():
     p.add_argument('--out_pt',        type=str,   required=True,
                    help='Output prefix for .pt dataset files')
     p.add_argument('--max_polyphony', type=int,   default=4)
+    p.add_argument('--cycle_unit', type=str, default='beat', choices=['beat','bar'],
+                   help="'beat' (default): root changes every beat, one cycle "
+                        "per bar, every note determined by the key. 'bar': root "
+                        'changes every BAR, a cycle spans 4 bars (16 beats), '
+                        'and the bar is realised by a pattern that may use '
+                        'chord tones -- the rule fixes harmony, not the notes.')
     p.add_argument('--no_midi', action='store_true',
                    help='Skip writing the per-song .mid files. Training never '
                         'reads them, and they are usually the bulk of the '
@@ -383,6 +420,7 @@ def main():
         n_bars        = args.n_bars,
         max_polyphony = args.max_polyphony,
         write_midi    = not args.no_midi,
+        cycle_unit    = args.cycle_unit,
         allowed_keys  = args.keys,
         seed          = args.seed,
     )
