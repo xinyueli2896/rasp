@@ -338,6 +338,7 @@ def main(args):
         rule_input        = args.rule_input,
         rule_enc_type     = args.rule_enc_type,
         rule_enc_hidden   = args.rule_enc_hidden,
+        rule_key_select   = args.rule_key_select,
     )
 
     if args.unfreeze_base:
@@ -549,6 +550,16 @@ def get_args():
                         'needs every dimension in [0, 1].')
     p.add_argument('--rule_enc_hidden',    type=int, default=64,
                    help='Hidden width for --rule_enc_type mlp.')
+    p.add_argument('--rule_key_select',    type=str, default='phase0',
+                   choices=['phase0', 'first'],
+                   help="How the compiled head retrieves the key. 'phase0' "
+                        'matches every phase-0 slot and averages them -- a '
+                        "clean one-hot on rule-following input, a blend off "
+                        "it, and a violation of Tracr Appendix D.1's "
+                        "one-token rule. 'first' matches only the slot "
+                        'holding beat 0, so the head attends exactly one '
+                        'token. Identical outputs on rule-following input; '
+                        'they differ only when the stream breaks the rule.')
     p.add_argument('--sample_step',        type=int, default=SUBBEATS_PER_BAR,
                    help='Align training window starts to a multiple of this. This '
                         'trainer always used SUBBEATS_PER_BAR (one I-IV-V-I cycle); '

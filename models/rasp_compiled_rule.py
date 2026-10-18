@@ -105,7 +105,9 @@ KEY_BASE  = 12                 # dims 12-23  key
 PH_BASE   = 24                 # dims 24-27  phase
 PHN_BASE  = 28                 # dims 28-31  phase_next
 ROOT_BASE = 32                 # dims 32-43  root_next
-D_MODEL   = 44
+FIRST_BASE = 44                # dim  44     marks the slot holding beat 0
+D_MODEL   = 45                 # no VIEW exposes dim 44, so the view widths
+                               # (12/16/32/44) are unchanged by it
 
 # Which subspaces are handed to the cross-attention adapter as rule_hidden.
 #   root_next : the answer -- the adapter only has to copy it
@@ -145,6 +147,7 @@ class RaspCompiledRule(nn.Module):
         attn_scale:         float = 100.0,
         bos_beta:           float = 0.5,
         view:               str   = 'key_phase',
+        key_select:         str   = 'phase0',
     ):
         """
         subbeats_per_chord : positions per phase slot.  1 for the bass
@@ -162,7 +165,22 @@ class RaspCompiledRule(nn.Module):
         bos_beta : beta_BOS from Appendix D.1.  0.5 = attend BOS only when
             nothing else is selected.
         view : which subspaces rule_hidden() returns.
+        key_select : how the head finds the key.
+            'phase0' Select(phase, phase, k == 0) -- matches EVERY phase-0
+                slot, so at t=9 it averages beats 0, 4 and 8. On
+                rule-following input they are identical and the average is a
+                clean one-hot, but it violates Appendix D.1's requirement
+                that a categorical head attend to at most one token, and off
+                the rule manifold it returns a blend.
+            'first'  Select(is_first, is_first, k == 1) -- matches exactly the
+                one slot holding beat 0, satisfying D.1. Costs one extra
+                residual dimension, which is positional and therefore
+                constant-folded into the embedding like `phase`. The
+                trade-off is the one the paper should state: retrieval now
+                rests on a single note that can never be outvoted.
         """
+        if key_select not in ('phase0', 'first'):
+            raise ValueError(f"key_select must be 'phase0' or 'first', got {key_select!r}")
         super().__init__()
         if view not in VIEWS:
             raise ValueError(f'view must be one of {sorted(VIEWS)}, got {view!r}')
@@ -172,6 +190,7 @@ class RaspCompiledRule(nn.Module):
         self.attn_scale = attn_scale
         self.bos_beta   = bos_beta
         self.view       = view
+        self.key_select = key_select
         self.d_model    = D_MODEL
         self.rule_d_model = VIEW_WIDTH[view]
 
@@ -189,12 +208,26 @@ class RaspCompiledRule(nn.Module):
         self.register_buffer('W_phase', W_phase)
         self.register_buffer('W_phase_next', W_phase_next)
 
+        # is_first: 1 at the stream slot holding beat 0. The beat at stream
+        # index t is beat t + input_shift, so beat 0 sits at t = -input_shift
+        # (index 0 for the integer host, index 1 for the bos-shifted CP host).
+        # Like phase, it is a function of position alone -- the Map that would
+        # compute it folds into the embedding.
+        self.first_index = -input_shift
+
         # --- attention: Select(phase, phase, k == 0), Aggregate(tokens) ---
         W_Q = torch.zeros(d, d)
         W_K = torch.zeros(d, d)
-        for p in range(N_POS):
-            W_Q[PH_BASE + 0, PH_BASE + p] = 1.0   # every query -> phase-0 dir
-            W_K[PH_BASE + p, PH_BASE + p] = 1.0   # identity on phase
+        if key_select == 'phase0':
+            for p in range(N_POS):
+                W_Q[PH_BASE + 0, PH_BASE + p] = 1.0   # every query -> phase-0 dir
+                W_K[PH_BASE + p, PH_BASE + p] = 1.0   # identity on phase
+        else:
+            # Every query points along is_first; only the beat-0 slot carries
+            # it, so the score is 1 for exactly one key and 0 for all others.
+            for p in range(N_POS):
+                W_Q[FIRST_BASE, PH_BASE + p] = 1.0
+            W_K[FIRST_BASE, FIRST_BASE] = 1.0
         self.register_buffer('W_Q', W_Q)
         self.register_buffer('W_K', W_K)
 
@@ -231,12 +264,25 @@ class RaspCompiledRule(nn.Module):
         t = torch.arange(T, device=device) + shift
         return (t // self.subbeats_per_chord) % N_POS
 
+    def first_marker(self, T: int, device) -> torch.Tensor:
+        """(T, d_model): a 1 in the is_first dim at the slot holding beat 0.
+
+        Positional, so it is part of the embedding rather than something the
+        network computes. Zero everywhere under key_select='phase0', where
+        nothing reads it.
+        """
+        m = torch.zeros(T, self.d_model, device=device)
+        if self.key_select == 'first' and 0 <= self.first_index < T:
+            m[self.first_index, FIRST_BASE] = 1.0
+        return m
+
     def embed(self, idx: torch.Tensor) -> torch.Tensor:
         T, dev = idx.shape[1], idx.device
         return (self.W_E[idx]
                 + self.W_phase[self.phase_at(T, dev, self.input_shift)].unsqueeze(0)
                 + self.W_phase_next[
-                      self.phase_at(T, dev, self.input_shift + self.shift)].unsqueeze(0))
+                      self.phase_at(T, dev, self.input_shift + self.shift)].unsqueeze(0)
+                + self.first_marker(T, dev).unsqueeze(0))
 
     def attention(self, x: torch.Tensor) -> torch.Tensor:
         """The compiled head, over an arbitrary float residual stream."""

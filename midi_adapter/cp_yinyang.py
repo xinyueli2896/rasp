@@ -233,6 +233,7 @@ class CPYinyangTransformer(nn.Module):
         rule_input:       str  = 'tokens',     # 'tokens' | 'ar_state'
         rule_enc_type:    str  = 'mlp',        # 'linear' | 'mlp'
         rule_enc_hidden:  int  = 64,
+        rule_key_select:  str  = 'phase0',
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -279,7 +280,8 @@ class CPYinyangTransformer(nn.Module):
             # SequenceMap then emits the root for beat t -- the beat the
             # adapter is about to influence.
             self.rule_model = RaspCompiledRule(shift=1, input_shift=-1,
-                                               view=rule_view)
+                                               view=rule_view,
+                                               key_select=rule_key_select)
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
         # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the
@@ -432,7 +434,8 @@ class CPYinyangTransformer(nn.Module):
         h    = F.pad(p, (0, rm.d_model - p.shape[-1]))
         h    = (h + rm.W_phase[rm.phase_at(T, dev, rm.input_shift)].unsqueeze(0)
                   + rm.W_phase_next[
-                        rm.phase_at(T, dev, rm.input_shift + rm.shift)].unsqueeze(0))
+                        rm.phase_at(T, dev, rm.input_shift + rm.shift)].unsqueeze(0)
+                  + rm.first_marker(T, dev).unsqueeze(0))
         h    = rm.mlp(rm.attention(h))
         rh   = h.index_select(-1, rm._view_dims).clone()
         rh[:, 0] = 0.0          # nothing is knowable before the first beat
