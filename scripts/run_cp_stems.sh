@@ -30,6 +30,11 @@ PRETRAIN_DATA="${PRETRAIN_DATA:-}"
 CKPT_DIR="${CKPT_DIR:-checkpoints_cp}"
 LOG_DIR="${LOG_DIR:-logs_cp}"
 MAX_STEPS="${MAX_STEPS:-10000}"
+# One adapter per global layer. The integer experiment injects at every layer,
+# so matching it here keeps the two experiments structurally comparable.
+# model_size 1 has 12 global layers, so n_skip=1 gives 12 adapters (4.81M
+# trainable, 4.12% of the host) against 3 at n_skip=4 (1.20M, 1.06%).
+N_SKIP="${N_SKIP:-1}"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -41,7 +46,7 @@ COMMON=(
   --train_data  "$TRAIN_DATA"
   --val_data    "$VAL_DATA"
   --unseen_data "$UNSEEN_DATA"
-  --model_size 1 --batch_size 8
+  --model_size 1 --batch_size 8 --n_skip "$N_SKIP"
   --rule_mode compiled --rule_view root_next
   --max_steps "$MAX_STEPS" --val_check_interval 500
   --ckpt_dir "$CKPT_DIR"
@@ -73,7 +78,7 @@ stem () {
       python -m midi_adapter.train_cp_yinyang \
           --train_data "$TRAIN_DATA" --pretrain_data "$PRETRAIN_DATA" \
           --val_data "$VAL_DATA" --unseen_data "$UNSEEN_DATA" \
-          --model_size 1 --batch_size 8 \
+          --model_size 1 --batch_size 8 --n_skip "$N_SKIP" \
           --rule_mode compiled --rule_view root_next \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --no_tensorboard \
