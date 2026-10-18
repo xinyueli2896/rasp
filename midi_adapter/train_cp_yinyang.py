@@ -346,7 +346,14 @@ def main(args):
         rule_enc_hidden   = args.rule_enc_hidden,
         rule_key_select   = args.rule_key_select,
         strict_causal     = args.strict_causal,
+        gate_init         = args.gate_init,
+        freeze_base_eval  = args.freeze_base_eval,
     )
+
+    if args.unfreeze_base and args.freeze_base_eval:
+        raise SystemExit('--freeze_base_eval is for a FROZEN host; with '
+                         '--unfreeze_base the base is training and must stay '
+                         'in train mode.')
 
     if args.unfreeze_base:
         for p in adapter.base.parameters():
@@ -571,6 +578,23 @@ def get_args():
                    help='Seed for pl.seed_everything. Pass a distinct '
                         '--run_name per seed so the runs do not share a '
                         'checkpoint directory.')
+    p.add_argument('--gate_init',          type=float, default=0.0,
+                   help='Initial value of each adapter block\'s output gate. '
+                        '0.0 (default) means the adapter contributes nothing '
+                        'at step 0 and grows in -- the standard discipline for '
+                        'an adapter residual branch, and the same convention '
+                        'as lora_B=zeros. Runs before this flag existed used '
+                        '1.0, which wrote a randomly-initialised cross-'
+                        'attention into the host at full strength; pass 1.0 to '
+                        'reproduce them.')
+    p.add_argument('--freeze_base_eval',   action='store_true',
+                   help='Hold the frozen host in eval mode during training, so '
+                        'its dropout is off. Lightning otherwise puts the whole '
+                        'module in train mode and the frozen base keeps '
+                        'dropping at 0.1, which cannot regularise weights that '
+                        'are not learning but does force the adapter to '
+                        'tolerate noisy host states. Whether that helps is '
+                        'open -- A/B it. Incompatible with --unfreeze_base.')
     p.add_argument('--strict_causal',      action='store_true',
                    help='Mask the adapter cross-attention to j < t instead of '
                         'j <= t, in training AND generation. By default the '

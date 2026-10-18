@@ -145,6 +145,7 @@ class CPYinyangCrossAttention(nn.Module):
         dropout:      float = 0.1,
         max_beats:    int   = 512,
         strict_causal: bool = False,
+        gate_init:    float = 0.0,
     ):
         super().__init__()
         # Saved as a buffer so a checkpoint carries its own masking rule --
@@ -161,7 +162,12 @@ class CPYinyangCrossAttention(nn.Module):
         self.k_proj   = nn.Linear(rule_d_model, embed_dim)
         self.v_proj   = nn.Linear(rule_d_model, embed_dim)
         self.out_proj = nn.Linear(embed_dim,    d_model)
-        self.gate      = nn.Parameter(torch.ones(1,))
+        # Zero by default: the adapter contributes NOTHING at step 0 and grows
+        # in, the standard discipline for an adapter's residual branch and the
+        # same convention as lora_B = zeros below. Starting at 1.0 meant a
+        # randomly-initialised cross-attention wrote at full strength into a
+        # host that, in the frozen stem, cannot compensate.
+        self.gate      = nn.Parameter(torch.full((1,), float(gate_init)))
         self.attn_drop = nn.Dropout(dropout)
 
         # Single sinusoidal PE shared by Q and K (same beat index space)
@@ -260,6 +266,8 @@ class CPYinyangTransformer(nn.Module):
         rule_enc_hidden:  int  = 64,
         rule_key_select:  str  = 'phase0',
         strict_causal:    bool = False,
+        gate_init:        float = 0.0,
+        freeze_base_eval: bool = False,
     ):
         assert not (bidirectional and encoder_injected), \
             "bidirectional and encoder_injected are mutually exclusive"
@@ -273,6 +281,7 @@ class CPYinyangTransformer(nn.Module):
         self.base             = base_model
         self.n_skip           = n_skip
         self.lora_rank        = lora_rank
+        self.freeze_base_eval = freeze_base_eval
         self.bidirectional    = bidirectional
         self.encoder_injected = encoder_injected
 
@@ -341,6 +350,7 @@ class CPYinyangTransformer(nn.Module):
                 embed_dim    = adapter_rank,
                 n_heads      = 8,
                 strict_causal= strict_causal,
+                gate_init    = gate_init,
             )
             for _ in range(n_adapters)
         ])
@@ -467,6 +477,20 @@ class CPYinyangTransformer(nn.Module):
         rh   = h.index_select(-1, rm._view_dims).clone()
         rh[:, 0] = 0.0          # nothing is knowable before the first beat
         return rh
+
+    def train(self, mode: bool = True):
+        """Optionally hold the frozen host in eval mode while training.
+
+        Lightning calls train() on the whole module, which switches the frozen
+        base back on and leaves its hidden/attention dropout (0.1 each) active.
+        That dropout cannot regularise weights which are not learning; what it
+        does is force the adapter to tolerate noisy host states. Whether that
+        helps is an empirical question, so it is a flag rather than a fix.
+        """
+        super().train(mode)
+        if mode and self.freeze_base_eval:
+            self.base.eval()
+        return self
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
