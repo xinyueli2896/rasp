@@ -272,13 +272,16 @@ def _print_error_dist(errors: list) -> None:
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_dir) -> None:
+def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_dir,
+                        max_polyphony: int = 4, beats_per_chord: int = 1) -> None:
     import os
     os.makedirs(out_dir, exist_ok=True)
     all_keys = list(range(12))
     for key in all_keys:
         prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                                   base=base, n_prompt_beats=n_prompt_beats)
+                                   base=base, n_prompt_beats=n_prompt_beats,
+                                   max_polyphony=max_polyphony,
+                                   cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
         sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                           show_progress=False)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
@@ -358,7 +361,9 @@ def run_evaluation(args) -> None:
     if args.save_midi_dir:
         print(f'\nSaving MIDI for all 12 keys → {args.save_midi_dir}')
         _save_midi_all_keys(base, args.n_gen_beats, device, args.temperature,
-                            args.n_prompt_beats, args.save_midi_dir)
+                            args.n_prompt_beats, args.save_midi_dir,
+                            max_polyphony=args.max_polyphony,
+                            beats_per_chord=args.beats_per_chord)
 
 
 def get_args():

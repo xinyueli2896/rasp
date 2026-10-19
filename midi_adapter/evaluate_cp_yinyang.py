@@ -149,12 +149,15 @@ def _print_qualitative(model, keys, cat_label, n_gen, device, temperature,
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_dir) -> None:
+def _save_midi_all_keys(model, n_gen, device, temperature, n_prompt_beats, out_dir,
+                        max_polyphony: int = 4, beats_per_chord: int = 1) -> None:
     os.makedirs(out_dir, exist_ok=True)
     all_keys = list(range(12))
     for key in all_keys:
         prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                                   base=model.base, n_prompt_beats=n_prompt_beats)
+                                   base=model.base, n_prompt_beats=n_prompt_beats,
+                                   max_polyphony=max_polyphony,
+                                   cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
         total   = n_prompt_beats + n_gen
         sampled = model.global_sampling(prompt, max_seq_len=total, temperature=temperature)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
@@ -344,7 +347,9 @@ def run_evaluation(args) -> None:
     )
     print(f'\nSaving MIDI for all 12 keys → {midi_dir}')
     _save_midi_all_keys(model, args.n_gen_beats, device, args.temperature,
-                        args.n_prompt_beats, midi_dir)
+                        args.n_prompt_beats, midi_dir,
+                        max_polyphony=args.max_polyphony,
+                        beats_per_chord=args.beats_per_chord)
 
 
 def get_args():

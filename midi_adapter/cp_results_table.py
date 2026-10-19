@@ -50,6 +50,7 @@ from midi_adapter.evaluate_cp_bass import (
 from midi_adapter.evaluate_cp_yinyang import (
     load_model         as load_adapter_model,
     rule_following_acc as adapter_rule_following_acc,
+    _save_midi_all_keys as save_adapter_midi,
 )
 from models.rasp_compiled_rule import VIEW_WIDTH
 
@@ -165,6 +166,10 @@ def main():
     p.add_argument('--max_polyphony', type=int, default=4,
                    help='Note-slots per beat in the TRAINING data (4 or 2); '
                         'the prompt must match or it is out of distribution.')
+    p.add_argument('--save_midi_dir', type=str, default=None,
+                   help='Also write one MIDI per key for every model, under '
+                        '<dir>/<run>/. Uses the same prompts and protocol as '
+                        'the table, so what you hear is what was scored.')
     p.add_argument('--rule_key_select', type=str, default='phase0',
                    choices=['phase0', 'first'],
                    help='Must match what the runs were trained with. Only '
@@ -252,6 +257,21 @@ def main():
         for rlbl, keys, _ in rows:
             results[lbl][rlbl] = eval_model(model, is_ad, keys, args, device)
         print('  '.join(f'{results[lbl][r]:.3f}' for r, _, _ in rows))
+
+    if args.save_midi_dir:
+        print()
+        print('=' * 60)
+        print(f'Saving MIDI -> {args.save_midi_dir}')
+        print('=' * 60)
+        for lbl, model, is_ad in entries:
+            if not is_ad:
+                continue          # the baselines have their own evaluator
+            out = os.path.join(args.save_midi_dir, lbl)
+            print(f'  {lbl}')
+            save_adapter_midi(model, args.n_gen_beats, device, args.temperature,
+                              args.n_prompt_beats, out,
+                              max_polyphony=args.max_polyphony,
+                              beats_per_chord=args.beats_per_chord)
 
     labels = [l for l, _, _ in entries]
     w = {l: max(len(l), 7) for l in labels}
