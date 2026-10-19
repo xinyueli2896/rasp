@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 import sys
@@ -167,6 +168,9 @@ def main():
     p.add_argument('--max_polyphony', type=int, default=4,
                    help='Note-slots per beat in the TRAINING data (4 or 2); '
                         'the prompt must match or it is out of distribution.')
+    p.add_argument('--json_out', type=str, default=None,
+                   help='Also write the table as JSON, so several seeds can be '
+                        'aggregated without parsing the text.')
     p.add_argument('--save_midi_dir', type=str, default=None,
                    help='Also write one MIDI per key for every model, under '
                         '<dir>/<run>/. Uses the same prompts and protocol as '
@@ -276,6 +280,17 @@ def main():
                   args.n_prompt_beats, out,
                   max_polyphony=args.max_polyphony,
                   beats_per_chord=args.beats_per_chord)
+
+    if args.json_out:
+        os.makedirs(os.path.dirname(args.json_out) or '.', exist_ok=True)
+        with open(args.json_out, 'w') as f:
+            json.dump({'protocol': {'n_prompt_beats': args.n_prompt_beats,
+                                    'n_gen_beats': args.n_gen_beats,
+                                    'n_trials': args.n_trials,
+                                    'beats_per_chord': args.beats_per_chord,
+                                    'max_polyphony': args.max_polyphony},
+                       'results': results}, f, indent=2)
+        print(f'\nwrote {args.json_out}')
 
     labels = [l for l, _, _ in entries]
     w = {l: max(len(l), 7) for l in labels}

@@ -97,6 +97,7 @@ eval_seed () {
   if [[ -n "$MIDI_DIR" ]]; then
     args+=(--save_midi_dir "$MIDI_DIR/s$sd")
   fi
+  args+=(--json_out "$LOG_DIR/table_s$sd.json")
   if [[ -n "$ft" ]]; then
     args+=(--ft_ckpt "$ft")
     echo "  finetune baseline: $(basename "$ft")"
@@ -136,6 +137,20 @@ for sd in $SEEDS; do
   eval_seed "$sd"
 done
 
+# --- one combined table across seeds -------------------------------------
+jsons=""
+for sd in $SEEDS; do
+  [[ -f "$LOG_DIR/table_s$sd.json" ]] && jsons="$jsons $LOG_DIR/table_s$sd.json"
+done
+if [[ -n "$jsons" ]]; then
+  echo
+  python -m midi_adapter.aggregate_seeds $jsons \
+      2>&1 | tee "$LOG_DIR/table_all_seeds.log"
+fi
+
 echo
-echo "all seeds done. tables:"
-for sd in $SEEDS; do echo "  $LOG_DIR/table_s$sd.log"; done
+echo "all seeds done."
+for sd in $SEEDS; do echo "  per seed : $LOG_DIR/table_s$sd.log"; done
+echo "  combined : $LOG_DIR/table_all_seeds.log"
+[[ -n "$MIDI_DIR" ]] && echo "  midi     : $MIDI_DIR/s<seed>/<model>/"
+true
