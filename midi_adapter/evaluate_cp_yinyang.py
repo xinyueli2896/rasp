@@ -176,6 +176,14 @@ def _report_load(missing: list, unexpected: list) -> None:
     table in silence. Adapter-block mismatches are called out by name.
     """
     import re as _re
+    # Config buffers, not weights. A checkpoint written before they were made
+    # persistent simply lacks them, and the value then comes from the command
+    # line -- which the caller already prints. Warning about those is noise
+    # that looks like a failure.
+    CONFIG_BUFFERS = ('rule_subbeats_per_chord', 'rule_key_select_first',
+                      'strict_causal')
+    missing = [k for k in missing
+               if not any(k.endswith(c) for c in CONFIG_BUFFERS)]
     if missing:
         print(f'  WARNING missing keys ({len(missing)}): {missing[:3]}')
     if unexpected:
