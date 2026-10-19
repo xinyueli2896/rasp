@@ -44,8 +44,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from midi_adapter.evaluate_cp_bass import (
     CATEGORIES, ALL_SEEN, UNSEEN,
-    load_model         as load_base_model,
-    rule_following_acc as base_rule_following_acc,
+    load_model          as load_base_model,
+    rule_following_acc  as base_rule_following_acc,
+    _save_midi_all_keys as save_base_midi,
 )
 from midi_adapter.evaluate_cp_yinyang import (
     load_model         as load_adapter_model,
@@ -264,14 +265,17 @@ def main():
         print(f'Saving MIDI -> {args.save_midi_dir}')
         print('=' * 60)
         for lbl, model, is_ad in entries:
-            if not is_ad:
-                continue          # the baselines have their own evaluator
+            # Baselines are plain transformers and adapters are not, so they
+            # need different savers -- but both belong in the output: hearing
+            # Pretrain and Finetune fail on the unseen keys is the qualitative
+            # half of the same claim the table makes numerically.
+            saver = save_adapter_midi if is_ad else save_base_midi
             out = os.path.join(args.save_midi_dir, lbl)
             print(f'  {lbl}')
-            save_adapter_midi(model, args.n_gen_beats, device, args.temperature,
-                              args.n_prompt_beats, out,
-                              max_polyphony=args.max_polyphony,
-                              beats_per_chord=args.beats_per_chord)
+            saver(model, args.n_gen_beats, device, args.temperature,
+                  args.n_prompt_beats, out,
+                  max_polyphony=args.max_polyphony,
+                  beats_per_chord=args.beats_per_chord)
 
     labels = [l for l, _, _ in entries]
     w = {l: max(len(l), 7) for l in labels}

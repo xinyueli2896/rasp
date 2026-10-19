@@ -57,6 +57,9 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 # it score downbeats rather than every beat.
 MAX_POLY="${MAX_POLY:-2}"
 N_TRIALS="${N_TRIALS:-20}"
+# One MIDI per key per adapter run, generated with the same prompts the table
+# scores, so what you hear matches the numbers. Set to "" to skip.
+MIDI_DIR="${MIDI_DIR-eval_midi_bar}"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -89,7 +92,11 @@ eval_seed () {
         --adapter_rank 256 --n_skip "$N_SKIP"
         --max_polyphony "$MAX_POLY" --beats_per_chord "$BEATS_PER_CHORD"
         --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
-        --n_trials "$N_TRIALS")
+        --n_trials "$N_TRIALS"
+        --rule_key_select "$KEY_SELECT")
+  if [[ -n "$MIDI_DIR" ]]; then
+    args+=(--save_midi_dir "$MIDI_DIR/s$sd")
+  fi
   if [[ -n "$ft" ]]; then
     args+=(--ft_ckpt "$ft")
     echo "  finetune baseline: $(basename "$ft")"
