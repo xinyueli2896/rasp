@@ -76,6 +76,13 @@ TRAIN_LENGTH="${TRAIN_LENGTH:-24}"
 #                      basis for the key: use 4 (one full bar) and 28.
 PROBE_PROMPT="${PROBE_PROMPT:-1}"
 PROBE_GEN="${PROBE_GEN:-23}"
+# Window starts must land on a cycle boundary or the rule model, which reads
+# phase from position, is misaligned for the whole window. The adapter trainer
+# derives this itself; finetune_cp_bass has to be told.
+SAMPLE_STEP=$(( 4 * BEATS_PER_CHORD ))
+# model_size and the wandb project are fixed, not overridable: every run in
+# this experiment is size 1 and belongs in the cp_bass project, and a stem
+# that quietly differed on either would not be comparable to the rest.
 RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT"
            --beats_per_chord "$BEATS_PER_CHORD" --train_length "$TRAIN_LENGTH"
            --probe_prompt_beats "$PROBE_PROMPT" --probe_gen_beats "$PROBE_GEN")
@@ -98,7 +105,7 @@ COMMON=(
   "${RULE_OPTS[@]}"
   --max_steps "$MAX_STEPS" --val_check_interval 500
   --ckpt_dir "$CKPT_DIR"
-  --no_tensorboard
+  --no_tensorboard --wandb_project cp_bass
 )
 
 run () {            # run <run_name> <extra args...>
@@ -131,8 +138,22 @@ stem () {
           "${RULE_OPTS[@]}" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --no_tensorboard \
+          --wandb_project cp_bass \
           --unfreeze_base --run_name "cp_yy_scratch$RUN_SUFFIX" \
           2>&1 | tee "$LOG_DIR/cp_yy_scratch$RUN_SUFFIX.log"
+      ;;
+    # Baseline: plain finetuning on keys B, no adapter and no rule model.
+    # Uses finetune_cp_bass, so none of the adapter options apply to it.
+    finetune)
+      python -m midi_adapter.finetune_cp_bass \
+          --pretrain_ckpt "$BASE_CKPT" \
+          --train_data "$TRAIN_DATA" --val_data "$VAL_DATA" \
+          --model_size 1 --batch_size 8 --seed "$SEED" \
+          --train_length "$TRAIN_LENGTH" --sample_step "$SAMPLE_STEP" \
+          --max_steps "$MAX_STEPS" --val_check_interval 500 \
+          --ckpt_dir "$CKPT_DIR" --run_name "cp_bass_ft$RUN_SUFFIX" \
+          --no_tensorboard --wandb_project cp_bass \
+          2>&1 | tee "$LOG_DIR/cp_bass_ft$RUN_SUFFIX.log"
       ;;
     # No input to the rule model: the host's pre-block state is encoded into
     # the rule model's token subspace. MLP encoder + aux CE on the current pc,
@@ -140,18 +161,18 @@ stem () {
     noinput) run cp_yy_noinput_mlp_aux1 \
                  --rule_input ar_state --rule_enc_type mlp --rule_enc_hidden 64 \
                  --enc_loss_weight 1.0 "${FROZEN_OPTS[@]}" ;;
-    *) echo "unknown stem: $1  (frozen lora trainar scratch noinput all)" >&2
+    *) echo "unknown stem: $1  (finetune frozen lora trainar scratch noinput all)" >&2
        exit 1 ;;
   esac
 }
 
 if [[ $# -eq 0 ]]; then
-  echo "usage: $0 <frozen|lora|trainar|scratch|noinput|all> ..." >&2
+  echo "usage: $0 <finetune|frozen|lora|trainar|scratch|noinput|all> ..." >&2
   exit 1
 fi
 
 if [[ "$1" == "all" ]]; then
-  set -- frozen lora trainar scratch noinput
+  set -- finetune frozen lora trainar scratch noinput
 fi
 
 for s in "$@"; do stem "$s"; done
