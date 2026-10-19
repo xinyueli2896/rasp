@@ -200,7 +200,9 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                rule_input: str = 'tokens',
                rule_enc_type: str = 'mlp',
                rule_enc_hidden: int = 64,
-               strict_causal: bool = False) -> CPYinyangTransformer:
+               strict_causal: bool = False,
+               rule_subbeats_per_chord: int = 1,
+               rule_key_select: str = 'phase0') -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
     model = CPYinyangTransformer(base, adapter_rank=adapter_rank, n_skip=n_skip,
@@ -213,7 +215,9 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                                  rule_input=rule_input,
                                  rule_enc_type=rule_enc_type,
                                  rule_enc_hidden=rule_enc_hidden,
-                                 strict_causal=strict_causal)
+                                 strict_causal=strict_causal,
+                                 rule_subbeats_per_chord=rule_subbeats_per_chord,
+                                 rule_key_select=rule_key_select)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):
         print(f'  WARNING: adapter ckpt not found ({adapter_ckpt}) — random weights')

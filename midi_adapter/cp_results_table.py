@@ -117,6 +117,17 @@ def inspect(ckpt_path: str) -> dict:
     if sc is not None:
         info['strict_causal'] = bool(sc.item())
 
+    # Recorded only by runs trained after this was made persistent; older
+    # checkpoints fall back to whatever --beats_per_chord says.
+    spc = next((v for k, v in sd.items()
+                if k.endswith('rule_subbeats_per_chord')), None)
+    if spc is not None:
+        info['rule_subbeats_per_chord'] = int(spc.item())
+    ks = next((v for k, v in sd.items()
+               if k.endswith('rule_key_select_first')), None)
+    if ks is not None:
+        info['rule_key_select'] = 'first' if bool(ks.item()) else 'phase0'
+
     if any('rule_input_encoder.fc_out' in k for k in sd):
         info['rule_input'] = 'ar_state'
         w1 = next((v for k, v in sd.items() if k.endswith('rule_input_encoder.fc1.weight')),
@@ -154,6 +165,12 @@ def main():
     p.add_argument('--max_polyphony', type=int, default=4,
                    help='Note-slots per beat in the TRAINING data (4 or 2); '
                         'the prompt must match or it is out of distribution.')
+    p.add_argument('--rule_key_select', type=str, default='phase0',
+                   choices=['phase0', 'first'],
+                   help='Must match what the runs were trained with. Only '
+                        'affects the teacher-forced path, since generation '
+                        'reconstructs a rule-following stream on which both '
+                        'agree -- but pass it correctly anyway.')
     p.add_argument('--beats_per_chord', type=int, default=1,
                    help='Beats the root is held for; 4 for --cycle_unit bar '
                         'data, where only downbeats carry a target.')
@@ -200,7 +217,8 @@ def main():
         print(f'  {run:<26} {os.path.basename(c)}')
         print(f'  {"":<26} rule_mode={info["rule_mode"]} view={info["rule_view"]} '
               f'lora_rank={info["lora_rank"]} rule_input={info["rule_input"]} '
-              f'n_skip={n_skip} strict_causal={info["strict_causal"]}'
+              f'n_skip={n_skip} strict_causal={info["strict_causal"]} '
+              f'spc={info.get("rule_subbeats_per_chord", args.beats_per_chord)}'
               + (f' enc={info["enc"]}' if info['enc'] else ''))
         model = load_adapter_model(
             args.base_ckpt, c, args.model_size, args.adapter_rank, n_skip,
@@ -210,7 +228,17 @@ def main():
             rule_input      = info['rule_input'],
             rule_enc_type   = info['enc'] or 'mlp',
             rule_enc_hidden = info['enc_hidden'],
-            strict_causal   = info['strict_causal'])
+            strict_causal   = info['strict_causal'],
+            # The rule model must be rebuilt with the SAME chord length the
+            # adapter trained against. It changes no tensor shape, so a
+            # mismatch loads every weight cleanly and silently feeds the host
+            # a different rule: at 1 the channel emits the per-beat cycle
+            # [6,11,1,6,...] where the adapter learned the per-bar
+            # [6,6,6,6,11,11,11,11,...].
+            rule_subbeats_per_chord = info.get('rule_subbeats_per_chord',
+                                               args.beats_per_chord),
+            rule_key_select         = info.get('rule_key_select',
+                                               args.rule_key_select))
         entries.append((run, model, True))
 
     print()

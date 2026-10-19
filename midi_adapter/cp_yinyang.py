@@ -283,6 +283,14 @@ class CPYinyangTransformer(nn.Module):
         self.n_skip           = n_skip
         self.lora_rank        = lora_rank
         self.freeze_base_eval = freeze_base_eval
+        # Persistent, so a checkpoint records the rule model it was trained
+        # against. subbeats_per_chord changes no tensor shape, so a wrong
+        # rebuild loads every weight cleanly and silently swaps the rule --
+        # which is exactly what happened to the first latent-rule tables.
+        self.register_buffer('rule_subbeats_per_chord',
+                             torch.tensor(int(rule_subbeats_per_chord)))
+        self.register_buffer('rule_key_select_first',
+                             torch.tensor(rule_key_select == 'first'))
         self.bidirectional    = bidirectional
         self.encoder_injected = encoder_injected
 

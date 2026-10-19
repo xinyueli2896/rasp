@@ -74,6 +74,8 @@ def main():
     p.add_argument('--rule_input', type=str, default='tokens')
     p.add_argument('--lora_rank', type=int, default=0)
     p.add_argument('--beats_per_chord', type=int, default=4)
+    p.add_argument('--rule_key_select', type=str, default='first',
+                   choices=['phase0', 'first'])
     p.add_argument('--max_polyphony', type=int, default=2)
     p.add_argument('--n_prompt_beats', type=int, default=4)
     p.add_argument('--n_gen_beats', type=int, default=28)
@@ -91,7 +93,9 @@ def main():
                        args.adapter_rank, args.n_skip, False, False,
                        'embedding', args.rule_mode, dev,
                        rule_view=args.rule_view, lora_rank=args.lora_rank,
-                       rule_input=args.rule_input)
+                       rule_input=args.rule_input,
+                       rule_subbeats_per_chord=args.beats_per_chord,
+                       rule_key_select=args.rule_key_select)
     model.eval()
 
     print('=' * 68)
