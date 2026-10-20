@@ -284,6 +284,12 @@ def main():
                         'bar run trained with.')
     p.add_argument('--max_polyphony',  type=int, default=4)
     p.add_argument('--strict_causal',  action='store_true')
+    # _prompt_from_key calls generate_song, which draws a random bar pattern
+    # per call, so one trial per key resolves to 1/7 per scored downbeat and
+    # the Overall row disagrees with the group rows. Average like the results
+    # table does. Free-running is the expensive part: cost is roughly linear
+    # in n_trials.
+    p.add_argument('--n_trials',       type=int, default=5)
     args = p.parse_args()
 
     device = torch.device(args.device if args.device else
@@ -337,7 +343,8 @@ def main():
     for lbl, keys, kstr in rows:
         line = f'{lbl:<16} {kstr:<22}'
         for cname, fn in cols:
-            v = float(np.mean([fn(k) for k in keys]))
+            v = float(np.mean([fn(k) for k in keys
+                               for _ in range(args.n_trials)]))
             res[(lbl, cname)] = v
             line += f' {v:>15.3f}'
         print(line)
@@ -359,26 +366,35 @@ def main():
         print(sh); print('-' * len(sh))
         for lbl, keys, kstr in rows:
             vals = [rule_sensitivity(model, k, args.n_prompt_beats,
-                                     args.n_gen_beats, device, cfg) for k in keys]
+                                     args.n_gen_beats, device, cfg)
+                    for k in keys for _ in range(args.n_trials)]
             at, aw, ch, rl = (float(np.mean([v[i] for v in vals])) for i in range(4))
             print(f'{lbl:<16} {kstr:<22} {at:>9.3f} {aw:>10.3f} '
                   f'{ch:>8.3f} {rl:>9.4f}')
         print('-' * len(sh))
 
     gap = res[('Unseen', 'free-run ALL')] - res[('Unseen', 'free-run LAST')]
+    exposure = res[('Unseen', 'teacher-forced')] - res[('Unseen', 'free-run ALL')]
     print()
-    print(f'Unseen: ALL - LAST = {gap:+.3f}')
-    if gap > 0.05:
-        print('  The sampler mismatch accounts for most of the shortfall. Fix')
-        print('  global_sampling to correct every position and re-evaluate --')
-        print('  no retraining needed, the weights are unchanged.')
-    elif res[('Unseen', 'teacher-forced')] - res[('Unseen', 'free-run ALL')] > 0.05:
-        print('  The sampler is fine; the loss is in generating its own inputs.')
-        print('  Exposure bias, not a plumbing bug.')
+    print(f'Unseen: ALL - LAST  = {gap:+.3f}   (size of the OLD sampler bug;')
+    print('                                 global_sampling corrects every')
+    print('                                 position now, so ALL is what ships')
+    print('                                 and the results table matches it)')
+    print(f'Unseen: TF  - ALL   = {exposure:+.3f}   (cost of generating its own inputs)')
+    print()
+    if res[('Unseen', 'teacher-forced')] < 0.5:
+        print('  The adapter did not learn to route the rule on unseen keys.')
+        print('  Teacher-forced is the ceiling and it is already low, so no')
+        print('  change to generation can help -- check the rule-input')
+        print('  sensitivity block above before anything else.')
+    elif exposure > 0.2:
+        print('  The adapter KNOWS the rule (high teacher-forced) and loses it')
+        print('  while free-running. Exposure bias, not rule learning: the')
+        print('  deficit is robustness to its own generations, and the fix is')
+        print('  on the training/decoding side, not the adapter.')
     else:
-        print('  Neither. The adapter genuinely did not learn to route the rule')
-        print('  signal on unseen keys -- the teacher-forced number is the')
-        print('  ceiling, and it is already low.')
+        print('  The adapter knows the rule and keeps it while free-running.')
+        print('  This stem is working as intended.')
 
 
 if __name__ == '__main__':
