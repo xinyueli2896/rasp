@@ -55,7 +55,8 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from midi_adapter.cp_yinyang import CPYinyangTransformer
-from midi_adapter.evaluate_cp_bass import CATEGORIES, ALL_SEEN, UNSEEN, _expected_pc
+from midi_adapter.evaluate_cp_bass import (CATEGORIES, ALL_SEEN, UNSEEN,
+                                           _expected_pc, _scored_positions)
 from midi_adapter.evaluate_cp_yinyang import load_model
 from midi_adapter.infer_cp_bass import _prompt_from_key
 
@@ -134,33 +135,123 @@ def _pc(tok_row: torch.Tensor) -> int:
     return int(tok_row[1] % 128 % 12)
 
 
+def _prompt(key, n_beats, device, model, cfg):
+    """max_polyphony and cycle_unit must match the training data, or the
+    prompt is the wrong token width and local_encode does not mask the pad."""
+    return _prompt_from_key(key, n_prompt_bars=0, device=device,
+                            base=model.base, n_prompt_beats=n_beats,
+                            max_polyphony=cfg['max_polyphony'],
+                            cycle_unit=cfg['cycle_unit'])
+
+
 @torch.no_grad()
-def acc_teacher_forced(model, key, n_prompt, n_gen, device) -> float:
+def _teacher_forced_logits(model, x, rule_hidden=None):
+    """CPYinyangTransformer.forward, with rule_hidden optionally supplied.
+
+    Mirrors cp_yinyang.py:508 exactly. The override exists so the same host
+    input can be run against a DIFFERENT key's rule signal, which is what
+    isolates "the adapter is ignoring the rule" from "the adapter is using it".
+    """
+    base = model.base
+    B, T, _ = x.shape
+
+    h, emb = base.local_encode(x)
+    h = h.view(B, T, base.hidden_size)
+    sos = base.global_sos.view(1, 1, -1).expand(B, 1, -1)
+    h = torch.cat([sos, h[:, :-1]], dim=1)
+    model._pre_block_cache = h
+
+    if rule_hidden is None:
+        if model.rule_input == 'ar_state':
+            rule_hidden = model._ar_state_rule_hidden(h)
+        elif model.bidirectional:
+            rule_hidden = None
+        else:
+            rule_hidden = model._rule_hidden(x)
+
+    mask = base.buffered_future_mask(h)
+    for i, layer in enumerate(base.model.layer):
+        h = layer(h, attention_mask=mask)[0]
+        if (i + 1) % model.n_skip == 0:
+            k = (i + 1) // model.n_skip - 1
+            rule_h = model.ar_to_rule[k](h) if model.bidirectional else rule_hidden
+            h = h + model.yinyang_attn[k](h, rule_h, sub_offset=0)
+    return base.local_decode(h, emb)
+
+
+def _hits(pred_pc, key, n_prompt, total, bpc):
+    """Accuracy over the beats that carry a rule target."""
+    pos = _scored_positions(n_prompt, total, bpc)
+    return [int(pred_pc(t) == _expected_pc(key, t, bpc)) for t in pos]
+
+
+@torch.no_grad()
+def acc_teacher_forced(model, key, n_prompt, n_gen, device, cfg) -> float:
     """The training computation: ground-truth inputs, all positions corrected."""
     total = n_prompt + n_gen
-    x = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                         base=model.base, n_prompt_beats=total)
+    x = _prompt(key, total, device, model, cfg)
     B, T, S = x.shape
     # local_encode flattens (B, T, subseq) -> (B*T, subseq), so local_decode
     # returns (B*T, subseq, vocab) rather than (B, T, subseq, vocab).
-    logits = model(x)
+    logits = _teacher_forced_logits(model, x)
     assert logits.shape[:2] == (B * T, S), \
         f'unexpected logits shape {tuple(logits.shape)}; expected ({B*T}, {S}, vocab)'
     pred = logits.argmax(-1).view(B, T, S)
-    hits = [int(_pc(pred[0, t]) == _expected_pc(key, t))
-            for t in range(n_prompt, total)]
-    return float(np.mean(hits))
+    return float(np.mean(_hits(lambda t: _pc(pred[0, t]), key, n_prompt,
+                               total, cfg['beats_per_chord'])))
 
 
 @torch.no_grad()
-def acc_free_run(model, key, n_prompt, n_gen, device, correct_all) -> float:
+def acc_free_run(model, key, n_prompt, n_gen, device, correct_all, cfg) -> float:
     total = n_prompt + n_gen
-    prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
-                              base=model.base, n_prompt_beats=n_prompt)
+    prompt = _prompt(key, n_prompt, device, model, cfg)
     y = generate(model, prompt, total, correct_all=correct_all)
-    hits = [int(_pc(y[t][0]) == _expected_pc(key, t))
-            for t in range(n_prompt, total)]
-    return float(np.mean(hits))
+    return float(np.mean(_hits(lambda t: _pc(y[t][0]), key, n_prompt,
+                               total, cfg['beats_per_chord'])))
+
+
+@torch.no_grad()
+def rule_sensitivity(model, key, n_prompt, n_gen, device, cfg):
+    """Does the output depend on the rule input at all?
+
+    The gates are open in every bar-experiment run, including the ones whose
+    accuracy equals the bare pretrained host's. An open gate only means the
+    branch has magnitude -- it says nothing about whether what flows through
+    carries the key. So: hold the host input fixed and swap the rule model's
+    input to a tritone-away key. If nothing downstream moves, the adapter is
+    injecting a large signal that is constant in the key, and the host is
+    right to ignore it.
+
+    Returns (acc_true, acc_wrong, frac_pred_changed, rel_logit_delta).
+    """
+    total = n_prompt + n_gen
+    bpc = cfg['beats_per_chord']
+    x = _prompt(key, total, device, model, cfg)
+    # A tritone away: maximally far in pitch-class space, and never equal to
+    # the true key, so any invariance is not an accident of the offsets.
+    x_other = _prompt((key + 6) % 12, total, device, model, cfg)
+
+    rh_true = model._rule_hidden(x)
+    rh_wrong = model._rule_hidden(x_other)
+
+    lg_true = _teacher_forced_logits(model, x, rh_true)
+    lg_wrong = _teacher_forced_logits(model, x, rh_wrong)
+
+    B, T, S = x.shape
+    p_true = lg_true.argmax(-1).view(B, T, S)
+    p_wrong = lg_wrong.argmax(-1).view(B, T, S)
+
+    a_true = float(np.mean(_hits(lambda t: _pc(p_true[0, t]), key,
+                                 n_prompt, total, bpc)))
+    a_wrong = float(np.mean(_hits(lambda t: _pc(p_wrong[0, t]), key,
+                                  n_prompt, total, bpc)))
+
+    pos = _scored_positions(n_prompt, total, bpc)
+    changed = float(np.mean([int(_pc(p_true[0, t]) != _pc(p_wrong[0, t]))
+                             for t in pos]))
+    denom = lg_true.float().norm()
+    rel = float((lg_true.float() - lg_wrong.float()).norm() / denom) if denom > 0 else 0.0
+    return a_true, a_wrong, changed, rel
 
 
 def main():
@@ -180,10 +271,29 @@ def main():
     p.add_argument('--n_prompt_beats', type=int, default=1)
     p.add_argument('--n_gen_beats',    type=int, default=23)
     p.add_argument('--device',         type=str, default=None)
+    # The latent-rule (one chord per bar) configuration. These MUST match the
+    # data and the training command. beats_per_chord drives both the expected
+    # pitch class and which beats are scored; rule_key_select and
+    # rule_subbeats_per_chord rebuild the rule model -- getting the last one
+    # wrong is what silently invalidated an entire round of result tables.
+    p.add_argument('--beats_per_chord', type=int, default=1)
+    p.add_argument('--rule_key_select', type=str, default='phase0',
+                   choices=['phase0', 'first'])
+    p.add_argument('--rule_subbeats_per_chord', type=int, default=None,
+                   help='Defaults to --beats_per_chord, which is what every '
+                        'bar run trained with.')
+    p.add_argument('--max_polyphony',  type=int, default=4)
+    p.add_argument('--strict_causal',  action='store_true')
     args = p.parse_args()
 
     device = torch.device(args.device if args.device else
                           ('cuda' if torch.cuda.is_available() else 'cpu'))
+
+    spc = (args.rule_subbeats_per_chord if args.rule_subbeats_per_chord
+           is not None else args.beats_per_chord)
+    cfg = {'beats_per_chord': args.beats_per_chord,
+           'max_polyphony': args.max_polyphony,
+           'cycle_unit': 'bar' if args.beats_per_chord > 1 else 'beat'}
 
     model = load_model(args.base_ckpt, args.adapter_ckpt, args.model_size,
                        args.adapter_rank, args.n_skip, False, False,
@@ -192,22 +302,30 @@ def main():
                        lora_rank       = args.lora_rank,
                        rule_input      = args.rule_input,
                        rule_enc_type   = args.rule_enc_type,
-                       rule_enc_hidden = args.rule_enc_hidden)
+                       rule_enc_hidden = args.rule_enc_hidden,
+                       strict_causal   = args.strict_causal,
+                       rule_subbeats_per_chord = spc,
+                       rule_key_select = args.rule_key_select)
     model.eval()
 
     rows = list(CATEGORIES) + [('Overall', ALL_SEEN + UNSEEN, 'all 12 keys')]
     cols = [('teacher-forced', lambda k: acc_teacher_forced(
-                model, k, args.n_prompt_beats, args.n_gen_beats, device)),
+                model, k, args.n_prompt_beats, args.n_gen_beats, device, cfg)),
             ('free-run ALL',   lambda k: acc_free_run(
-                model, k, args.n_prompt_beats, args.n_gen_beats, device, True)),
+                model, k, args.n_prompt_beats, args.n_gen_beats, device, True, cfg)),
             ('free-run LAST',  lambda k: acc_free_run(
-                model, k, args.n_prompt_beats, args.n_gen_beats, device, False))]
+                model, k, args.n_prompt_beats, args.n_gen_beats, device, False, cfg))]
 
     print('=' * 78)
     print(f'FROZEN-ADAPTER DIAGNOSIS  ({args.n_prompt_beats}-beat prompt, '
           f'{args.n_gen_beats} generated, greedy)')
     print(f'  base    {args.base_ckpt}')
     print(f'  adapter {args.adapter_ckpt}')
+    print(f'  rule    spc={spc} key_select={args.rule_key_select} '
+          f'bpc={args.beats_per_chord} mp={args.max_polyphony} '
+          f'cycle={cfg["cycle_unit"]}')
+    if args.beats_per_chord > 1:
+        print('          scoring downbeats only -- off-beats may use chord tones')
     print('=' * 78)
     print('  free-run LAST = the shipped sampler.  free-run ALL = corrections at')
     print('  every position, matching the training forward.')
@@ -224,6 +342,28 @@ def main():
             line += f' {v:>15.3f}'
         print(line)
     print('=' * len(hdr))
+
+    # --- is the rule input used at all? ------------------------------------
+    # Only meaningful when something external feeds the rule model. With
+    # rule_input='ar_state' the signal is derived from the host's own state,
+    # so there is no other key's input to swap in.
+    if model.rule_input == 'tokens' and not model.bidirectional:
+        print()
+        print('Rule-input sensitivity: same host input, rule model fed the '
+              'tritone-away key.')
+        print('  An open gate carrying no key information looks like '
+              'acc_true == acc_wrong, changed == 0.')
+        print()
+        sh = (f'{"Key group":<16} {"Keys":<22} {"acc true":>9} {"acc wrong":>10} '
+              f'{"changed":>8} {"d logits":>9}')
+        print(sh); print('-' * len(sh))
+        for lbl, keys, kstr in rows:
+            vals = [rule_sensitivity(model, k, args.n_prompt_beats,
+                                     args.n_gen_beats, device, cfg) for k in keys]
+            at, aw, ch, rl = (float(np.mean([v[i] for v in vals])) for i in range(4))
+            print(f'{lbl:<16} {kstr:<22} {at:>9.3f} {aw:>10.3f} '
+                  f'{ch:>8.3f} {rl:>9.4f}')
+        print('-' * len(sh))
 
     gap = res[('Unseen', 'free-run ALL')] - res[('Unseen', 'free-run LAST')]
     print()
