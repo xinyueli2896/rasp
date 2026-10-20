@@ -12,9 +12,14 @@
 # is readable while seeds 2 and 3 are still training, so a misconfiguration
 # shows up after a third of the compute instead of all of it.
 #
-# Required:
-#   BASE_FMT    printf format for the base checkpoint, with %s for the seed.
-#               Default assumes the step004000 snapshot of cp_bass_pre_bar_s<seed>.
+# Required (one of):
+#   BASE_CKPT_SHARED  a single checkpoint used as the host for EVERY seed, so
+#               the seed varies only the adapter init and the batch order.
+#               Takes precedence over BASE_FMT.
+#   BASE_FMT    printf format for a per-seed base checkpoint, with %s for the
+#               seed. Default assumes the step004000 snapshot of
+#               cp_bass_pre_bar_s<seed>; with this the seed also varies the
+#               pretrained host, so the error bars cover host variation too.
 # Useful:
 #   SEEDS       default "1 2 3"
 #   EVAL_ONLY=1 skip training, just rebuild the tables from existing checkpoints
@@ -31,6 +36,12 @@ SEEDS="${SEEDS:-1 2 3}"
 STEMS="${STEMS:-finetune frozen lora noinput trainar scratch}"
 EVAL_ONLY="${EVAL_ONLY:-0}"
 BASE_FMT="${BASE_FMT:-ckpt/cp_bass_pre_bar_s%s/cp_bass_pre_bar_s%s.step004000.ckpt}"
+# One host for every seed. Set this and the seed no longer varies the host:
+# frozen, lora, trainar and the finetune baseline all start from this one
+# checkpoint, and every seed's table is evaluated against it. Leave it empty
+# for the per-seed hosts of BASE_FMT. (scratch has no host to share -- its
+# base is randomly initialised from the seed either way.)
+BASE_CKPT_SHARED="${BASE_CKPT_SHARED:-}"
 
 # --- the latent-rule configuration -----------------------------------------
 export TRAIN_DATA="${TRAIN_DATA:-data/bass_finetune_bar.pt}"
@@ -63,16 +74,26 @@ MIDI_DIR="${MIDI_DIR-eval_midi_bar}"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
-base_for () { printf "$BASE_FMT" "$1" "$1"; }
+base_for () {
+  if [[ -n "$BASE_CKPT_SHARED" ]]; then printf '%s' "$BASE_CKPT_SHARED"
+  else printf "$BASE_FMT" "$1" "$1"; fi
+}
 
 # --- preflight: every base must exist before anything is launched ----------
 missing=0
-for sd in $SEEDS; do
-  b="$(base_for "$sd")"
-  if [[ ! -f "$b" ]]; then echo "MISSING base for seed $sd: $b" >&2; missing=1; fi
-done
+if [[ -n "$BASE_CKPT_SHARED" ]]; then
+  echo "shared host for all seeds: $BASE_CKPT_SHARED"
+  if [[ ! -f "$BASE_CKPT_SHARED" ]]; then
+    echo "MISSING shared base: $BASE_CKPT_SHARED" >&2; missing=1
+  fi
+else
+  for sd in $SEEDS; do
+    b="$(base_for "$sd")"
+    if [[ ! -f "$b" ]]; then echo "MISSING base for seed $sd: $b" >&2; missing=1; fi
+  done
+fi
 if [[ "$missing" == "1" ]]; then
-  echo "Set BASE_FMT, or wait for the pretrains to reach that step." >&2
+  echo "Set BASE_CKPT_SHARED or BASE_FMT, or wait for the pretrains to reach that step." >&2
   exit 1
 fi
 
