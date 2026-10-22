@@ -179,20 +179,31 @@ for sd in $SEEDS; do
   eval_seed "$sd"
 done
 
-# --- one combined table across seeds -------------------------------------
-jsons=""
-for sd in $SEEDS; do
-  [[ -f "$LOG_DIR/table_s$sd.json" ]] && jsons="$jsons $LOG_DIR/table_s$sd.json"
+# --- one combined table across seeds, per temperature ---------------------
+# Per-seed JSON is named table_s<seed>_T<temp>.json, so aggregate each
+# temperature separately: averaging greedy and sampled runs into one column
+# would hide exactly the difference the two tables exist to show.
+for t in $TEMPS; do
+  jsons=""
+  for sd in $SEEDS; do
+    f="$LOG_DIR/table_s${sd}_T${t}.json"
+    [[ -f "$f" ]] && jsons="$jsons $f"
+  done
+  if [[ -n "$jsons" ]]; then
+    echo
+    echo "=== combined across seeds, temperature $t ==="
+    python -m midi_adapter.aggregate_seeds $jsons \
+        2>&1 | tee "$LOG_DIR/table_all_seeds_T${t}.log"
+  else
+    echo "no per-seed JSON found for temperature $t -- combined table skipped" >&2
+  fi
 done
-if [[ -n "$jsons" ]]; then
-  echo
-  python -m midi_adapter.aggregate_seeds $jsons \
-      2>&1 | tee "$LOG_DIR/table_all_seeds.log"
-fi
 
 echo
 echo "all seeds done."
-for sd in $SEEDS; do echo "  per seed : $LOG_DIR/table_s$sd.log"; done
-echo "  combined : $LOG_DIR/table_all_seeds.log"
-[[ -n "$MIDI_DIR" ]] && echo "  midi     : $MIDI_DIR/s<seed>/<model>/"
+for sd in $SEEDS; do
+  for t in $TEMPS; do echo "  per seed : $LOG_DIR/table_s${sd}_T${t}.log"; done
+done
+for t in $TEMPS; do echo "  combined : $LOG_DIR/table_all_seeds_T${t}.log"; done
+[[ -n "$MIDI_DIR" ]] && echo "  midi     : $MIDI_DIR/s<seed>/T<temp>/<model>/"
 true
