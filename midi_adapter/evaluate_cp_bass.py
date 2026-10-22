@@ -37,22 +37,67 @@ from midi_adapter.infer_cp_bass import _sample, _prompt_from_key, decode_output
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# Key partitions
+# Key partitions.
+#
+# Two unseen keys make the Unseen row coarse: one key flipping moves it by
+# ~0.5, which is wider than the gaps between stems it is meant to separate.
+# CP_UNSEEN_KEYS widens the held-out set without editing this file, so the
+# per-beat experiment's published numbers stay reproducible:
+#
+#   CP_UNSEEN_KEYS="2 6 8 11" python -m midi_adapter.cp_results_table ...
+#
+# Keys named there are removed from FINETUNE_ONLY, which is always derived
+# rather than listed -- the four groups partition all 12 keys by construction,
+# so they cannot drift apart. The pretrain keys are fixed, so widening the
+# unseen set never invalidates a pretrain checkpoint; it only requires the
+# FINETUNE and UNSEEN datasets to be regenerated to match.
 PRETRAIN_ONLY = [5, 9]                        # seen only during CP pretraining
-FINETUNE_ONLY = [1, 2, 3, 4, 7, 10, 11]      # seen only during fine-tuning
 BOTH_SEEN     = [0]                           # seen in both pretrain and fine-tune
-UNSEEN        = [6, 8]                        # never seen during any training
+
+_DEFAULT_UNSEEN = [6, 8]
+
+
+def _parse_unseen() -> list[int]:
+    raw = os.environ.get('CP_UNSEEN_KEYS', '').replace(',', ' ').split()
+    if not raw:
+        return list(_DEFAULT_UNSEEN)
+    try:
+        keys = sorted({int(k) for k in raw})
+    except ValueError:
+        raise SystemExit(f'CP_UNSEEN_KEYS: expected integers 0-11, got {raw!r}')
+    bad = [k for k in keys if not 0 <= k <= 11]
+    if bad:
+        raise SystemExit(f'CP_UNSEEN_KEYS: keys out of range 0-11: {bad}')
+    # A key the CP pretrain saw is not unseen, whatever the environment says.
+    clash = [k for k in keys if k in PRETRAIN_ONLY + BOTH_SEEN]
+    if clash:
+        raise SystemExit(
+            f'CP_UNSEEN_KEYS: {clash} are pretrain keys '
+            f'({sorted(PRETRAIN_ONLY + BOTH_SEEN)}), so they cannot be unseen.')
+    if len(keys) > 11 - len(PRETRAIN_ONLY + BOTH_SEEN):
+        raise SystemExit('CP_UNSEEN_KEYS: that leaves no finetune keys.')
+    return keys
+
+
+UNSEEN        = _parse_unseen()               # never seen during any training
+FINETUNE_ONLY = [k for k in range(12)         # seen only during fine-tuning
+                 if k not in PRETRAIN_ONLY + BOTH_SEEN + UNSEEN]
 
 # Aliases kept for backward compatibility
 PRETRAIN_KEYS = PRETRAIN_ONLY
 FINETUNE_NEW  = FINETUNE_ONLY
 ALL_SEEN      = PRETRAIN_ONLY + FINETUNE_ONLY + BOTH_SEEN
 
+
+def _kstr(keys: list[int]) -> str:
+    return '{' + ','.join(str(k) for k in sorted(keys)) + '}'
+
+
 CATEGORIES = [
-    ('Pretrain-only', PRETRAIN_ONLY, '{5,9}'),
-    ('Finetune-only', FINETUNE_ONLY, '{1,2,3,4,7,10,11}'),
-    ('Both seen',     BOTH_SEEN,     '{0}'),
-    ('Unseen',        UNSEEN,        '{6,8}'),
+    ('Pretrain-only', PRETRAIN_ONLY, _kstr(PRETRAIN_ONLY)),
+    ('Finetune-only', FINETUNE_ONLY, _kstr(FINETUNE_ONLY)),
+    ('Both seen',     BOTH_SEEN,     _kstr(BOTH_SEEN)),
+    ('Unseen',        UNSEEN,        _kstr(UNSEEN)),
 ]
 
 

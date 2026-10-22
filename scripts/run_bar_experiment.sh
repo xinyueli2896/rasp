@@ -62,6 +62,12 @@ export PROBE_PROMPT="${PROBE_PROMPT:-4}"
 export PROBE_GEN="${PROBE_GEN:-28}"
 export MAX_STEPS="${MAX_STEPS:-10000}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+# Held-out keys. Unset -> {6,8}, the original pair. Widening it (e.g.
+# "2 6 8 11") makes the Unseen row less coarse, and FINETUNE_ONLY is derived
+# from it, so TRAIN_DATA and UNSEEN_DATA MUST be regenerated to match or the
+# model will have trained on keys the table calls unseen. PRETRAIN_DATA and
+# the pretrain checkpoints are unaffected -- the pretrain keys never move.
+export CP_UNSEEN_KEYS="${CP_UNSEEN_KEYS:-}"
 
 # Evaluation protocol. These must match the data or the table is wrong in
 # silence: max_polyphony sets the prompt's token width, beats_per_chord makes
