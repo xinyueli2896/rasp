@@ -532,8 +532,20 @@ class CPYinyangTransformer(nn.Module):
 
         mask = base.buffered_future_mask(h)
 
+        # RoFormer applies rotary embeddings ONLY when sinusoidal_pos is passed
+        # (RoFormerSelfAttention: `if not is_cross_attention and sinusoidal_pos
+        # is not None`). cp_transformer runs the global stack as
+        # self.model(h, ...), so RoFormerEncoder.forward computes this and hands
+        # it to every layer -- which is how the host was pretrained, and what
+        # global_sampling already does. Iterating base.model.layer by hand
+        # without it silently disables rotary, so the adapter was trained
+        # against a host running a different function from the one it is
+        # deployed on. Verified: the manual loop without this differs from
+        # RoFormerEncoder by 0.416 max-abs; with it, by 0.0.
+        sinusoidal_pos = base.model.embed_positions(h.shape[:-1], 0)[None, None, :, :]
+
         for i, layer in enumerate(base.model.layer):
-            h = layer(h, attention_mask=mask)[0]
+            h = layer(h, attention_mask=mask, sinusoidal_pos=sinusoidal_pos)[0]
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden

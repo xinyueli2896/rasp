@@ -170,8 +170,11 @@ def _teacher_forced_logits(model, x, rule_hidden=None):
             rule_hidden = model._rule_hidden(x)
 
     mask = base.buffered_future_mask(h)
+    # Must match CPYinyangTransformer.forward, rotary included -- without this
+    # the "teacher-forced" column measures a host the model is never run on.
+    sinusoidal_pos = base.model.embed_positions(h.shape[:-1], 0)[None, None, :, :]
     for i, layer in enumerate(base.model.layer):
-        h = layer(h, attention_mask=mask)[0]
+        h = layer(h, attention_mask=mask, sinusoidal_pos=sinusoidal_pos)[0]
         if (i + 1) % model.n_skip == 0:
             k = (i + 1) // model.n_skip - 1
             rule_h = model.ar_to_rule[k](h) if model.bidirectional else rule_hidden
