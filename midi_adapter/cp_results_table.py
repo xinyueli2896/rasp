@@ -199,6 +199,32 @@ def main():
     print(f'  protocol : {args.n_prompt_beats}-beat prompt, '
           f'{args.n_gen_beats} generated, temperature {args.temperature}')
 
+    entries = build_entries(args, device)
+
+    print()
+    print('=' * 60)
+    print('Evaluating')
+    print('=' * 60)
+    results = {}
+    for lbl, model, is_ad in entries:
+        results[lbl] = {}
+        print(f'  {lbl} ...', end='  ', flush=True)
+        for rlbl, keys, _ in rows:
+            results[lbl][rlbl] = eval_model(model, is_ad, keys, args, device)
+        print('  '.join(f'{results[lbl][r]:.3f}' for r, _, _ in rows))
+
+    _rest_of_main(args, device, entries, rows, results)
+
+
+def build_entries(args, device):
+    """(label, model, is_adapter) for the baselines and every --runs entry.
+
+    Shared with drift_curve so the rebuild parameters are recovered from the
+    checkpoint in exactly one place. Copying this block is what produced the
+    rule_subbeats_per_chord mismatch that silently invalidated a whole round
+    of tables: every weight loads cleanly and the rule model emits a
+    different sequence.
+    """
     entries = []            # (label, model, is_adapter)
     entries.append(('Pretrain', load_base_model(args.base_ckpt, args.model_size, device), False))
     if args.ft_ckpt:
@@ -251,18 +277,10 @@ def main():
                                                args.rule_key_select))
         entries.append((run, model, True))
 
-    print()
-    print('=' * 60)
-    print('Evaluating')
-    print('=' * 60)
-    results = {}
-    for lbl, model, is_ad in entries:
-        results[lbl] = {}
-        print(f'  {lbl} ...', end='  ', flush=True)
-        for rlbl, keys, _ in rows:
-            results[lbl][rlbl] = eval_model(model, is_ad, keys, args, device)
-        print('  '.join(f'{results[lbl][r]:.3f}' for r, _, _ in rows))
+    return entries
 
+
+def _rest_of_main(args, device, entries, rows, results):
     if args.save_midi_dir:
         print()
         print('=' * 60)
