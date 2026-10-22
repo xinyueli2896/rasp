@@ -68,6 +68,14 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 # it score downbeats rather than every beat.
 MAX_POLY="${MAX_POLY:-2}"
 N_TRIALS="${N_TRIALS:-20}"
+# Temperatures to score at, one table each. 0 is greedy: deterministic given
+# the prompt, and the number the probe and every earlier table used -- but it
+# takes the modal continuation, which cannot reproduce the per-song pattern
+# diversity in the data (a greedy sample ties the bar pattern to the phase
+# instead of holding one pattern per song). 1 samples from the model's own
+# distribution, so it measures whether the rule survives when the realisation
+# is free. Set TEMPS="0" for the old behaviour.
+TEMPS="${TEMPS:-0 1}"
 # One MIDI per key per adapter run, generated with the same prompts the table
 # scores, so what you hear matches the numbers. Set to "" to skip.
 MIDI_DIR="${MIDI_DIR-eval_midi_bar}"
@@ -99,7 +107,7 @@ fi
 
 # --- the table for one seed ------------------------------------------------
 eval_seed () {
-  local sd="$1" base ft args
+  local sd="$1" base ft args t tag
   base="$(base_for "$sd")"
 
   # The finetune baseline is selected on val_loss, which is what its filenames
@@ -107,28 +115,35 @@ eval_seed () {
   ft="$(ls -1 "$CKPT_DIR/cp_bass_ft_s$sd"/*.ckpt 2>/dev/null \
         | grep -v 'last\.ckpt' | sort -t= -k3 -g | head -1)"
 
-  args=(--base_ckpt "$base" --ckpt_dir "$CKPT_DIR"
-        --runs "cp_yy_frozen_s$sd" "cp_yy_lora_s$sd" "cp_yy_trainar_s$sd"
-               "cp_yy_scratch_s$sd" "cp_yy_noinput_mlp_aux1_s$sd"
-        --adapter_rank 256 --n_skip "$N_SKIP"
-        --max_polyphony "$MAX_POLY" --beats_per_chord "$BEATS_PER_CHORD"
-        --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
-        --n_trials "$N_TRIALS"
-        --rule_key_select "$KEY_SELECT")
-  if [[ -n "$MIDI_DIR" ]]; then
-    args+=(--save_midi_dir "$MIDI_DIR/s$sd")
-  fi
-  args+=(--json_out "$LOG_DIR/table_s$sd.json")
   if [[ -n "$ft" ]]; then
-    args+=(--ft_ckpt "$ft")
     echo "  finetune baseline: $(basename "$ft")"
   else
     echo "  finetune baseline: none found -- the Finetune column is omitted"
   fi
 
-  echo "=== table, seed $sd ==="
-  python -m midi_adapter.cp_results_table "${args[@]}" \
-      2>&1 | tee "$LOG_DIR/table_s$sd.log"
+  # One table per temperature. Same checkpoints, same prompts, same scored
+  # downbeats -- only the decoding changes, so the two tables are directly
+  # comparable and their difference is the cost of sampling.
+  for t in $TEMPS; do
+    tag="T${t}"
+    args=(--base_ckpt "$base" --ckpt_dir "$CKPT_DIR"
+          --runs "cp_yy_frozen_s$sd" "cp_yy_lora_s$sd" "cp_yy_trainar_s$sd"
+                 "cp_yy_scratch_s$sd" "cp_yy_noinput_mlp_aux1_s$sd"
+          --adapter_rank 256 --n_skip "$N_SKIP"
+          --max_polyphony "$MAX_POLY" --beats_per_chord "$BEATS_PER_CHORD"
+          --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
+          --n_trials "$N_TRIALS" --temperature "$t"
+          --rule_key_select "$KEY_SELECT")
+    if [[ -n "$MIDI_DIR" ]]; then
+      args+=(--save_midi_dir "$MIDI_DIR/s$sd/$tag")
+    fi
+    args+=(--json_out "$LOG_DIR/table_s${sd}_${tag}.json")
+    [[ -n "$ft" ]] && args+=(--ft_ckpt "$ft")
+
+    echo "=== table, seed $sd, temperature $t ==="
+    python -m midi_adapter.cp_results_table "${args[@]}" \
+        2>&1 | tee "$LOG_DIR/table_s${sd}_${tag}.log"
+  done
 }
 
 # --- one wave: six models for one seed, in parallel ------------------------
