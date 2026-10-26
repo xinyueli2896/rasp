@@ -52,12 +52,17 @@ def _gen_pcs(model: CPYinyangTransformer,
              device: torch.device, temperature: float,
              n_prompt_beats: int = 2,
              max_polyphony: int = 4,
-             beats_per_chord: int = 1) -> list[int | None]:
-    """Generate n_gen beats with rule conditioning and return pitch classes."""
+             beats_per_chord: int = 1,
+             pattern: str | None = None) -> list[int | None]:
+    """Generate n_gen beats with rule conditioning and return pitch classes.
+
+    pattern pins the prompt's realisation; None draws one at random per call.
+    """
     prompt = _prompt_from_key(key, n_prompt_bars=0, device=device,
                               base=model.base, n_prompt_beats=n_prompt_beats,
                               max_polyphony=max_polyphony,
-                              cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
+                              cycle_unit=('bar' if beats_per_chord > 1 else 'beat'),
+                              pattern=pattern)
 
     total = n_prompt_beats + n_gen
     sampled = model.global_sampling(

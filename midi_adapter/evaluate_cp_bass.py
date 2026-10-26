@@ -152,17 +152,21 @@ def _gen_pcs(base: RoFormerSymbolicTransformer,
              device: torch.device, temperature: float,
              n_prompt_beats: int = 1,
              max_polyphony: int = 4,
-             beats_per_chord: int = 1) -> list[int | None]:
+             beats_per_chord: int = 1,
+             pattern: str | None = None) -> list[int | None]:
     """Generate n_gen beats from an n_prompt_beats prompt and return pitch classes.
 
     max_polyphony and beats_per_chord must match the TRAINING data, or the
     prompt is out of distribution: a different token width per beat, or a
     whole I-IV-V-I crammed into a bar the model expects to hold one root.
+
+    pattern pins the prompt's realisation; None draws one at random per call.
     """
     prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
                                base=base, n_prompt_beats=n_prompt_beats,
                                max_polyphony=max_polyphony,
-                               cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
+                               cycle_unit=('bar' if beats_per_chord > 1 else 'beat'),
+                               pattern=pattern)
     sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                       show_progress=False)
     return [_extract_pc(t, base.tokenizer) for t in sampled[n_prompt_beats:]]

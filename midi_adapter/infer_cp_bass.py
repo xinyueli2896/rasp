@@ -133,7 +133,8 @@ def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
                      base: RoFormerSymbolicTransformer,
                      n_prompt_beats: int | None = None,
                      max_polyphony: int = 4,
-                     cycle_unit: str = 'beat') -> torch.Tensor:
+                     cycle_unit: str = 'beat',
+                     pattern: str | None = None) -> torch.Tensor:
     """Generate a synthetic prompt in the given key.
 
     n_prompt_beats overrides n_prompt_bars if given (finer granularity).
@@ -153,8 +154,12 @@ def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
         pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
         return base.preprocess(dummy, pitch_shift)
 
+    # pattern=None keeps the original behaviour: generate_song draws one of the
+    # five realisations at random per call, so a sweep of trials averages over
+    # them. Naming one pins the prompt's realisation instead, which is what
+    # isolates "does the prompt's pattern change anything".
     pm, _ = generate_song(n_bars=max(1, -(-n_subbeats // SUBBEATS_PER_BAR)),
-                          key=key, cycle_unit=cycle_unit)
+                          key=key, cycle_unit=cycle_unit, pattern=pattern)
     data, _ = _preprocess_pm(pm, n_subbeats, max_polyphony=max_polyphony)
     data = data.unsqueeze(0).to(device)
     pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
