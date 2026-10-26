@@ -41,9 +41,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from midi_adapter.cp_results_table import build_entries
 from midi_adapter.evaluate_cp_bass import (ALL_SEEN, UNSEEN, _expected_pc,
-                                           _scored_positions,
+                                           _scored_positions, _extract_pc,
                                            _gen_pcs as base_gen_pcs)
 from midi_adapter.evaluate_cp_yinyang import _gen_pcs as adapter_gen_pcs
+from midi_adapter.infer_cp_bass import _prompt_from_key
 
 # Semitones above the bar's root; None is a beat with no onset. These are the
 # five realisations generate_synthetic_bass draws from.
@@ -93,6 +94,35 @@ def trial(model, is_adapter, key, args, device, pattern):
 
     # pcs[0] is absolute beat n_p, which is a bar boundary because n_p is a
     # multiple of bpc (checked in main), so bars line up with no offset.
+    bars = [classify_bar(pcs[i:i + bpc])
+            for i in range(0, len(pcs) - bpc + 1, bpc)]
+    return hits, scored, bars
+
+
+@torch.no_grad()
+def data_trial(base, key, args, device, pattern):
+    """The same measurement on the GROUND-TRUTH data instead of a generation.
+
+    This is the ceiling, and it is not optional. Every number here must come
+    out at 1.000: the data follows the rule by construction and holds one
+    realisation per song. Anything less means the classifier or the pitch-class
+    extraction is wrong, and the model rows below it mean nothing.
+    """
+    bpc = args.beats_per_chord
+    n_p = args.n_prompt_beats
+    total = n_p + args.n_gen_beats
+
+    x = _prompt_from_key(key, n_prompt_bars=0, device=device, base=base,
+                         n_prompt_beats=total,
+                         max_polyphony=args.max_polyphony,
+                         cycle_unit='bar', pattern=pattern)
+    pcs = [_extract_pc(x[:, t, :], base.tokenizer) for t in range(n_p, total)]
+
+    hits = scored = 0
+    for t in _scored_positions(n_p, total, bpc):
+        pc = pcs[t - n_p]
+        scored += 1
+        hits += int(pc is not None and pc == _expected_pc(key, t, bpc))
     bars = [classify_bar(pcs[i:i + bpc])
             for i in range(0, len(pcs) - bpc + 1, bpc)]
     return hits, scored, bars
@@ -151,8 +181,10 @@ def main():
     print('Sweeping prompt patterns')
     print('=' * 60)
 
+    # (label, model, is_adapter) plus a sentinel for the ground-truth ceiling.
+    DATA = '__data__'
     rows = []
-    for lbl, model, is_ad in entries:
+    for lbl, model, is_ad in [('Data (ceiling)', entries[0][1], DATA)] + entries:
         print(f'  {lbl}')
         for pat in sweep:
             h = s = 0
@@ -161,8 +193,14 @@ def main():
             cons_h = cons_n = 0
             for key in keys_all:
                 for _ in range(args.n_trials):
-                    hits, scored, bars = trial(model, is_ad, key, args,
-                                               device, pat)
+                    if is_ad == DATA:
+                        if pat is None:
+                            continue        # "random" is meaningless for data
+                        hits, scored, bars = data_trial(model, key, args,
+                                                        device, pat)
+                    else:
+                        hits, scored, bars = trial(model, is_ad, key, args,
+                                                   device, pat)
                     h += hits; s += scored
                     if key in UNSEEN:
                         hu += hits; su += scored
@@ -178,6 +216,15 @@ def main():
                     if bars and bars[0] is not None:
                         cons_h += sum(1 for b in bars if b == bars[0])
                         cons_n += len(bars)
+            if is_ad == DATA and pat is None:
+                continue
+            wfr = wf / max(nbars, 1)
+            # What `consistent` reads if each bar's realisation is drawn
+            # independently: the first bar always matches itself, and each
+            # later one matches with probability (well-formed / 5). Printed
+            # because 0.3 is meaningless until you know chance is also 0.3.
+            nb = max(1, args.n_gen_beats // args.beats_per_chord)
+            chance = (1 + (nb - 1) * wfr / len(PATTERNS)) / nb
             rows.append({
                 'model': lbl,
                 'prompt': pat or 'random',
@@ -185,13 +232,14 @@ def main():
                 'acc_unseen': hu / max(su, 1),
                 'continues': (cont / nbars) if (pat and nbars) else float('nan'),
                 'consistent': cons_h / max(cons_n, 1),
-                'wellformed': wf / max(nbars, 1),
+                'consistent_chance': chance,
+                'wellformed': wfr,
             })
             r = rows[-1]
             cstr = ('  --  ' if pat is None else f'{r["continues"]:.3f}')
             print(f'    {r["prompt"]:<9} acc {r["acc_all"]:.3f}  '
                   f'unseen {r["acc_unseen"]:.3f}  |  continues {cstr}  '
-                  f'consistent {r["consistent"]:.3f}  '
+                  f'consistent {r["consistent"]:.3f} (chance {chance:.3f})  '
                   f'well-formed {r["wellformed"]:.3f}')
 
     if args.csv_out:
@@ -200,6 +248,15 @@ def main():
             w = csv.DictWriter(f, fieldnames=list(rows[0]))
             w.writeheader(); w.writerows(rows)
         print(f'\nwrote {args.csv_out}')
+
+    bad = [r for r in rows if r['model'].startswith('Data')
+           and min(r['acc_all'], r['continues'], r['consistent'],
+                   r['wellformed']) < 0.999]
+    if bad:
+        print()
+        print('!! The Data (ceiling) rows are not 1.000. The classifier or the')
+        print('!! pitch-class extraction is wrong and every model row below is')
+        print('!! uninterpretable. Fix that before reading anything else.')
 
     print()
     print('Rule-following   acc / unseen  -- is the downbeat the right root?')
