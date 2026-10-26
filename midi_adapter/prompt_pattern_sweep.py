@@ -44,16 +44,26 @@ from midi_adapter.evaluate_cp_bass import (ALL_SEEN, UNSEEN, _expected_pc,
                                            _scored_positions, _extract_pc,
                                            _gen_pcs as base_gen_pcs)
 from midi_adapter.evaluate_cp_yinyang import _gen_pcs as adapter_gen_pcs
+from midi_adapter.generate_synthetic_bass import COMMON_CHORDS
 from midi_adapter.infer_cp_bass import _prompt_from_key
 
-# Semitones above the bar's root; None is a beat with no onset. These are the
-# five realisations generate_synthetic_bass draws from.
+# Semitones above the bar's root; None is a beat with no onset. Each name maps
+# to every shape that realisation can take.
+#
+# Only `walking` has more than one. _bar_notes walks it as
+# tones[i % len(tones)], and `tones` is COMMON_CHORDS[quality] for a quality
+# drawn at random per song -- so a minor bar is 0 3 7 0 and a seventh is
+# 0 4 7 10. Matching only the major shape scored four fifths of walking bars
+# as unclassifiable. The other four patterns use the root and tones[2], which
+# is 7 in every quality, so they do not vary.
+_WALK = [[t[i % len(t)] for i in range(4)] for t in COMMON_CHORDS.values()]
+
 PATTERNS = {
-    'root4':   [0, 0, 0, 0],
-    'root2':   [0, None, 0, None],
-    'whole':   [0, None, None, None],
-    'half':    [0, None, 7, None],
-    'walking': [0, 4, 7, 0],
+    'root4':   [[0, 0, 0, 0]],
+    'root2':   [[0, None, 0, None]],
+    'whole':   [[0, None, None, None]],
+    'half':    [[0, None, 7, None]],
+    'walking': _WALK,
 }
 
 
@@ -68,8 +78,8 @@ def classify_bar(pcs):
         return None
     r = pcs[0]
     steps = [None if p is None else (p - r) % 12 for p in pcs]
-    for name, tmpl in PATTERNS.items():
-        if steps == tmpl:
+    for name, shapes in PATTERNS.items():
+        if steps in shapes:
             return name
     return None
 
