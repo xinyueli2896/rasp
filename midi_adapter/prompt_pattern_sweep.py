@@ -51,6 +51,31 @@ from midi_adapter.bar_patterns import PATTERNS, classify_bar
 from midi_adapter.infer_cp_bass import _prompt_from_key
 
 @torch.no_grad()
+def trial(model, is_adapter, key, args, device, pattern):
+    """(hits, scored, [bar classification]) for one generation."""
+    gen = adapter_gen_pcs if is_adapter else base_gen_pcs
+    bpc = args.beats_per_chord
+    n_p = args.n_prompt_beats
+    total = n_p + args.n_gen_beats
+
+    pcs = gen(model, key, args.n_gen_beats, device, args.temperature, n_p,
+              max_polyphony=args.max_polyphony, beats_per_chord=bpc,
+              pattern=pattern)
+
+    hits = scored = 0
+    for t in _scored_positions(n_p, total, bpc):
+        pc = pcs[t - n_p]
+        scored += 1
+        hits += int(pc is not None and pc == _expected_pc(key, t, bpc))
+
+    # pcs[0] is absolute beat n_p, a bar boundary because n_p is a multiple of
+    # bpc (checked in main), so bars line up with no offset.
+    bars = [classify_bar(pcs[i:i + bpc])
+            for i in range(0, len(pcs) - bpc + 1, bpc)]
+    return hits, scored, bars
+
+
+@torch.no_grad()
 def data_trial(base, key, args, device, pattern):
     """The same measurement on the GROUND-TRUTH data instead of a generation.
 
