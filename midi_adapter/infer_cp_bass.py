@@ -134,7 +134,8 @@ def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
                      n_prompt_beats: int | None = None,
                      max_polyphony: int = 4,
                      cycle_unit: str = 'beat',
-                     pattern: str | None = None) -> torch.Tensor:
+                     pattern: str | None = None,
+                     quality: str | None = None) -> torch.Tensor:
     """Generate a synthetic prompt in the given key.
 
     n_prompt_beats overrides n_prompt_bars if given (finer granularity).
@@ -158,8 +159,12 @@ def _prompt_from_key(key: int, n_prompt_bars: int, device: torch.device,
     # five realisations at random per call, so a sweep of trials averages over
     # them. Naming one pins the prompt's realisation instead, which is what
     # isolates "does the prompt's pattern change anything".
+    # quality=None draws one at random per call, as before. Pinning it lets a
+    # caller build two songs that differ ONLY in their realisation pattern,
+    # which is what makes splicing one bar into another's context meaningful.
     pm, _ = generate_song(n_bars=max(1, -(-n_subbeats // SUBBEATS_PER_BAR)),
-                          key=key, cycle_unit=cycle_unit, pattern=pattern)
+                          key=key, cycle_unit=cycle_unit, pattern=pattern,
+                          quality=quality)
     data, _ = _preprocess_pm(pm, n_subbeats, max_polyphony=max_polyphony)
     data = data.unsqueeze(0).to(device)
     pitch_shift = torch.zeros(1, dtype=torch.long, device=device)
