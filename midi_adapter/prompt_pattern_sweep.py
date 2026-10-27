@@ -275,9 +275,15 @@ def main():
             w.writeheader(); w.writerows(rows)
         print(f'\nwrote {args.csv_out}')
 
+    # Only the PINNED Data rows should read 1.000 throughout. The `mixed` row
+    # redraws per bar, so its `consistent` is correctly at chance and its
+    # `continues` is undefined -- checking those made the gate cry wolf.
     bad = [r for r in rows if r['model'].startswith('Data')
-           and min(r['acc_all'], r['continues'], r['consistent'],
-                   r['wellformed']) < 0.999]
+           and ((r['prompt'] in PATTERNS
+                 and min(r['acc_all'], r['continues'], r['consistent'],
+                         r['wellformed']) < 0.999)
+                or (r['prompt'] == MIXED_PATTERN
+                    and min(r['acc_all'], r['wellformed']) < 0.999))]
     if bad:
         print()
         print('!! The Data (ceiling) rows are not 1.000. The classifier or the')
