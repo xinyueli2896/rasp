@@ -34,6 +34,7 @@ import argparse
 import csv
 import os
 import sys
+from collections import Counter
 
 import torch
 
@@ -43,7 +44,9 @@ from midi_adapter.cp_results_table import build_entries
 from midi_adapter.evaluate_cp_bass import (ALL_SEEN, UNSEEN, _expected_pc,
                                            _scored_positions, _extract_pc,
                                            _gen_pcs as base_gen_pcs)
+from midi_adapter.evaluate_cp_bass import _save_midi_all_keys as save_base_midi
 from midi_adapter.evaluate_cp_yinyang import _gen_pcs as adapter_gen_pcs
+from midi_adapter.evaluate_cp_yinyang import _save_midi_all_keys as save_adapter_midi
 from midi_adapter.generate_synthetic_bass import COMMON_CHORDS
 from midi_adapter.infer_cp_bass import _prompt_from_key
 
@@ -138,6 +141,30 @@ def data_trial(base, key, args, device, pattern):
     return hits, scored, bars
 
 
+def print_lift(rows, model_label):
+    """How much the prompt moved the output, net of what the model does anyway.
+
+    `continues` alone is confounded: root4 scores highest partly because root4
+    is what these models emit whatever they are shown, which is the same
+    reason `whole` reads 0.000. Lift subtracts that prior:
+
+        lift(X) = P(bar = X | prompt = X) - mean_(Y != X) P(bar = X | prompt = Y)
+
+    Zero means the prompt changed nothing. Positive means the prompt's
+    realisation actually carried.
+    """
+    mine = [r for r in rows if r['model'] == model_label and r['prompt'] != 'random']
+    if len(mine) < 2:
+        return
+    out = []
+    for r in mine:
+        x = r['prompt']
+        others = [o[f'p_{x}'] for o in mine if o['prompt'] != x]
+        r['lift'] = r[f'p_{x}'] - sum(others) / len(others)
+        out.append(f'{x}={r["lift"]:+.3f}')
+    print('              lift:     ' + '  '.join(out))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -157,6 +184,10 @@ def main():
     p.add_argument('--n_trials',       type=int, default=20)
     p.add_argument('--temperature',    type=float, default=0.0)
     p.add_argument('--csv_out', default=None)
+    p.add_argument('--save_midi_dir', default=None,
+                   help='Write one MIDI per key per prompt pattern, so the '
+                        'numbers can be listened to: '
+                        '<dir>/<model>/<prompt>/key_<name>.mid')
     p.add_argument('--device', default=None)
     args = p.parse_args()
 
@@ -201,6 +232,7 @@ def main():
             hu = su = 0
             cont = wf = nbars = 0
             cons_h = cons_n = 0
+            hist: Counter = Counter()
             for key in keys_all:
                 for _ in range(args.n_trials):
                     if is_ad == DATA:
@@ -218,6 +250,7 @@ def main():
                         nbars += 1
                         wf += int(b is not None)
                         cont += int(pat is not None and b == pat)
+                        hist[b or 'none'] += 1
                     # Self-consistency: does the model hold ONE realisation for
                     # the whole generation, whichever it picked? The training
                     # data draws one pattern per song, so this is a property of
@@ -244,6 +277,8 @@ def main():
                 'consistent': cons_h / max(cons_n, 1),
                 'consistent_chance': chance,
                 'wellformed': wfr,
+                **{f'p_{k}': hist[k] / max(nbars, 1)
+                   for k in list(PATTERNS) + ['none']},
             })
             r = rows[-1]
             cstr = ('  --  ' if pat is None else f'{r["continues"]:.3f}')
@@ -251,11 +286,27 @@ def main():
                   f'unseen {r["acc_unseen"]:.3f}  |  continues {cstr}  '
                   f'consistent {r["consistent"]:.3f} (chance {chance:.3f})  '
                   f'well-formed {r["wellformed"]:.3f}')
+            print('              produced: ' + '  '.join(
+                f'{k}={hist[k] / max(nbars, 1):.2f}'
+                for k in list(PATTERNS) + ['none'] if hist[k]))
+
+            if args.save_midi_dir and pat is not None:
+                saver = save_adapter_midi if is_ad is True else save_base_midi
+                if is_ad != DATA:
+                    out = os.path.join(args.save_midi_dir, lbl, pat)
+                    saver(model, args.n_gen_beats, device, args.temperature,
+                          args.n_prompt_beats, out,
+                          max_polyphony=args.max_polyphony,
+                          beats_per_chord=args.beats_per_chord,
+                          pattern=pat, quiet=True)
+
+        print_lift(rows, lbl)
 
     if args.csv_out:
         os.makedirs(os.path.dirname(args.csv_out) or '.', exist_ok=True)
         with open(args.csv_out, 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            fields = list(dict.fromkeys(k for r in rows for k in r))
+            w = csv.DictWriter(f, fieldnames=fields, restval='')
             w.writeheader(); w.writerows(rows)
         print(f'\nwrote {args.csv_out}')
 
@@ -275,6 +326,9 @@ def main():
     print('  consistent     bars matching this generation\'s OWN first bar, i.e. does')
     print('                 it hold one realisation the way the training data does')
     print('  well-formed    bars matching ANY of the five realisations')
+    print('  produced       what the generated bars actually were')
+    print('  lift           P(X | prompt=X) - mean P(X | prompt!=X). continues')
+    print("                 is confounded by the model's own prior; lift is not.")
     print("All three are measured against each bar's own downbeat, so they are "
           "independent\nof whether the root is correct: a clean `walking` on the "
           "wrong chord counts as\npattern-following and fails rule-following.")

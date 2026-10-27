@@ -322,7 +322,8 @@ def _print_error_dist(errors: list) -> None:
 
 @torch.no_grad()
 def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_dir,
-                        max_polyphony: int = 4, beats_per_chord: int = 1) -> None:
+                        max_polyphony: int = 4, beats_per_chord: int = 1,
+                        pattern: str | None = None, quiet: bool = False) -> None:
     import os
     os.makedirs(out_dir, exist_ok=True)
     all_keys = list(range(12))
@@ -330,12 +331,14 @@ def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_di
         prompt  = _prompt_from_key(key, n_prompt_bars=0, device=device,
                                    base=base, n_prompt_beats=n_prompt_beats,
                                    max_polyphony=max_polyphony,
-                                   cycle_unit=('bar' if beats_per_chord > 1 else 'beat'))
+                                   cycle_unit=('bar' if beats_per_chord > 1 else 'beat'),
+                                   pattern=pattern)
         sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                           show_progress=False)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
         decode_output(sampled, base.tokenizer, save_path=path)
-        print(f'  saved {path}')
+        if not quiet:
+            print(f'  saved {path}')
 
 
 # ---------------------------------------------------------------------------
