@@ -48,6 +48,7 @@ from midi_adapter.evaluate_cp_bass import _save_midi_all_keys as save_base_midi
 from midi_adapter.evaluate_cp_yinyang import _gen_pcs as adapter_gen_pcs
 from midi_adapter.evaluate_cp_yinyang import _save_midi_all_keys as save_adapter_midi
 from midi_adapter.bar_patterns import PATTERNS, classify_bar
+from midi_adapter.generate_synthetic_bass import MIXED_PATTERN
 from midi_adapter.infer_cp_bass import _prompt_from_key
 
 @torch.no_grad()
@@ -116,7 +117,7 @@ def print_lift(rows, model_label):
     Zero means the prompt changed nothing. Positive means the prompt's
     realisation actually carried.
     """
-    mine = [r for r in rows if r['model'] == model_label and r['prompt'] != 'random']
+    mine = [r for r in rows if r['model'] == model_label and r['prompt'] in PATTERNS]
     if len(mine) < 2:
         return
     out = []
@@ -178,7 +179,7 @@ def main():
 
     # None sweeps last, as the control: it is the random-pattern prompt every
     # earlier table used.
-    sweep = list(PATTERNS) + [None]
+    sweep = list(PATTERNS) + [MIXED_PATTERN, None]
 
     print()
     print('=' * 60)
@@ -212,7 +213,7 @@ def main():
                     for b in bars:
                         nbars += 1
                         wf += int(b is not None)
-                        cont += int(pat is not None and b == pat)
+                        cont += int(pat in PATTERNS and b == pat)
                         hist[b or 'none'] += 1
                     # Self-consistency: does the model hold ONE realisation for
                     # the whole generation, whichever it picked? The training
@@ -236,7 +237,8 @@ def main():
                 'prompt': pat or 'random',
                 'acc_all': h / max(s, 1),
                 'acc_unseen': hu / max(su, 1),
-                'continues': (cont / nbars) if (pat and nbars) else float('nan'),
+                'continues': (cont / nbars) if (pat in PATTERNS and nbars)
+                             else float('nan'),
                 'consistent': cons_h / max(cons_n, 1),
                 'consistent_chance': chance,
                 'wellformed': wfr,
@@ -244,7 +246,7 @@ def main():
                    for k in list(PATTERNS) + ['none']},
             })
             r = rows[-1]
-            cstr = ('  --  ' if pat is None else f'{r["continues"]:.3f}')
+            cstr = (f'{r["continues"]:.3f}' if pat in PATTERNS else '  --  ')
             print(f'    {r["prompt"]:<9} acc {r["acc_all"]:.3f}  '
                   f'unseen {r["acc_unseen"]:.3f}  |  continues {cstr}  '
                   f'consistent {r["consistent"]:.3f} (chance {chance:.3f})  '

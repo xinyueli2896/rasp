@@ -184,6 +184,8 @@ PATTERNS = ['whole', 'half', 'quarter', 'walking']
 # Patterns that realise ONE chord across a bar. Every one begins on the root,
 # which is what keeps the downbeat a clean target for the rule.
 BAR_PATTERNS = ['root4', 'root2', 'whole', 'half', 'walking']
+# Not a realisation: asks for an independent draw per bar.
+MIXED_PATTERN = 'mixed'
 
 
 def generate_song(
@@ -221,6 +223,10 @@ def generate_song(
     # drawn from a single song, so this keeps the realisation consistent within
     # a sample: the model sees one way of playing a bar and has to apply it to
     # whatever root the rule supplies, rather than a new pattern every bar.
+    # 'mixed' redraws per bar, which is what the data generated before commit
+    # 1d06d93 looks like. Models trained on that data have never seen several
+    # consecutive bars share a realisation, so a multi-bar prompt built from a
+    # single pattern is out of distribution for them.
     song_pattern = pattern if pattern is not None else random.choice(BAR_PATTERNS)
 
     pm   = pretty_midi.PrettyMIDI(initial_tempo=CONSTANT_TEMPO)
@@ -254,8 +260,10 @@ def generate_song(
             bar_root = (key + OFFSETS[b % 4]) % 12
             xf_chords.append([float(bar_start),
                               f'{ROOT_NAMES[bar_root]}:{song_quality}'])
+            bar_pattern = (random.choice(BAR_PATTERNS)
+                           if song_pattern == MIXED_PATTERN else song_pattern)
             bass.notes.extend(_bar_notes(bar_root, song_quality, bar_start,
-                                         song_pattern))
+                                         bar_pattern))
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -409,7 +417,7 @@ def main():
                         'and the bar is realised by a pattern that may use '
                         'chord tones -- the rule fixes harmony, not the notes.')
     p.add_argument('--bar_pattern', type=str, default=None,
-                   choices=BAR_PATTERNS,
+                   choices=BAR_PATTERNS + [MIXED_PATTERN],
                    help='Fix the bar realisation for every song. Default: one '
                         'pattern drawn per SONG, so it is consistent within a '
                         'training window but varies across the dataset. Only '
