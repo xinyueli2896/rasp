@@ -30,6 +30,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from midi_adapter.bar_patterns import PATTERNS, classify_bar
 from midi_adapter.chord_tokenizer import N_QUALITIES, NO_CHORD_TOKEN
 from midi_adapter.generate_synthetic_bass import OFFSETS, SUBBEATS_PER_BAR
 
@@ -59,6 +60,45 @@ def _compliance(roots: list[int | None], spc: int) -> tuple[int, int]:
         total += 1
         hits += int(r == (key + OFFSETS[(t // spc) % 4]) % 12)
     return hits, total
+
+
+def pattern_histogram(prefix: str, lens, max_polyphony: int = 2):
+    """How often each realisation appears, read from the note data.
+
+    The generator draws one pattern per song uniformly from five, so a healthy
+    dataset is ~20% each with nothing unclassified. Checked because the models
+    put an 80-nat penalty on `whole`, and before concluding that is the model's
+    doing it is worth confirming the data contains what we think.
+    """
+    data = torch.load(f'{prefix}.pt')
+    hist = Counter()
+    per_song = Counter()
+    start = 0
+    for L in lens.tolist():
+        song = data[start:start + L]
+        start += L
+        bars = []
+        for b in range(L // SUBBEATS_PER_BAR):
+            pcs = []
+            for j in range(SUBBEATS_PER_BAR):
+                row = song[b * SUBBEATS_PER_BAR + j]
+                # raw CP: slot fields are [program, pitch, dur, velocity];
+                # 255 is pad and program 254 is the end-of-beat marker.
+                pcs.append(None if int(row[0]) >= 128 or int(row[1]) == 255
+                           else int(row[1]) % 12)
+            c = classify_bar(pcs)
+            bars.append(c)
+            hist[c or 'none'] += 1
+        # One pattern per song is the generator's contract; check it holds.
+        per_song['consistent' if len(set(bars)) == 1 else 'MIXED'] += 1
+    n = sum(hist.values())
+    print('  bars  : ' + '  '.join(f'{k}={hist[k] / n:.3f}'
+                                   for k in list(PATTERNS) + ['none']))
+    print(f'  songs : one pattern throughout = '
+          f'{per_song["consistent"]}/{sum(per_song.values())}')
+    if per_song['MIXED']:
+        print(f'  !! {per_song["MIXED"]} songs mix realisations -- the '
+              f'generator should draw one per song')
 
 
 def report(prefix: str) -> bool:
@@ -104,6 +144,11 @@ def report(prefix: str) -> bool:
     print(f'  counts: ' + '  '.join(f'{ROOT_NAMES[k]}={keys[k]}' for k in klist))
     print(f'  cycle : {mode}   (distinct roots per bar = {distinct})')
     print(f'  rule  : per-bar  {bar_acc:.4f}      per-beat {beat_acc:.4f}')
+    if mode == 'bar':
+        try:
+            pattern_histogram(prefix, lens)
+        except Exception as e:                                  # noqa: BLE001
+            print(f'  (pattern histogram unavailable: {type(e).__name__}: {e})')
     if bar_acc < 0.99 and beat_acc < 0.99:
         print('  !! neither rule fits -- this data does not follow '
               '(key + OFFSETS[p]) % 12')

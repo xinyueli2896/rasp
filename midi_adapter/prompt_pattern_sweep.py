@@ -47,70 +47,8 @@ from midi_adapter.evaluate_cp_bass import (ALL_SEEN, UNSEEN, _expected_pc,
 from midi_adapter.evaluate_cp_bass import _save_midi_all_keys as save_base_midi
 from midi_adapter.evaluate_cp_yinyang import _gen_pcs as adapter_gen_pcs
 from midi_adapter.evaluate_cp_yinyang import _save_midi_all_keys as save_adapter_midi
-from midi_adapter.generate_synthetic_bass import COMMON_CHORDS
+from midi_adapter.bar_patterns import PATTERNS, classify_bar
 from midi_adapter.infer_cp_bass import _prompt_from_key
-
-# Semitones above the bar's root; None is a beat with no onset. Each name maps
-# to every shape that realisation can take.
-#
-# Only `walking` has more than one. _bar_notes walks it as
-# tones[i % len(tones)], and `tones` is COMMON_CHORDS[quality] for a quality
-# drawn at random per song -- so a minor bar is 0 3 7 0 and a seventh is
-# 0 4 7 10. Matching only the major shape scored four fifths of walking bars
-# as unclassifiable. The other four patterns use the root and tones[2], which
-# is 7 in every quality, so they do not vary.
-_WALK = [[t[i % len(t)] for i in range(4)] for t in COMMON_CHORDS.values()]
-
-PATTERNS = {
-    'root4':   [[0, 0, 0, 0]],
-    'root2':   [[0, None, 0, None]],
-    'whole':   [[0, None, None, None]],
-    'half':    [[0, None, 7, None]],
-    'walking': _WALK,
-}
-
-
-def classify_bar(pcs):
-    """Which of the five realisations this bar's shape is, or None.
-
-    Measured against the bar's own downbeat, so a correctly-shaped bar on the
-    wrong chord still classifies. A bar whose downbeat has no note cannot be
-    referenced and counts as unclassified.
-    """
-    if not pcs or pcs[0] is None:
-        return None
-    r = pcs[0]
-    steps = [None if p is None else (p - r) % 12 for p in pcs]
-    for name, shapes in PATTERNS.items():
-        if steps in shapes:
-            return name
-    return None
-
-
-@torch.no_grad()
-def trial(model, is_adapter, key, args, device, pattern):
-    """(hits, scored, [bar classification]) for one generation."""
-    gen = adapter_gen_pcs if is_adapter else base_gen_pcs
-    bpc = args.beats_per_chord
-    n_p = args.n_prompt_beats
-    total = n_p + args.n_gen_beats
-
-    pcs = gen(model, key, args.n_gen_beats, device, args.temperature, n_p,
-              max_polyphony=args.max_polyphony, beats_per_chord=bpc,
-              pattern=pattern)
-
-    hits = scored = 0
-    for t in _scored_positions(n_p, total, bpc):
-        pc = pcs[t - n_p]
-        scored += 1
-        hits += int(pc is not None and pc == _expected_pc(key, t, bpc))
-
-    # pcs[0] is absolute beat n_p, which is a bar boundary because n_p is a
-    # multiple of bpc (checked in main), so bars line up with no offset.
-    bars = [classify_bar(pcs[i:i + bpc])
-            for i in range(0, len(pcs) - bpc + 1, bpc)]
-    return hits, scored, bars
-
 
 @torch.no_grad()
 def data_trial(base, key, args, device, pattern):
