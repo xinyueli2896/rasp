@@ -146,6 +146,17 @@ def _extract_pc(tok: torch.Tensor, tokenizer) -> int | None:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
+# Prompts are seeded by (key, trial) so every model is scored on and writes
+# MIDI from the SAME prompts. Without this each stem drew fresh realisations,
+# which left the accuracy comparison unpaired and made side-by-side MIDI
+# compare different prompts rather than different models.
+PROMPT_SEED_BASE = 20261028
+
+
+def prompt_seed(key: int, trial: int = 0) -> int:
+    return PROMPT_SEED_BASE + 1000 * key + trial
+
+
 @torch.no_grad()
 def _gen_pcs(base: RoFormerSymbolicTransformer,
              key: int, n_gen: int,
@@ -153,7 +164,8 @@ def _gen_pcs(base: RoFormerSymbolicTransformer,
              n_prompt_beats: int = 1,
              max_polyphony: int = 4,
              beats_per_chord: int = 1,
-             pattern: str | None = None) -> list[int | None]:
+             pattern: str | None = None,
+             seed: int | None = None) -> list[int | None]:
     """Generate n_gen beats from an n_prompt_beats prompt and return pitch classes.
 
     max_polyphony and beats_per_chord must match the TRAINING data, or the
@@ -166,7 +178,7 @@ def _gen_pcs(base: RoFormerSymbolicTransformer,
                                base=base, n_prompt_beats=n_prompt_beats,
                                max_polyphony=max_polyphony,
                                cycle_unit=('bar' if beats_per_chord > 1 else 'beat'),
-                               pattern=pattern)
+                               pattern=pattern, seed=seed)
     sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                       show_progress=False)
     return [_extract_pc(t, base.tokenizer) for t in sampled[n_prompt_beats:]]
@@ -195,9 +207,10 @@ def rule_following_acc(
 
     for key in keys:
         trial_accs = []
-        for _ in range(n_trials):
+        for _trial in range(n_trials):
             pcs = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats,
-                           max_polyphony, beats_per_chord)
+                           max_polyphony, beats_per_chord,
+                           seed=prompt_seed(key, _trial))
             total = n_prompt_beats + len(pcs)
             scored = _scored_positions(n_prompt_beats, total, beats_per_chord)
             n_correct = 0
@@ -332,7 +345,8 @@ def _save_midi_all_keys(base, n_gen, device, temperature, n_prompt_beats, out_di
                                    base=base, n_prompt_beats=n_prompt_beats,
                                    max_polyphony=max_polyphony,
                                    cycle_unit=('bar' if beats_per_chord > 1 else 'beat'),
-                                   pattern=pattern)
+                                   pattern=pattern,
+                                   seed=prompt_seed(key))
         sampled = _sample(base, prompt, n_prompt_beats + n_gen, temperature, device,
                           show_progress=False)
         path = os.path.join(out_dir, f'key_{ROOT_NAMES[key]}.mid')
