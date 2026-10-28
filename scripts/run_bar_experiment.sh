@@ -131,7 +131,11 @@ eval_seed () {
   # downbeats -- only the decoding changes, so the two tables are directly
   # comparable and their difference is the cost of sampling.
   for t in $TEMPS; do
-    tag="T${t}"
+    # The prompt length goes in the name too. Protocols differing only in
+    # prompt length produce files that are otherwise identical in name, and a
+    # MIDI folder called s1/T0 says nothing about how much context the model
+    # was given.
+    tag="p${PROBE_PROMPT}_T${t}"
     args=(--base_ckpt "$base" --ckpt_dir "$CKPT_DIR"
           --runs "cp_yy_frozen_s$sd" "cp_yy_lora_s$sd" "cp_yy_trainar_s$sd"
                  "cp_yy_scratch_s$sd" "cp_yy_noinput_mlp_aux1_s$sd"
@@ -186,24 +190,29 @@ done
 for t in $TEMPS; do
   jsons=""
   for sd in $SEEDS; do
-    f="$LOG_DIR/table_s${sd}_T${t}.json"
+    f="$LOG_DIR/table_s${sd}_p${PROBE_PROMPT}_T${t}.json"
     [[ -f "$f" ]] && jsons="$jsons $f"
   done
   if [[ -n "$jsons" ]]; then
     echo
-    echo "=== combined across seeds, temperature $t ==="
+    echo "=== combined across seeds, ${PROBE_PROMPT}-beat prompt, temperature $t ==="
     python -m midi_adapter.aggregate_seeds $jsons \
-        2>&1 | tee "$LOG_DIR/table_all_seeds_T${t}.log"
+        2>&1 | tee "$LOG_DIR/table_all_seeds_p${PROBE_PROMPT}_T${t}.log"
   else
-    echo "no per-seed JSON found for temperature $t -- combined table skipped" >&2
+    echo "no per-seed JSON for prompt=${PROBE_PROMPT} temperature $t -- skipped" >&2
   fi
 done
 
 echo
 echo "all seeds done."
 for sd in $SEEDS; do
-  for t in $TEMPS; do echo "  per seed : $LOG_DIR/table_s${sd}_T${t}.log"; done
+  for t in $TEMPS; do
+    echo "  per seed : $LOG_DIR/table_s${sd}_p${PROBE_PROMPT}_T${t}.log"
+  done
 done
-for t in $TEMPS; do echo "  combined : $LOG_DIR/table_all_seeds_T${t}.log"; done
-[[ -n "$MIDI_DIR" ]] && echo "  midi     : $MIDI_DIR/s<seed>/T<temp>/<model>/"
+for t in $TEMPS; do
+  echo "  combined : $LOG_DIR/table_all_seeds_p${PROBE_PROMPT}_T${t}.log"
+done
+[[ -n "$MIDI_DIR" ]] && \
+  echo "  midi     : $MIDI_DIR/s<seed>/p${PROBE_PROMPT}_T<temp>/<model>/"
 true
