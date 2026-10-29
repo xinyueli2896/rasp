@@ -81,6 +81,8 @@ DURATION_BOUNDARIES = (DURATION_TEMPLATES[1:] + DURATION_TEMPLATES[:-1]) / 2.0
 # Bass range: one octave only (C2=36 … B2=47) so every pitch class maps to
 # exactly one MIDI note — no octave ambiguity during training or evaluation.
 BASS_MIN, BASS_MAX = 36, 47
+# v3 octave variation may place a note an octave either side of that band.
+OCTAVE_MIN, OCTAVE_MAX = 24, 59          # C1 .. B3
 
 ROOT_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -91,6 +93,16 @@ COMMON_CHORDS: dict[str, list[int]] = {
     '7':    [0, 4, 7, 10],
     'maj7': [0, 4, 7, 11],
     'min7': [0, 3, 7, 10],
+}
+
+# Parent scale per quality, for picking non-chord tones that still belong to
+# the harmony's key rather than arbitrary semitones.
+SCALES: dict[str, list[int]] = {
+    'maj':  [0, 2, 4, 5, 7, 9, 11],
+    'min':  [0, 2, 3, 5, 7, 8, 10],
+    '7':    [0, 2, 4, 5, 7, 9, 10],      # mixolydian
+    'maj7': [0, 2, 4, 5, 7, 9, 11],
+    'min7': [0, 2, 3, 5, 7, 8, 10],
 }
 
 # Exactly the RASP rule offsets: token[i] = (x + OFFSETS[i%4]) % 12
@@ -116,6 +128,45 @@ def _chord_tones(root_semitone: int, quality: str) -> list[int]:
     tones = [(t if t <= BASS_MAX else t - 12) for t in tones]
     tones = [(t if t >= BASS_MIN else t + 12) for t in tones]
     return tones
+
+
+def _non_chord_tones(root_semitone: int, quality: str) -> list[int]:
+    """Scale tones of the bar's harmony that are NOT chord tones."""
+    chord = set(COMMON_CHORDS[quality])
+    root = _bass_root(root_semitone)
+    out = []
+    for i in SCALES[quality]:
+        if i in chord:
+            continue
+        t = root + i
+        t = t - 12 if t > BASS_MAX else t
+        t = t + 12 if t < BASS_MIN else t
+        out.append(t)
+    return out
+
+
+def _vary_bar(notes, bar_start: int, root_semitone: int, quality: str,
+              octave_prob: float, nct_prob: float) -> None:
+    """Apply v3 variation in place: octave displacement and non-chord tones.
+
+    The DOWNBEAT keeps the root's pitch class, always. Evaluation reads the
+    key from beat 0 and scores each bar's downbeat against
+    (key + OFFSETS[p]) % 12, so a non-chord tone there would break both the
+    key extraction and the metric. An octave displacement is safe anywhere --
+    it does not change the pitch class -- so the downbeat may move register.
+    """
+    if not (octave_prob or nct_prob):
+        return
+    t0 = bar_start * SECONDS_PER_SUBBEAT
+    ncts = _non_chord_tones(root_semitone, quality)
+    for n in notes:
+        on_downbeat = abs(n.start - t0) < 1e-9
+        if ncts and not on_downbeat and random.random() < nct_prob:
+            n.pitch = int(random.choice(ncts))
+        if random.random() < octave_prob:
+            shifted = n.pitch + random.choice((-12, 12))
+            if OCTAVE_MIN <= shifted <= OCTAVE_MAX:
+                n.pitch = int(shifted)
 
 
 def _make_note(pitch, start, duration_subbeats, velocity=70):
@@ -196,6 +247,8 @@ def generate_song(
     bass_instrument_program: int        = 33,     # Electric Bass, finger
     cycle_unit:              str        = 'beat',
     pattern:                 str | None = None,   # None = random once per song
+    octave_prob:             float      = 0.0,    # v3: octave displacement
+    nct_prob:                float      = 0.0,    # v3: non-chord tones
 ) -> tuple[pretty_midi.PrettyMIDI, list[list]]:
     """
     Generate one song following the exact RASP rule:
@@ -239,6 +292,11 @@ def generate_song(
 
     if cycle_unit not in ('beat', 'bar'):
         raise ValueError(f"cycle_unit must be 'beat' or 'bar', got {cycle_unit!r}")
+    if nct_prob and cycle_unit == 'beat':
+        # Per-beat data scores EVERY beat against the rule, so no beat is free
+        # to carry a non-chord tone. Octave variation is still fine there.
+        raise ValueError('nct_prob requires --cycle_unit bar; in beat mode '
+                         'every beat is a scored downbeat')
 
     for b in range(n_bars):
         bar_start = b * SUBBEATS_PER_BAR
@@ -250,7 +308,9 @@ def generate_song(
                 beat_start = bar_start + j * beat_step
                 chord_str  = f'{ROOT_NAMES[beat_root]}:{song_quality}'
                 xf_chords.append([float(beat_start), chord_str])
-            bass.notes.extend(_bar_notes(key, song_quality, bar_start, 'quarter'))
+            _beat_notes = _bar_notes(key, song_quality, bar_start, 'quarter')
+            _vary_bar(_beat_notes, bar_start, key, song_quality, octave_prob, 0.0)
+            bass.notes.extend(_beat_notes)
         else:
             # One chord per BAR: the root changes every bar, so a cycle spans
             # four bars (16 beats). The bar is realised by a pattern which may
@@ -262,8 +322,10 @@ def generate_song(
                               f'{ROOT_NAMES[bar_root]}:{song_quality}'])
             bar_pattern = (random.choice(BAR_PATTERNS)
                            if song_pattern == MIXED_PATTERN else song_pattern)
-            bass.notes.extend(_bar_notes(bar_root, song_quality, bar_start,
-                                         bar_pattern))
+            _bn = _bar_notes(bar_root, song_quality, bar_start, bar_pattern)
+            _vary_bar(_bn, bar_start, bar_root, song_quality,
+                      octave_prob, nct_prob)
+            bass.notes.extend(_bn)
 
     pm.instruments.append(bass)
     return pm, xf_chords
@@ -326,6 +388,8 @@ def generate_dataset(
     n_bars:        int       = 32,
     max_polyphony: int       = 4,
     allowed_keys:  list[int] | None = None,
+    octave_prob:   float = 0.0,
+    nct_prob:      float = 0.0,
     seed:          int       = 42,
     write_midi:    bool      = True,
     cycle_unit:    str       = 'beat',
@@ -361,6 +425,8 @@ def generate_dataset(
         pm, xf_chords = generate_song(
             n_bars       = n_bars,
             allowed_keys = allowed_keys,
+            octave_prob  = octave_prob,
+            nct_prob     = nct_prob,
             cycle_unit   = cycle_unit,
             pattern      = pattern,
         )
@@ -428,6 +494,14 @@ def main():
                         'dataset on disk.')
     p.add_argument('--keys',          type=int,   nargs='*', default=None,
                    help='Allowed root semitones (0-11). Default: all 12.')
+    p.add_argument('--octave_prob',   type=float, default=0.0,
+                   help='v3: chance each note is displaced an octave. The '
+                        'downbeat may move register -- pitch class is '
+                        'unchanged, so the rule metric is unaffected.')
+    p.add_argument('--nct_prob',      type=float, default=0.0,
+                   help='v3: chance a NON-downbeat note becomes a non-chord '
+                        'scale tone. Requires --cycle_unit bar; the downbeat '
+                        'always keeps the root.')
     p.add_argument('--seed',          type=int,   default=42)
     args = p.parse_args()
 
@@ -445,6 +519,8 @@ def main():
         cycle_unit    = args.cycle_unit,
         pattern       = args.bar_pattern,
         allowed_keys  = args.keys,
+        octave_prob   = args.octave_prob,
+        nct_prob      = args.nct_prob,
         seed          = args.seed,
     )
 

@@ -73,32 +73,64 @@ def pattern_histogram(prefix: str, lens, max_polyphony: int = 2):
     data = torch.load(f'{prefix}.pt')
     hist = Counter()
     per_song = Counter()
+    octaves = Counter()
+    db_ok = db_n = 0
     start = 0
     for L in lens.tolist():
         song = data[start:start + L]
         start += L
-        bars = []
+        bars, pitches = [], []
         for b in range(L // SUBBEATS_PER_BAR):
             pcs = []
             for j in range(SUBBEATS_PER_BAR):
                 row = song[b * SUBBEATS_PER_BAR + j]
                 # raw CP: slot fields are [program, pitch, dur, velocity];
                 # 255 is pad and program 254 is the end-of-beat marker.
-                pcs.append(None if int(row[0]) >= 128 or int(row[1]) == 255
-                           else int(row[1]) % 12)
+                dead = int(row[0]) >= 128 or int(row[1]) == 255
+                pcs.append(None if dead else int(row[1]) % 12)
+                if not dead:
+                    pitches.append(int(row[1]))
             c = classify_bar(pcs)
             bars.append(c)
             hist[c or 'none'] += 1
         # One pattern per song is the generator's contract; check it holds.
         per_song['consistent' if len(set(bars)) == 1 else 'MIXED'] += 1
+        for p in pitches:
+            octaves[p // 12] += 1
+
+        # The downbeat must carry the bar's root pitch class -- in whatever
+        # octave, and whatever the other beats do. Evaluation reads the key
+        # from beat 0 and scores every downbeat against
+        # (key + OFFSETS[p]) % 12, so this is the metric's precondition and
+        # the one invariant v3's octave and non-chord-tone variation must not
+        # break. Classification into the five realisations does NOT survive
+        # non-chord tones, so for v3 data this is the line that matters.
+        key0 = None
+        for b in range(L // SUBBEATS_PER_BAR):
+            row = song[b * SUBBEATS_PER_BAR]
+            if int(row[0]) >= 128 or int(row[1]) == 255:
+                continue
+            pc = int(row[1]) % 12
+            if key0 is None:
+                key0 = pc                       # bar 0 is phase 0 -> the key
+            db_n += 1
+            db_ok += int(pc == (key0 + OFFSETS[b % 4]) % 12)
+
     n = sum(hist.values())
     print('  bars  : ' + '  '.join(f'{k}={hist[k] / n:.3f}'
                                    for k in list(PATTERNS) + ['none']))
     print(f'  songs : one pattern throughout = '
           f'{per_song["consistent"]}/{sum(per_song.values())}')
+    print(f'  downbt: is the bar root = {db_ok}/{db_n} = '
+          f'{db_ok / max(db_n, 1):.4f}')
+    print(f'  octave: ' + '  '.join(f'{o}={c / sum(octaves.values()):.3f}'
+                                    for o, c in sorted(octaves.items())))
+    if db_ok != db_n:
+        print('  !! some downbeats are not the bar root -- the key cannot be '
+              'read from beat 0 and the accuracy metric is invalid')
     if per_song['MIXED']:
-        print(f'  !! {per_song["MIXED"]} songs mix realisations -- the '
-              f'generator should draw one per song')
+        print(f'  (songs mix realisations -- per-bar data, or v3 non-chord '
+              f'tones defeating the five-template classifier)')
 
 
 def report(prefix: str) -> bool:

@@ -35,6 +35,19 @@ MAX_POLY="${MAX_POLY:-2}"
 PRE_STEP="${PRE_STEP:-004000}"
 PRE_NAME="cp_bass_pre_${TAG}"
 
+# --- v3 surface variation ---------------------------------------------------
+# OCTAVE_PROB  chance each note is displaced an octave. The downbeat may move
+#              register; its pitch class does not change, so the rule metric
+#              is untouched.
+# NCT_PROB     chance a NON-downbeat note becomes a non-chord scale tone.
+# BAR_PATTERN  empty draws one realisation per SONG (the latent); "mixed"
+#              redraws per bar, which is what bass_*_bar holds.
+#
+# Both probabilities default to 0, so omitting them reproduces v2 exactly.
+OCTAVE_PROB="${OCTAVE_PROB:-0}"
+NCT_PROB="${NCT_PROB:-0}"
+BAR_PATTERN="${BAR_PATTERN:-}"
+
 # The bar-cycle geometry. A cycle is 16 beats, so windows must start on a
 # multiple of 16 or the rule model's phase is wrong for the whole window.
 TRAIN_LENGTH="${TRAIN_LENGTH:-32}"
@@ -49,9 +62,13 @@ if has data; then
   gen () {   # gen <name> <n_songs> <keys...>
     local name="$1" n="$2"; shift 2
     echo "--- $name : keys $* ---"
+    local extra=()
+    [[ "$OCTAVE_PROB" != "0" ]] && extra+=(--octave_prob "$OCTAVE_PROB")
+    [[ "$NCT_PROB"    != "0" ]] && extra+=(--nct_prob "$NCT_PROB")
+    [[ -n "$BAR_PATTERN"     ]] && extra+=(--bar_pattern "$BAR_PATTERN")
     python -m midi_adapter.generate_synthetic_bass \
       --n_songs "$n" --n_bars "$N_BARS" --max_polyphony "$MAX_POLY" \
-      --cycle_unit bar --no_midi --keys "$@" \
+      --cycle_unit bar --no_midi --keys "$@" "${extra[@]}" \
       --out_dir "data/bass_${name}_${TAG}" --out_pt "data/bass_${name}_${TAG}" \
       || { echo "generation failed for $name" >&2; exit 1; }
   }
@@ -70,17 +87,29 @@ if has data; then
       "data/bass_unseen_${TAG}" "data/bass_all_${TAG}" \
       2>&1 | tee "verify_${TAG}.log"
 
-  # Hard gate: the whole point of this run is the per-song latent. If any song
-  # mixes realisations the data is the old kind and everything downstream is
-  # measuring nothing.
-  if grep -q 'mix realisations' "verify_${TAG}.log"; then
+  # The downbeat must be the bar's root everywhere, or the key cannot be read
+  # from beat 0 and every accuracy number is meaningless. This holds for v2 and
+  # v3 alike and is never negotiable.
+  if grep -q 'some downbeats are not the bar root' "verify_${TAG}.log"; then
+    echo >&2
+    echo "ABORT: some downbeats are not the bar root." >&2
+    exit 1
+  fi
+
+  # Per-song realisation is only expected when BAR_PATTERN is unset. Under v3
+  # the five-template classifier also fails on non-chord tones, so the gate
+  # would misfire; skip it there.
+  if [[ -n "$BAR_PATTERN" || "$NCT_PROB" != "0" ]]; then
+    echo "data ok: downbeats are the bar root (per-song check skipped)"
+  elif grep -q 'mix realisations' "verify_${TAG}.log"; then
     echo >&2
     echo "ABORT: songs mix realisations -- this is the pre-1d06d93 behaviour." >&2
     echo "The generator should draw one pattern per song. Nothing downstream" >&2
     echo "is worth running until that holds." >&2
     exit 1
+  else
+    echo "data ok: one realisation per song"
   fi
-  echo "data ok: one realisation per song"
 fi
 
 # --- pretrain ---------------------------------------------------------------
