@@ -206,6 +206,7 @@ def _report_load(missing: list, unexpected: list) -> None:
     # line -- which the caller already prints. Warning about those is noise
     # that looks like a failure.
     CONFIG_BUFFERS = ('rule_subbeats_per_chord', 'rule_key_select_first',
+                      'rule_rate_bar',
                       'strict_causal')
     missing = [k for k in missing
                if not any(k.endswith(c) for c in CONFIG_BUFFERS)]
@@ -235,6 +236,7 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                rule_enc_hidden: int = 64,
                strict_causal: bool = False,
                rule_subbeats_per_chord: int = 1,
+               rule_rate: str = 'beat',
                rule_key_select: str = 'phase0') -> CPYinyangTransformer:
     max_lr = 5e-5 if model_size >= 2 else 1e-4
     base  = RoFormerSymbolicTransformer(size=model_size, max_lr=max_lr, with_velocity=False)
@@ -250,6 +252,7 @@ def load_model(base_ckpt: str | None, adapter_ckpt: str,
                                  rule_enc_hidden=rule_enc_hidden,
                                  strict_causal=strict_causal,
                                  rule_subbeats_per_chord=rule_subbeats_per_chord,
+                                 rule_rate=rule_rate,
                                  rule_key_select=rule_key_select)
 
     if not (adapter_ckpt and os.path.exists(adapter_ckpt)):

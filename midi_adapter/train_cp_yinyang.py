@@ -353,6 +353,7 @@ def main(args):
         rule_enc_hidden   = args.rule_enc_hidden,
         rule_key_select   = args.rule_key_select,
         rule_subbeats_per_chord = args.beats_per_chord,
+        rule_rate               = args.rule_rate,
         strict_causal     = args.strict_causal,
         gate_init         = args.gate_init,
         freeze_base_eval  = args.freeze_base_eval,
@@ -633,6 +634,13 @@ def get_args():
                         'are not learning but does force the adapter to '
                         'tolerate noisy host states. Whether that helps is '
                         'open -- A/B it. Incompatible with --unfreeze_base.')
+    p.add_argument('--rule_rate', type=str, default='beat',
+                   choices=['beat', 'bar'],
+                   help="'beat' gives the adapter one key per beat, which is "
+                        "the same root repeated beats_per_chord times. 'bar' "
+                        "gives one key per bar at the first position its root "
+                        "is known, which also drops the zeroed index-0 row "
+                        "from the attention.")
     p.add_argument('--strict_causal',      action='store_true',
                    help='Mask the adapter cross-attention to j < t instead of '
                         'j <= t, in training AND generation. By default the '

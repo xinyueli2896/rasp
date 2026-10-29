@@ -187,12 +187,22 @@ class CPYinyangCrossAttention(nn.Module):
         ar_hidden:   torch.Tensor,   # (B, T_q, d_model)
         rule_hidden: torch.Tensor,   # (B, T_k, rule_d_model)
         sub_offset:  int = 0,        # absolute beat index of ar_hidden[:, 0, :]
+        key_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """key_positions gives the absolute beat index of each key row.
+
+        None means one key per beat at its own index, which is the per-beat
+        rule rate and the original behaviour. A per-BAR rate passes the beat
+        index of each bar's key instead, so queries and keys stay on one axis
+        and the causal mask keeps its meaning.
+        """
         B, T_q, _ = ar_hidden.shape
         _, T_k, _ = rule_hidden.shape
+        if key_positions is None:
+            key_positions = torch.arange(T_k, device=ar_hidden.device)
 
         Q = self.q_proj(ar_hidden)   + self.pe[:, sub_offset:sub_offset + T_q, :]
-        K = self.k_proj(rule_hidden) + self.pe[:, :T_k, :]
+        K = self.k_proj(rule_hidden) + self.pe[:, key_positions, :]
         V = self.v_proj(rule_hidden)
 
         Q = Q.view(B, T_q, self.n_heads, self.head_dim).transpose(1, 2)
@@ -213,7 +223,7 @@ class CPYinyangCrossAttention(nn.Module):
         #     t-4 is a valid, non-zero row, so the first few generated beats
         #     have no same-phase reference at all.
         abs_q = torch.arange(sub_offset, sub_offset + T_q, device=ar_hidden.device)
-        k_rng = torch.arange(T_k, device=ar_hidden.device)
+        k_rng = key_positions
         causal = (abs_q.unsqueeze(1) > k_rng.unsqueeze(0)
                   if bool(self.strict_causal)
                   else abs_q.unsqueeze(1) >= k_rng.unsqueeze(0))       # (T_q, T_k)
@@ -266,6 +276,7 @@ class CPYinyangTransformer(nn.Module):
         rule_enc_hidden:  int  = 64,
         rule_key_select:  str  = 'phase0',
         rule_subbeats_per_chord: int = 1,
+        rule_rate:        str  = 'beat',       # 'beat' | 'bar'
         strict_causal:    bool = False,
         gate_init:        float = 0.0,
         freeze_base_eval: bool = False,
@@ -291,6 +302,14 @@ class CPYinyangTransformer(nn.Module):
                              torch.tensor(int(rule_subbeats_per_chord)))
         self.register_buffer('rule_key_select_first',
                              torch.tensor(rule_key_select == 'first'))
+        # 'bar' hands the adapter one key per BAR instead of one per beat.
+        # rule_hidden[t] carries the root of bar t//spc, so within a bar the
+        # rows are identical in content and only their positions differ --
+        # the per-beat stream is the same hint repeated spc times.
+        if rule_rate not in ('beat', 'bar'):
+            raise ValueError(f"rule_rate must be 'beat' or 'bar', got {rule_rate!r}")
+        self.register_buffer('rule_rate_bar',
+                             torch.tensor(rule_rate == 'bar'))
         self.bidirectional    = bidirectional
         self.encoder_injected = encoder_injected
 
@@ -447,6 +466,28 @@ class CPYinyangTransformer(nn.Module):
         enc_out = self.rule_input_encoder(cur_pc)                # (B, T, N_ROOTS=12)
         return enc_out, cur_pc                                   # (B,T,12), (B,T)
 
+    def _bar_key_index(self, T: int, device) -> torch.Tensor:
+        """Beat index of each bar's key, for rule_rate='bar'.
+
+        rule_hidden[t] holds the root of bar t//spc, so bar b is readable from
+        t = spc*b onward -- except bar 0, whose row at t=0 is deliberately
+        zeroed (nothing is knowable before the first beat). Its first informative
+        row is t=1. A plain stride-spc subsample would keep that zero row and
+        drop 1,2,3, which would delete bar 0's root for EVERY query rather than
+        just the one at t=0.
+        """
+        spc = int(self.rule_subbeats_per_chord)
+        idx = [min(1, T - 1) if b == 0 else b * spc
+               for b in range((T + spc - 1) // spc)]
+        return torch.tensor([i for i in idx if i < T], device=device)
+
+    def _rule_keys(self, rule_hidden: torch.Tensor):
+        """(keys, key_positions) for the configured rule rate."""
+        if rule_hidden is None or not bool(self.rule_rate_bar):
+            return rule_hidden, None
+        idx = self._bar_key_index(rule_hidden.shape[1], rule_hidden.device)
+        return rule_hidden.index_select(1, idx), idx
+
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
 
@@ -530,6 +571,8 @@ class CPYinyangTransformer(nn.Module):
         else:
             rule_hidden = self._rule_hidden(x)
 
+        rule_hidden, rule_key_pos = self._rule_keys(rule_hidden)
+
         mask = base.buffered_future_mask(h)
 
         # RoFormer applies rotary embeddings ONLY when sinusoidal_pos is passed
@@ -549,7 +592,8 @@ class CPYinyangTransformer(nn.Module):
             if (i + 1) % self.n_skip == 0:
                 adapter_idx = (i + 1) // self.n_skip - 1
                 rule_h = self.ar_to_rule[adapter_idx](h) if self.bidirectional else rule_hidden
-                h = h + self.yinyang_attn[adapter_idx](h, rule_h, sub_offset=0)
+                h = h + self.yinyang_attn[adapter_idx](
+                    h, rule_h, sub_offset=0, key_positions=rule_key_pos)
 
         return base.local_decode(h, emb)
 
@@ -596,6 +640,8 @@ class CPYinyangTransformer(nn.Module):
         else:
             rule_hidden = None
 
+        rule_hidden, rule_key_pos = self._rule_keys(rule_hidden)
+
         # Encode seed subbeats
         h_seed, _ = base.local_encode(x)
         h_seed = h_seed.view(batch_size, seed_len, base.hidden_size)
@@ -628,7 +674,8 @@ class CPYinyangTransformer(nn.Module):
                         # 0, so the host's self-attention at the last position
                         # reads CORRECTED earlier beats, as it did in training.
                         h_out = h_out + self.yinyang_attn[adapter_idx](
-                            h_out, rule_h, sub_offset=0)
+                            h_out, rule_h, sub_offset=0,
+                            key_positions=rule_key_pos)
                     else:
                         # Legacy path, kept only to reproduce numbers measured
                         # before the mismatch was found. Correcting the last
@@ -640,7 +687,8 @@ class CPYinyangTransformer(nn.Module):
                         # cp_yy_frozen this cost 0.500 accuracy on unseen keys
                         # (0.348 vs 0.848) and 0.228 overall.
                         correction = self.yinyang_attn[adapter_idx](
-                            h_out[:, -1:, :], rule_h, sub_offset=i
+                            h_out[:, -1:, :], rule_h, sub_offset=i,
+                            key_positions=rule_key_pos
                         )
                         h_out = torch.cat([h_out[:, :-1, :], h_out[:, -1:, :] + correction], dim=1)
 

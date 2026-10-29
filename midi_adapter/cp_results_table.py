@@ -126,6 +126,9 @@ def inspect(ckpt_path: str) -> dict:
                 if k.endswith('rule_subbeats_per_chord')), None)
     if spc is not None:
         info['rule_subbeats_per_chord'] = int(spc.item())
+    rr = next((v for k, v in sd.items() if k.endswith('rule_rate_bar')), None)
+    if rr is not None:
+        info['rule_rate'] = 'bar' if bool(rr.item()) else 'beat'
     ks = next((v for k, v in sd.items()
                if k.endswith('rule_key_select_first')), None)
     if ks is not None:
@@ -254,7 +257,8 @@ def build_entries(args, device):
         print(f'  {"":<26} rule_mode={info["rule_mode"]} view={info["rule_view"]} '
               f'lora_rank={info["lora_rank"]} rule_input={info["rule_input"]} '
               f'n_skip={n_skip} strict_causal={info["strict_causal"]} '
-              f'spc={info.get("rule_subbeats_per_chord", args.beats_per_chord)}'
+              f'spc={info.get("rule_subbeats_per_chord", args.beats_per_chord)} '
+              f'rate={info.get("rule_rate", "beat")}'
               + (f' enc={info["enc"]}' if info['enc'] else ''))
         model = load_adapter_model(
             args.base_ckpt, c, args.model_size, args.adapter_rank, n_skip,
@@ -271,6 +275,7 @@ def build_entries(args, device):
             # a different rule: at 1 the channel emits the per-beat cycle
             # [6,11,1,6,...] where the adapter learned the per-bar
             # [6,6,6,6,11,11,11,11,...].
+            rule_rate = info.get('rule_rate', 'beat'),
             rule_subbeats_per_chord = info.get('rule_subbeats_per_chord',
                                                args.beats_per_chord),
             rule_key_select         = info.get('rule_key_select',
