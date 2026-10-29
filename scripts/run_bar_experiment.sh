@@ -51,7 +51,11 @@ export UNSEEN_DATA="${UNSEEN_DATA:-data/bass_unseen_bar.pt}"
 export CKPT_DIR="${CKPT_DIR:-checkpoints_bar}"
 export LOG_DIR="${LOG_DIR:-logs_bar}"
 export N_SKIP="${N_SKIP:-1}"
-export KEY_SELECT="${KEY_SELECT:-first}"     # required: phase0 would average a whole bar
+export KEY_SELECT="${KEY_SELECT:-first}"  # required: phase0 would average a whole bar
+# 'bar' gives the adapter one key per bar instead of the same hint at every
+# beat -- the v2_align variant. Recovered from the checkpoint at evaluation,
+# so the tables need no matching flag.
+export RULE_RATE="${RULE_RATE:-beat}"
 export STRICT_CAUSAL="${STRICT_CAUSAL:-0}"
 export LORA_RANK="${LORA_RANK:-16}"
 export GATE_INIT="${GATE_INIT:-0.0}"

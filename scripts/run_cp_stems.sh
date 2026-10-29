@@ -44,6 +44,11 @@ N_SKIP="${N_SKIP:-1}"
 #                      beat t is withheld and the same-phase row at t-4 must
 #                      be used instead.
 KEY_SELECT="${KEY_SELECT:-phase0}"
+#   RULE_RATE=bar      one adapter key per BAR, placed at the first beat each
+#                      bar's root is known, instead of the same hint repeated
+#                      at every beat. Also drops the zeroed index-0 row from
+#                      the attention. 'beat' (default) is the original.
+RULE_RATE="${RULE_RATE:-beat}"
 STRICT_CAUSAL="${STRICT_CAUSAL:-0}"
 #   SEED=<n>           adapter seed; pass a distinct RUN_SUFFIX per seed so
 #                      the runs do not share a checkpoint directory.
@@ -83,7 +88,8 @@ SAMPLE_STEP=$(( 4 * BEATS_PER_CHORD ))
 # model_size and the wandb project are fixed, not overridable: every run in
 # this experiment is size 1 and belongs in the cp_bass project, and a stem
 # that quietly differed on either would not be comparable to the rest.
-RULE_OPTS=(--rule_key_select "$KEY_SELECT" --seed "$SEED" --gate_init "$GATE_INIT"
+RULE_OPTS=(--rule_key_select "$KEY_SELECT" --rule_rate "$RULE_RATE"
+           --seed "$SEED" --gate_init "$GATE_INIT"
            --beats_per_chord "$BEATS_PER_CHORD" --train_length "$TRAIN_LENGTH"
            --probe_prompt_beats "$PROBE_PROMPT" --probe_gen_beats "$PROBE_GEN")
 FROZEN_OPTS=()
