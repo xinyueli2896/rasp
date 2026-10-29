@@ -43,7 +43,12 @@ PARALLEL="${PARALLEL:-1}"
 
 # --- the v4 configuration --------------------------------------------------
 export TRAIN_DATA="${TRAIN_DATA:-data/v4_bass_finetune.pt}"
-export PRETRAIN_DATA="${PRETRAIN_DATA:-data/v4_bass_pretrain.pt}"
+# v4 has no pretrain-key set: the host pretrained on the whole LA corpus, so
+# every key is "seen in pretrain" and the split is two-way, finetune keys vs
+# the held-out F# and G#. The scratch stem still wants a second file to
+# interleave; it gets the finetune file, so scratch = a random-init host
+# trained with the adapter on the finetune keys.
+export PRETRAIN_DATA="${PRETRAIN_DATA:-data/v4_bass_finetune.pt}"
 export VAL_DATA="${VAL_DATA:-data/v4_bass_all.pt}"
 export UNSEEN_DATA="${UNSEEN_DATA:-data/v4_bass_unseen.pt}"
 export CKPT_DIR="${CKPT_DIR:-checkpoints_v4}"
@@ -78,10 +83,29 @@ mkdir -p "$LOG_DIR" "$CKPT_DIR"
 # --- preflight -------------------------------------------------------------
 missing=0
 [[ -f "$BASE_CKPT" ]] || { echo "MISSING host: $BASE_CKPT" >&2; missing=1; }
-for f in "$TRAIN_DATA" "$VAL_DATA" "$UNSEEN_DATA" "$PRETRAIN_DATA"; do
+for f in "$TRAIN_DATA" "$VAL_DATA" "$UNSEEN_DATA"; do
   [[ -f "$f" ]] || { echo "MISSING data: $f  (scp data/v4_bass_* from the Mac)" >&2; missing=1; }
 done
 [[ "$missing" == "1" ]] && exit 1
+# The held-out keys must be unreachable: no window may be transposed (every
+# pitch_shift_range must be [0,0]) and no finetune span may carry a held-out
+# key. Checked here because FramedDataset applies the ranges silently.
+python - "$TRAIN_DATA" "$UNSEEN_DATA" <<'PYCHECK' || exit 1
+import sys, torch
+tr, un = sys.argv[1], sys.argv[2]
+held = set(int(k) for k in torch.load(un[:-3] + '.keys.pt').tolist())
+ft = set(int(k) for k in torch.load(tr[:-3] + '.keys.pt').tolist())
+bad = []
+for f in (tr, un):
+    psr = torch.load(f[:-3] + '.pitch_shift_range.pt')
+    if int(psr.abs().sum()):
+        bad.append(f'{f}: pitch_shift_range is not all zero -- windows would be transposed')
+if ft & held:
+    bad.append(f'{tr}: carries held-out keys {sorted(ft & held)}')
+if bad:
+    print('\n'.join('REFUSING: ' + b for b in bad), file=sys.stderr); sys.exit(1)
+print(f'keys : finetune {sorted(ft)}  unseen {sorted(held)}  (no transposition)')
+PYCHECK
 echo "host : $BASE_CKPT"
 echo "data : $TRAIN_DATA / $UNSEEN_DATA / $PRETRAIN_DATA / $VAL_DATA"
 
@@ -99,7 +123,7 @@ eval_seed () {
           --runs "cp_yy_frozen_v4_s$sd" "cp_yy_lora_v4_s$sd" "cp_yy_trainar_v4_s$sd"
                  "cp_yy_scratch_v4_s$sd" "cp_yy_noinput_mlp_aux1_v4_s$sd"
           --adapter_rank 256 --n_skip "$N_SKIP" --rule_key_select "$KEY_SELECT"
-          --prompt_data "$TRAIN_DATA" "$UNSEEN_DATA" "$PRETRAIN_DATA"
+          --prompt_data "$TRAIN_DATA" "$UNSEEN_DATA"
           --beats_per_chord "$BEATS_PER_CHORD"
           --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
           --n_trials "$N_TRIALS" --temperature "$t"

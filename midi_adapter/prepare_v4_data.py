@@ -521,6 +521,13 @@ def main():
     p.add_argument('--balance_keys', type=int, default=0,
                    help='transpose spans so every key has at least this many '
                         'songs. 0 = keep the corpus distribution, skew and all')
+    p.add_argument('--holdout_keys', type=int, nargs='+', default=None,
+                   help='v4 two-way split: FINETUNE is every key not listed, '
+                        'UNSEEN is the listed keys, and no pretrain split is '
+                        'written (the host pretrained on the whole corpus, so '
+                        'it has seen every key). Refuses --balance_keys and '
+                        '--pitch_shift_from_data, since either could put a '
+                        'held-out key into finetune by transposition.')
     p.add_argument('--pitch_shift_from_data', action='store_true',
                    help="write upstream's per-song pitch_shift_range instead "
                         'of [0, 0]. Training then transposes windows, which '
@@ -530,6 +537,10 @@ def main():
                    help='joblib workers; -1 for every core')
     p.add_argument('--seed', type=int, default=42)
     args = p.parse_args()
+    if args.holdout_keys is not None and (args.balance_keys or args.pitch_shift_from_data):
+        sys.exit('--holdout_keys guarantees that no held-out key is reachable by '
+                 'transposition; it cannot be combined with --balance_keys or '
+                 '--pitch_shift_from_data.')
 
     bar_subbeats = args.beat_div * 4
     if not (args.midi_dir or args.midi_zip or args.from_stage):
@@ -654,6 +665,15 @@ def main():
         'pretrain': PRETRAIN_ONLY,
         'all': list(range(12)),
     }
+    if args.holdout_keys is not None:
+        held = sorted(set(args.holdout_keys))
+        splits = {
+            'finetune': [k for k in range(12) if k not in held],
+            'unseen': held,
+            'all': list(range(12)),
+        }
+        print(f'\ntwo-way split: finetune keys {splits["finetune"]}, '
+              f'unseen keys {held}; every span at its own key, no transposition')
     print('\nwriting:')
     os.makedirs(os.path.dirname(args.out_prefix) or '.', exist_ok=True)
     counts = {}

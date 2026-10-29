@@ -10,13 +10,29 @@ split of each data file -- the same songs FramedDataset holds out from
 training (index % 10 == 1), so no finetuned model saw them.
 
 Every span starts on a I bar with the root on its downbeat, so the key is in
-the prompt's first slot, exactly where the rule model reads it. The scoring
-is the v2/v3 protocol unchanged: downbeats must state the rule's root, and
-every sounding step is bucketed by its interval above its bar's root
-(chord / scale / outside). What is new is the **Data** row: the same metrics
-on the real continuation of each prompt. Downbeat accuracy is 1.000 there by
-construction; the harmonic profile is the corpus's own, which is what the
-models should be measured against, not the 1.000 ceiling of the generator.
+the prompt's first slot, exactly where the rule model reads it.
+
+Three readings of each generated bar, from strictest to loosest:
+
+  downbeat        the v2/v3 metric: the note struck on the downbeat IS the
+                  rule's root. One slot, one note.
+  root_exact      the bar's root, inferred from a duration-weighted
+                  pitch-class histogram of everything sounding in the bar
+                  (triad template match: root + fifth + the stronger third),
+                  equals the rule's root. Real bass lines walk, so a bar can
+                  state its chord without striking the root first.
+  root_chordtone  the inferred root is the root, third or fifth of the rule's
+                  chord: the bar is in the right harmony, possibly inverted.
+
+plus the harmonic profile of every sounding step (chord / scale / outside
+relative to the rule's root, and onsets per bar). The **Data** row runs the
+real continuation of each prompt through the same scorers. Downbeat is 1.000
+there by construction; root_exact is NOT, and its value is the ceiling of the
+histogram method on real music -- the number a model should be read against.
+
+Key groups are two-way. The host pretrained on the whole LA corpus, so every
+key is seen in pretraining; the finetune files hold ten keys and F# and G#
+are held out of finetuning entirely (prepare_v4_data --holdout_keys 6 8).
 
 Model loading is cp_results_table.build_entries, untouched, so the rule model
 is rebuilt from each checkpoint's recorded configuration exactly as before.
@@ -50,11 +66,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.evaluate_cp_bass import (
-    CATEGORIES, ALL_SEEN, UNSEEN, HARMONY_KEYS, CHORD_STEPS, SCALE_STEPS,
+    UNSEEN, HARMONY_KEYS, CHORD_STEPS, SCALE_STEPS,
 )
 from midi_adapter.infer_cp_bass import _sample, decode_output
 from midi_adapter.generate_synthetic_bass import (
-    OFFSETS, ROOT_NAMES, SECONDS_PER_SUBBEAT as _SYNTH_SECONDS_PER_SUBBEAT,
+    OFFSETS, ROOT_NAMES, DURATION_TEMPLATES,
+    SECONDS_PER_SUBBEAT as _SYNTH_SECONDS_PER_SUBBEAT,
 )
 
 # beat_div=4 and 120 BPM, as the listening samples: one subbeat is 0.125 s.
@@ -103,6 +120,26 @@ def pick_prompts(pool, key: int, n: int):
 # Scoring (vectorised over a batch of continuations)
 # ---------------------------------------------------------------------------
 
+def infer_root(hist: torch.Tensor) -> torch.Tensor:
+    """(..., 12) pitch-class weights -> (...) root by triad template.
+
+    score[r] = w[r] + 0.5 * w[r+7] + 0.5 * max(w[r+3], w[r+4]): the root
+    itself counts full, the fifth and whichever third is present count half,
+    so a bar that walks root-third-fifth and one that sits on the root both
+    name the same chord, while a bar sitting on the fifth names the fifth.
+    """
+    r = torch.arange(12, device=hist.device)
+    fifth = hist[..., (r + 7) % 12]
+    third = torch.maximum(hist[..., (r + 3) % 12], hist[..., (r + 4) % 12])
+    return (hist + 0.5 * fifth + 0.5 * third).argmax(-1)
+
+
+METRICS = ('acc', 'root_exact', 'root_chordtone')
+METRIC_NAMES = {'acc': 'downbeat note is the rule root',
+                'root_exact': 'histogram root equals the rule root',
+                'root_chordtone': 'histogram root is root, 3rd or 5th of the rule chord'}
+
+
 def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int):
     """gen: (B, n_gen, subseq) PROCESSED tokens for absolute steps
     n_prompt .. n_prompt+n_gen-1. Returns per-sample downbeat accuracy and
@@ -123,6 +160,31 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     down = (t % spc == 0)
     acc = ((pc == exp) & valid)[:, down].float().mean(1)
 
+    # Histogram root per bar. Every note slot of the step counts (a
+    # generated step may hold several), weighted by its duration in steps,
+    # clipped at the bar line so a long note does not vote for the next bar.
+    W = gen.shape[-1] // 2
+    pairs = gen.view(B, n_gen, W, 2)
+    v_all = (pairs[..., 0] < 128) & (pairs[..., 1] >= 128)          # (B, n_gen, W)
+    pc_all = (pairs[..., 1] % 128) % 12
+    dur_idx = (pairs[..., 1] // 128 - 1).clamp(0, len(DURATION_TEMPLATES) - 1)
+    dur = torch.tensor(DURATION_TEMPLATES, device=gen.device)[dur_idx].float()
+    remaining = (spc - (t % spc)).float().view(1, n_gen, 1)
+    w = torch.minimum(dur, remaining) * v_all
+    n_bars_i = n_gen // spc
+    bar_of = ((t - n_prompt) // spc).view(1, n_gen, 1).expand(B, n_gen, W)
+    hist = torch.zeros(B, n_bars_i, 12, device=gen.device)
+    flat_idx = (bar_of * 12 + pc_all).reshape(B, -1)
+    hist = hist.view(B, -1).scatter_add(1, flat_idx, w.reshape(B, -1)).view(B, n_bars_i, 12)
+    root = infer_root(hist)                                          # (B, n_bars_i)
+    gt = (keys.view(-1, 1) + torch.tensor(OFFSETS, device=gen.device)[
+        (torch.arange(n_bars_i, device=gen.device) + n_prompt // spc) % 4].view(1, -1)) % 12
+    rel = (root - gt) % 12
+    sounding = hist.sum(-1) > 0
+    root_exact = ((rel == 0) & sounding).float().mean(1)
+    root_chordtone = (((rel == 0) | (rel == 3) | (rel == 4) | (rel == 7))
+                      & sounding).float().mean(1)
+
     step = (pc - exp) % 12
     in_chord = torch.zeros(12, dtype=torch.bool, device=gen.device)
     in_chord[list(CHORD_STEPS)] = True
@@ -132,6 +194,8 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     n_bars = n_gen / spc
     return {
         'acc':            acc,
+        'root_exact':     root_exact,
+        'root_chordtone': root_chordtone,
         'chord':          (in_chord[step] & valid).sum(1) / onsets,
         'scale':          (in_scale[step] & valid).sum(1) / onsets,
         'outside':        (~in_chord[step] & ~in_scale[step] & valid).sum(1) / onsets,
@@ -213,9 +277,9 @@ def eval_entry(label, model, is_adapter, base, pool, args, device, midi_dir):
 def row_means(per_key: dict, keys: list[int]) -> dict:
     ks = [k for k in keys if k in per_key]
     if not ks:
-        return {m: float('nan') for m in ('acc',) + HARMONY_KEYS}
+        return {m: float('nan') for m in METRICS + HARMONY_KEYS}
     return {m: float(np.mean([per_key[k][m] for k in ks]))
-            for m in ('acc',) + HARMONY_KEYS}
+            for m in METRICS + HARMONY_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -260,8 +324,10 @@ def main():
     device = torch.device(args.device if args.device else
                           ('cuda' if torch.cuda.is_available() else 'cpu'))
     total = args.n_prompt_beats + args.n_gen_beats
-    rows = [(lbl, keys, s) for lbl, keys, s in CATEGORIES]
-    rows.append(('Overall', ALL_SEEN + UNSEEN, 'all 12 keys'))
+    seen = [k for k in range(12) if k not in UNSEEN]
+    rows = [('Finetuned keys', seen, '{' + ','.join(map(str, seen)) + '}'),
+            ('Unseen', UNSEEN, '{' + ','.join(map(str, UNSEEN)) + '}'),
+            ('Overall', list(range(12)), 'all 12 keys')]
 
     print('=' * 60)
     print('Prompts')
@@ -295,28 +361,36 @@ def main():
     print('=' * 60)
     print('Evaluating')
     print('=' * 60)
-    results, chord, per_key_all = {}, {}, {}
+    results, metrics, chord, per_key_all = {}, {m: {} for m in METRICS}, {}, {}
     for lbl, model, is_ad in [('Data', None, False)] + list(entries):
         print(f'  {lbl} ...', end='  ', flush=True)
         pk = eval_entry(lbl, model, is_ad, base, pool, args, device,
                         args.save_midi_dir)
         per_key_all[lbl] = pk
         results[lbl], chord[lbl] = {}, {}
+        for m in METRICS:
+            metrics[m][lbl] = {}
         for rlbl, keys, _ in rows:
-            m = row_means(pk, keys)
-            results[lbl][rlbl] = m['acc']
-            chord[lbl][rlbl] = {k: m[k] for k in HARMONY_KEYS}
-        print('  '.join(f'{results[lbl][r]:.3f}' for r, _, _ in rows))
+            mean = row_means(pk, keys)
+            results[lbl][rlbl] = mean['acc']
+            for m in METRICS:
+                metrics[m][lbl][rlbl] = mean[m]
+            chord[lbl][rlbl] = {k: mean[k] for k in HARMONY_KEYS}
+        print('  '.join(f'{metrics["root_exact"][lbl][r]:.3f}' for r, _, _ in rows)
+              + '   (root_exact)')
 
-    print()
-    print(f'downbeat-root accuracy ({args.n_prompt_beats}-step prompt, '
-          f'{args.n_gen_beats} generated, {args.n_gen_beats // args.beats_per_chord} '
-          f'scored downbeats per prompt)')
     labels = list(results)
-    print(f'{"":<16}' + ''.join(f'{l[:18]:>20}' for l in labels))
-    for rlbl, _, s in rows:
-        print(f'{rlbl:<16}' + ''.join(f'{results[l][rlbl]:>20.3f}' for l in labels)
-              + f'   {s}')
+    print()
+    print(f'{args.n_prompt_beats}-step prompt, {args.n_gen_beats} generated, '
+          f'{args.n_gen_beats // args.beats_per_chord} scored bars per prompt, '
+          f'temperature {args.temperature}')
+    for m in METRICS:
+        print()
+        print(f'{m}: {METRIC_NAMES[m]}')
+        print(f'{"":<16}' + ''.join(f'{l[:18]:>20}' for l in labels))
+        for rlbl, _, s in rows:
+            print(f'{rlbl:<16}' + ''.join(f'{metrics[m][l][rlbl]:>20.3f}' for l in labels)
+                  + f'   {s}')
     print()
     print('harmonic profile of every sounding step (Unseen row; Overall in JSON)')
     print(f'{"":<16}' + ''.join(f'{m:>16}' for m in HARMONY_KEYS))
@@ -324,11 +398,11 @@ def main():
         print(f'{l[:16]:<16}' + ''.join(f'{chord[l]["Unseen"][m]:>16.3f}'
                                         for m in HARMONY_KEYS))
     print()
-    print('per key, downbeat accuracy')
+    print('per key, root_exact')
     print(f'{"":<16}' + ''.join(f'{ROOT_NAMES[k]:>6}' for k in range(12)))
     for l in labels:
         print(f'{l[:16]:<16}' + ''.join(
-            f'{per_key_all[l][k]["acc"]:>6.2f}' if k in per_key_all[l] else f'{"-":>6}'
+            f'{per_key_all[l][k]["root_exact"]:>6.2f}' if k in per_key_all[l] else f'{"-":>6}'
             for k in range(12)))
 
     if args.json_out:
@@ -341,7 +415,9 @@ def main():
                                     'temperature': args.temperature,
                                     'prompt_data': args.prompt_data,
                                     'prompt_split': args.prompt_split},
-                       'results': results, 'chord_tone': chord,
+                       # 'results' stays the downbeat metric so aggregate_seeds
+                       # reads it as before; the three tiers are under 'metrics'.
+                       'results': results, 'metrics': metrics, 'chord_tone': chord,
                        'per_key': {l: {str(k): v for k, v in pk.items()}
                                    for l, pk in per_key_all.items()}},
                       f, indent=2)
