@@ -161,7 +161,7 @@ train_seed () {
   for s in $STEMS; do
     ./scripts/run_cp_stems.sh "$s" >| "$LOG_DIR/launch_${s}_${TAG}_s${sd}.log" 2>&1 &
     pids+=($!)
-    echo "  $s pid=${pids[-1]}"
+    echo "  $s pid=$!"
     sleep 45
   done
   local i=0
