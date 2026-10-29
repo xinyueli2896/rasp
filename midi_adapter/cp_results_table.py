@@ -147,13 +147,23 @@ def inspect(ckpt_path: str) -> dict:
 
 # ---------------------------------------------------------------------------
 
-def eval_model(model, is_adapter, keys, args, device) -> float:
+def eval_model(model, is_adapter, keys, args, device):
+    """(downbeat-root accuracy, chord-tone rate) for one model over `keys`.
+
+    Both come from one generation pass. The first is the strict claim -- beat
+    0 must BE the bar's root. The second asks whether every sounding beat is
+    a chord tone of that root, which the rule also determines and which the
+    first cannot see: a model can name every root correctly and still fill
+    the bars with unrelated pitches.
+    """
     rfa = adapter_rule_following_acc if is_adapter else base_rule_following_acc
-    per_key, _ = rfa(model, keys, args.n_gen_beats, args.n_trials,
-                     device, args.temperature, args.n_prompt_beats,
-                     beats_per_chord=args.beats_per_chord,
-                     max_polyphony=args.max_polyphony)
-    return float(np.mean([per_key[k] for k in keys]))
+    per_key, _, per_key_chord = rfa(
+        model, keys, args.n_gen_beats, args.n_trials,
+        device, args.temperature, args.n_prompt_beats,
+        beats_per_chord=args.beats_per_chord,
+        max_polyphony=args.max_polyphony)
+    return (float(np.mean([per_key[k] for k in keys])),
+            float(np.mean([per_key_chord[k] for k in keys])))
 
 
 def main():
@@ -208,15 +218,16 @@ def main():
     print('=' * 60)
     print('Evaluating')
     print('=' * 60)
-    results = {}
+    results, chord = {}, {}
     for lbl, model, is_ad in entries:
-        results[lbl] = {}
+        results[lbl], chord[lbl] = {}, {}
         print(f'  {lbl} ...', end='  ', flush=True)
         for rlbl, keys, _ in rows:
-            results[lbl][rlbl] = eval_model(model, is_ad, keys, args, device)
+            a, c = eval_model(model, is_ad, keys, args, device)
+            results[lbl][rlbl], chord[lbl][rlbl] = a, c
         print('  '.join(f'{results[lbl][r]:.3f}' for r, _, _ in rows))
 
-    _rest_of_main(args, device, entries, rows, results)
+    _rest_of_main(args, device, entries, rows, results, chord)
 
 
 def build_entries(args, device):
@@ -285,7 +296,7 @@ def build_entries(args, device):
     return entries
 
 
-def _rest_of_main(args, device, entries, rows, results):
+def _rest_of_main(args, device, entries, rows, results, chord=None):
     if args.save_midi_dir:
         print()
         print('=' * 60)
@@ -312,7 +323,8 @@ def _rest_of_main(args, device, entries, rows, results):
                                     'n_trials': args.n_trials,
                                     'beats_per_chord': args.beats_per_chord,
                                     'max_polyphony': args.max_polyphony},
-                       'results': results}, f, indent=2)
+                       'results': results,
+                       'chord_tone': chord or {}}, f, indent=2)
         print(f'\nwrote {args.json_out}')
 
     labels = [l for l, _, _ in entries]
@@ -333,6 +345,23 @@ def _rest_of_main(args, device, entries, rows, results):
             line += f' {results[l][rlbl]:>{w[l]}.3f}'
         print(line)
     print('=' * len(header))
+
+    if chord:
+        print()
+        print('=' * len(header))
+        print('CHORD-TONE RATE  -- every sounding beat, is it a chord tone of '
+              'its bar\'s root?')
+        print('(the data is 1.000 by construction; chance is 0.500)')
+        print('=' * len(header))
+        print(header); print(sep)
+        for rlbl, _, kstr in rows:
+            if rlbl == 'Overall':
+                print(sep)
+            line = f'{rlbl:<20} {kstr:<22}'
+            for l in labels:
+                line += f' {chord[l][rlbl]:>{w[l]}.3f}'
+            print(line)
+        print('=' * len(header))
 
 
 if __name__ == '__main__':

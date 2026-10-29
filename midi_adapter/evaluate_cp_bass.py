@@ -184,6 +184,21 @@ def _gen_pcs(base: RoFormerSymbolicTransformer,
     return [_extract_pc(t, base.tokenizer) for t in sampled[n_prompt_beats:]]
 
 
+# Chord tones of the bar's expected root, as semitone steps above it. The
+# union over all five qualities, so no knowledge of the song's quality is
+# needed. Measured on 200 songs x 32 bars of v2 data: every one of 16,800
+# sounding notes falls in this set, across all four beats -- so the ceiling
+# is exactly 1.000 and the metric is rule-determined, not a heuristic.
+#
+# This is the complement to downbeat accuracy. The rule fixes the bar's root,
+# so beat 0 must EQUAL it; beats 1-3 are free to be any chord tone of it.
+# Scoring only the downbeat looks at 6,400 of those 16,800 notes and cannot
+# see a model that names every root correctly and fills the bars with
+# unrelated pitches.
+CHORD_STEPS = frozenset({0, 3, 4, 7, 10, 11})
+
+
+
 @torch.no_grad()
 def rule_following_acc(
     base: RoFormerSymbolicTransformer,
@@ -195,7 +210,8 @@ def rule_following_acc(
     n_prompt_beats: int = 2,
     beats_per_chord: int = 1,
     max_polyphony: int = 4,
-) -> tuple[dict[int, float], list[tuple[int, int | None]]]:
+) -> tuple[dict[int, float], list[tuple[int, int | None]],
+           dict[int, float]]:
     """
     Returns
     -------
@@ -205,8 +221,10 @@ def rule_following_acc(
     per_key: dict[int, float] = {}
     errors: list[tuple[int, int | None]] = []
 
+    per_key_chord: dict[int, float] = {}
+
     for key in keys:
-        trial_accs = []
+        trial_accs, trial_chord = [], []
         for _trial in range(n_trials):
             pcs = _gen_pcs(base, key, n_gen, device, temperature, n_prompt_beats,
                            max_polyphony, beats_per_chord,
@@ -222,9 +240,24 @@ def rule_following_acc(
                 else:
                     errors.append((exp, pc))
             trial_accs.append(n_correct / max(len(scored), 1))
-        per_key[key] = float(np.mean(trial_accs))
 
-    return per_key, errors
+            # Every sounding beat, not just the downbeat: is it a chord tone
+            # of its bar's expected root? A beat with no note is not counted
+            # either way -- silence is the degenerate rate's business.
+            ct_hit = ct_tot = 0
+            for i, pc in enumerate(pcs):
+                if pc is None:
+                    continue
+                step = (pc - _expected_pc(key, n_prompt_beats + i,
+                                          beats_per_chord)) % 12
+                ct_tot += 1
+                ct_hit += int(step in CHORD_STEPS)
+            trial_chord.append(ct_hit / max(ct_tot, 1))
+
+        per_key[key] = float(np.mean(trial_accs))
+        per_key_chord[key] = float(np.mean(trial_chord))
+
+    return per_key, errors, per_key_chord
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +430,7 @@ def run_evaluation(args) -> None:
     all_errors = []
 
     for cat, keys, keys_str in CATEGORIES:
-        per_key, errors = rule_following_acc(
+        per_key, errors, _chord = rule_following_acc(
             base, keys, args.n_gen_beats, args.n_trials, device, args.temperature,
             n_prompt_beats=args.n_prompt_beats,
             beats_per_chord=args.beats_per_chord,
