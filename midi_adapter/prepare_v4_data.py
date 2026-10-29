@@ -74,6 +74,21 @@ Usage
       --upstream /path/to/MIDI-AutoLabel-Dataset \\
       --out_prefix data/v4_bass --min_bars 24 --jobs -1
 
+On a machine that cannot hold the corpus twice, read it straight out of the
+archive and stage the results, which is resumable:
+
+  python -m midi_adapter.prepare_v4_data \\
+      --midi_zip ~/Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA.zip \\
+      --upstream ~/mald-upstream --stage_dir v4_stage \\
+      --out_prefix data/v4_bass --min_bars 24 --jobs -1
+
+`UglyMIDI` takes a file object, so zip members are parsed in memory and the
+MIDI files are never written to disk. --stage_dir keeps a running log of which
+members were processed and a small tensor per accepted span, so the run can be
+stopped and restarted, and the splits are rebuilt from the stage each time
+(--from_stage alone rebuilds them without rescanning). What survives is tiny:
+only spans that follow the rule, a few hundred KB per thousand bars.
+
 Splits follow v1-v3 exactly: unseen {6, 8} is never trained on, pretrain-only
 {5, 9} is there for the baseline rows, and finetune gets the remaining eight.
 """
@@ -82,9 +97,11 @@ from __future__ import annotations
 
 import argparse
 import collections
+import io
 import json
 import os
 import sys
+import zipfile
 
 import numpy as np
 import torch
@@ -199,10 +216,16 @@ def bar_roots_from_bass(midi, ins, n_sub: int, *, bar_subbeats: int,
     return roots, starts, why
 
 
-def scan_file(midi_path: str, upstream: str, *, beat_div: int, bar_subbeats: int,
+def scan_file(src, upstream: str, *, beat_div: int, bar_subbeats: int,
               max_polyphony: int, tracks: str, min_bars: int,
               cover_min: float, require_mono: bool, quant_filter: bool):
     """Find every rule-following span in one file and cut the CP tensors.
+
+    `src` is (name, blob). A blob of None means read `name` off the disk;
+    otherwise `name` is a member of an archive and `blob` its bytes. UglyMIDI
+    takes a file object, so the archive member is parsed in memory and never
+    extracted -- which is what lets a 400k-file corpus be processed on a disk
+    that cannot hold it unpacked.
 
     Returns a list of dicts, or a single-key dict naming why the file was
     dropped -- the caller tallies those so a corpus that yields nothing says
@@ -210,9 +233,11 @@ def scan_file(midi_path: str, upstream: str, *, beat_div: int, bar_subbeats: int
     """
     import pretty_midi
     UglyMIDI, preprocess_midi, filter_la_quantization = load_upstream(upstream)
+    name, blob = src
 
     try:
-        midi = UglyMIDI(midi_path, constant_tempo=60.0 / beat_div)
+        midi = UglyMIDI(io.BytesIO(blob) if blob is not None else name,
+                        constant_tempo=60.0 / beat_div)
     except Exception:                                          # noqa: BLE001
         return {'reject': 'unreadable'}
     try:
@@ -257,7 +282,7 @@ def scan_file(midi_path: str, upstream: str, *, beat_div: int, bar_subbeats: int
         data, _ = res
         out.append({'data': data[lo:hi].clone(), 'key': int(key),
                     'n_bars': int(length), 'start_bar': int(b0),
-                    'start_subbeat': int(lo), 'path': midi_path,
+                    'start_subbeat': int(lo), 'path': name,
                     'why': dict(why)})
     return out or {'reject': 'span_cut_failed', 'why': dict(why)}
 
@@ -289,6 +314,100 @@ def transpose(data: torch.Tensor, semitones: int, max_polyphony: int):
 # ---------------------------------------------------------------------------
 # Writing a split
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Staging: scan in batches, survive an interruption, rebuild without rescanning
+# ---------------------------------------------------------------------------
+
+def stage_done(stage_dir: str) -> set[str]:
+    """Member names already scanned, so a restart picks up where it stopped."""
+    path = os.path.join(stage_dir, 'done.txt')
+    if not os.path.isfile(path):
+        return set()
+    with open(path) as f:
+        return {line.rstrip('\n') for line in f if line.strip()}
+
+
+def stage_put(stage_dir: str, names: list[str], spans: list[dict],
+              rejects: collections.Counter, bar_why: collections.Counter):
+    """Record one batch: its spans, its tallies, and the names it covered.
+
+    The span tensors are written before the names, so an interruption between
+    the two re-scans a batch rather than losing it -- the cheaper mistake.
+    """
+    os.makedirs(os.path.join(stage_dir, 'spans'), exist_ok=True)
+    if spans:
+        n = len(os.listdir(os.path.join(stage_dir, 'spans')))
+        torch.save(spans, os.path.join(stage_dir, 'spans', f'batch_{n:06d}.pt'))
+    stats_path = os.path.join(stage_dir, 'stats.json')
+    acc = {'rejects': {}, 'bar_why': {}}
+    if os.path.isfile(stats_path):
+        with open(stats_path) as f:
+            acc = json.load(f)
+    for key, counter in (('rejects', rejects), ('bar_why', bar_why)):
+        merged = collections.Counter(acc.get(key, {}))
+        merged.update(counter)
+        acc[key] = dict(merged)
+    with open(stats_path, 'w') as f:
+        json.dump(acc, f)
+    with open(os.path.join(stage_dir, 'done.txt'), 'a') as f:
+        for nm in names:
+            f.write(nm + '\n')
+
+
+def stage_get(stage_dir: str):
+    """Everything staged so far: spans plus the accumulated tallies."""
+    spans: list[dict] = []
+    span_dir = os.path.join(stage_dir, 'spans')
+    if os.path.isdir(span_dir):
+        for fn in sorted(os.listdir(span_dir)):
+            spans.extend(torch.load(os.path.join(span_dir, fn), weights_only=False))
+    rejects = collections.Counter()
+    bar_why = collections.Counter()
+    stats_path = os.path.join(stage_dir, 'stats.json')
+    if os.path.isfile(stats_path):
+        with open(stats_path) as f:
+            acc = json.load(f)
+        rejects.update(acc.get('rejects', {}))
+        bar_why.update(acc.get('bar_why', {}))
+    return spans, rejects, bar_why
+
+
+def iter_batches(args, skip: set[str], batch: int):
+    """Yield batches of (name, blob) from a directory or straight from a zip.
+
+    Reading the archive in the parent and handing bytes to the workers keeps
+    one ZipFile handle (they are not shareable across processes) and bounds
+    memory at one batch of MIDI files, which is a few tens of MB.
+    """
+    if args.midi_zip:
+        with zipfile.ZipFile(args.midi_zip) as zf:
+            names = [n for n in zf.namelist()
+                     if n.lower().endswith(('.mid', '.midi'))]
+            names.sort()
+            if args.max_files:
+                names = names[:args.max_files]
+            todo = [n for n in names if n not in skip]
+            print(f'{len(names)} MIDI members in {args.midi_zip}, '
+                  f'{len(todo)} still to scan')
+            for i in range(0, len(todo), batch):
+                chunk = todo[i:i + batch]
+                yield [(n, zf.read(n)) for n in chunk], len(todo), i
+    else:
+        paths = []
+        for dirpath, _, filenames in os.walk(args.midi_dir):
+            for fn in sorted(filenames):
+                if fn.lower().endswith(('.mid', '.midi')):
+                    paths.append(os.path.join(dirpath, fn))
+        paths.sort()
+        if args.max_files:
+            paths = paths[:args.max_files]
+        todo = [p for p in paths if p not in skip]
+        print(f'{len(paths)} MIDI files under {args.midi_dir}, '
+              f'{len(todo)} still to scan')
+        for i in range(0, len(todo), batch):
+            yield [(p, None) for p in todo[i:i + batch]], len(todo), i
+
 
 def check_invariants(songs: list[dict], bar_subbeats: int, max_polyphony: int):
     """Verify the three things the adapter silently depends on.
@@ -359,7 +478,20 @@ def write_split(prefix: str, split: str, songs: list[dict], pitch_shift: bool):
 def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--midi_dir', required=True, help='corpus root, scanned recursively')
+    p.add_argument('--midi_dir', help='corpus root, scanned recursively')
+    p.add_argument('--midi_zip',
+                   help='read MIDI straight out of this archive instead, '
+                        'without extracting it -- for a disk that cannot hold '
+                        'the corpus unpacked')
+    p.add_argument('--stage_dir',
+                   help='keep per-batch results here so the scan is resumable; '
+                        'the splits are rebuilt from the whole stage each run')
+    p.add_argument('--from_stage',
+                   help='rebuild the splits from an existing stage without '
+                        'scanning anything')
+    p.add_argument('--batch', type=int, default=2000,
+                   help='files per batch; bounds memory and how much a '
+                        'restart repeats')
     p.add_argument('--upstream', required=True,
                    help='checkout of instr3/MIDI-AutoLabel-Dataset, for '
                         'pretty_midi_fix and preprocess_large_midi_dataset')
@@ -400,21 +532,13 @@ def main():
     args = p.parse_args()
 
     bar_subbeats = args.beat_div * 4
-    files = []
-    for dirpath, _, filenames in os.walk(args.midi_dir):
-        for fn in sorted(filenames):
-            if fn.lower().endswith(('.mid', '.midi')):
-                files.append(os.path.join(dirpath, fn))
-    files.sort()
-    if args.max_files:
-        files = files[:args.max_files]
-    print(f'{len(files)} MIDI files under {args.midi_dir}')
+    if not (args.midi_dir or args.midi_zip or args.from_stage):
+        sys.exit('give --midi_dir, --midi_zip, or --from_stage')
+    stage = args.stage_dir or args.from_stage
     print(f'grid: beat_div={args.beat_div}, bar={bar_subbeats} subbeats, '
           f'cycle={bar_subbeats * CYCLE_BARS} subbeats, '
           f'max_polyphony={args.max_polyphony} '
           f'(subseq width {args.max_polyphony * 4})')
-    if not files:
-        sys.exit('nothing to scan')
 
     kwargs = dict(beat_div=args.beat_div, bar_subbeats=bar_subbeats,
                   max_polyphony=args.max_polyphony, tracks=args.tracks,
@@ -422,30 +546,56 @@ def main():
                   require_mono=not args.allow_poly_bass,
                   quant_filter=not args.no_quant_filter)
 
-    if args.jobs != 1:
-        from joblib import Parallel, delayed
-        results = Parallel(n_jobs=args.jobs, verbose=5)(
-            delayed(scan_file)(f, args.upstream, **kwargs) for f in files)
-    else:
-        results = []
-        for i, f in enumerate(files):
-            results.append(scan_file(f, args.upstream, **kwargs))
-            if (i + 1) % 200 == 0:
-                print(f'  {i + 1}/{len(files)}')
-
+    songs: list[dict] = []
     rejects = collections.Counter()
     bar_why = collections.Counter()
-    songs: list[dict] = []
-    for r in results:
-        if isinstance(r, dict):
-            rejects[r['reject']] += 1
-            bar_why.update(r.get('why', {}))
-            continue
-        for s in r:
-            bar_why.update(s.pop('why', {}))
-            songs.append(s)
+    scanned = 0
 
-    print(f'\nfiles accepted: {len(files) - sum(rejects.values())}/{len(files)}')
+    if args.midi_dir or args.midi_zip:
+        if stage:
+            os.makedirs(stage, exist_ok=True)
+        skip = stage_done(stage) if stage else set()
+        if skip:
+            print(f'resuming: {len(skip)} files already scanned')
+        parallel = None
+        if args.jobs != 1:
+            from joblib import Parallel, delayed
+            parallel = Parallel(n_jobs=args.jobs)
+        for chunk, total, offset in iter_batches(args, skip, args.batch):
+            if parallel is not None:
+                from joblib import delayed
+                results = parallel(
+                    delayed(scan_file)(s, args.upstream, **kwargs) for s in chunk)
+            else:
+                results = [scan_file(s, args.upstream, **kwargs) for s in chunk]
+            got, rej, why = [], collections.Counter(), collections.Counter()
+            for r in results:
+                if isinstance(r, dict):
+                    rej[r['reject']] += 1
+                    why.update(r.get('why', {}))
+                    continue
+                for s in r:
+                    why.update(s.pop('why', {}))
+                    got.append(s)
+            scanned += len(chunk)
+            rejects.update(rej)
+            bar_why.update(why)
+            if stage:
+                stage_put(stage, [n for n, _ in chunk], got, rej, why)
+            else:
+                songs.extend(got)
+            print(f'  {offset + len(chunk)}/{total} scanned, '
+                  f'{len(got)} spans this batch', flush=True)
+
+    if stage:
+        # Rebuild from everything ever staged, this run included, so stopping
+        # and restarting gives the same dataset as one uninterrupted pass.
+        songs, rejects, bar_why = stage_get(stage)
+        print(f'\nstage {stage}: {len(songs)} spans from '
+              f'{len(stage_done(stage))} files scanned in total')
+
+    n_files = max(scanned, len(stage_done(stage)) if stage else 0)
+    print(f'\nfiles accepted: {n_files - sum(rejects.values())}/{n_files}')
     for k, v in rejects.most_common():
         print(f'  dropped, {k:18s} {v}')
     print('bars, by what they could be used for:')
