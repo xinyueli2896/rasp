@@ -99,6 +99,12 @@ def _gen_pcs(model: CPYinyangTransformer,
 # see a model that names every root correctly and fills the bars with
 # unrelated pitches.
 CHORD_STEPS = frozenset({0, 3, 4, 7, 10, 11})
+# Scale tones that are NOT chord tones -- what v3's --nct_prob draws from.
+SCALE_STEPS = frozenset({2, 5, 8, 9})
+# Everything else: a semitone or a tritone above the bar's root. The generator
+# never produces these at any setting, so a non-zero rate is a harmonic error
+# the data cannot make. Chance is 2/12 = 0.167.
+HARMONY_KEYS = ('chord', 'scale', 'outside', 'onsets_per_bar')
 
 
 
@@ -138,21 +144,30 @@ def rule_following_acc(
                     errors.append((exp, pc))
             trial_accs.append(n_correct / max(len(scored), 1))
 
-            # Every sounding beat, not just the downbeat: is it a chord tone
-            # of its bar's expected root? A beat with no note is not counted
-            # either way -- silence is the degenerate rate's business.
-            ct_hit = ct_tot = 0
+            # Every sounding beat, not just the downbeat, bucketed by its
+            # step above its bar's expected root. A beat with no note is
+            # counted in neither -- silence is onsets_per_bar's business.
+            cnt = {'chord': 0, 'scale': 0, 'outside': 0}
+            onsets = 0
             for i, pc in enumerate(pcs):
                 if pc is None:
                     continue
+                onsets += 1
                 step = (pc - _expected_pc(key, n_prompt_beats + i,
                                           beats_per_chord)) % 12
-                ct_tot += 1
-                ct_hit += int(step in CHORD_STEPS)
-            trial_chord.append(ct_hit / max(ct_tot, 1))
+                cnt['chord' if step in CHORD_STEPS else
+                    'scale' if step in SCALE_STEPS else 'outside'] += 1
+            n_bars = max(len(pcs) / beats_per_chord, 1)
+            trial_chord.append({
+                'chord':   cnt['chord']   / max(onsets, 1),
+                'scale':   cnt['scale']   / max(onsets, 1),
+                'outside': cnt['outside'] / max(onsets, 1),
+                'onsets_per_bar': onsets / n_bars,
+            })
 
         per_key[key] = float(np.mean(trial_accs))
-        per_key_chord[key] = float(np.mean(trial_chord))
+        per_key_chord[key] = {k: float(np.mean([t[k] for t in trial_chord]))
+                              for k in HARMONY_KEYS}
 
     return per_key, errors, per_key_chord
 

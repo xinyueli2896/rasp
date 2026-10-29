@@ -44,7 +44,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from midi_adapter.evaluate_cp_bass import (
-    CATEGORIES, ALL_SEEN, UNSEEN,
+    CATEGORIES, ALL_SEEN, UNSEEN, HARMONY_KEYS,
     load_model          as load_base_model,
     rule_following_acc  as base_rule_following_acc,
     _save_midi_all_keys as save_base_midi,
@@ -163,7 +163,8 @@ def eval_model(model, is_adapter, keys, args, device):
         beats_per_chord=args.beats_per_chord,
         max_polyphony=args.max_polyphony)
     return (float(np.mean([per_key[k] for k in keys])),
-            float(np.mean([per_key_chord[k] for k in keys])))
+            {m: float(np.mean([per_key_chord[k][m] for k in keys]))
+             for m in HARMONY_KEYS})
 
 
 def main():
@@ -348,20 +349,26 @@ def _rest_of_main(args, device, entries, rows, results, chord=None):
 
     if chord:
         print()
-        print('=' * len(header))
-        print('CHORD-TONE RATE  -- every sounding beat, is it a chord tone of '
-              'its bar\'s root?')
-        print('(the data is 1.000 by construction; chance is 0.500)')
-        print('=' * len(header))
-        print(header); print(sep)
-        for rlbl, _, kstr in rows:
-            if rlbl == 'Overall':
-                print(sep)
-            line = f'{rlbl:<20} {kstr:<22}'
-            for l in labels:
-                line += f' {chord[l][rlbl]:>{w[l]}.3f}'
-            print(line)
-        print('=' * len(header))
+        print('=' * 86)
+        print('HARMONIC PROFILE  -- every sounding beat, by step above its '
+              "bar's expected root")
+        print('  chord {0,3,4,7,10,11}   scale {2,5,8,9}   outside {1,6}')
+        print('  v2 data: chord 1.000  scale 0.000  outside 0.000')
+        print('  v3 data at nct 0.3: chord 0.833  scale 0.167  outside 0.000')
+        print('  outside is 0.000 in the data at EVERY setting; chance is '
+              '0.167, so any')
+        print('  non-zero value is a harmonic error the generator cannot make.')
+        print('=' * 86)
+        h2 = (f'{"run":<28}{"group":<16}' +
+              ''.join(f'{m:>14}' for m in HARMONY_KEYS))
+        print(h2); print('-' * len(h2))
+        for l in labels:
+            for rlbl in ('Unseen', 'Overall'):
+                if rlbl not in chord[l]:
+                    continue
+                print(f'{l:<28}{rlbl:<16}' +
+                      ''.join(f'{chord[l][rlbl][m]:>14.3f}' for m in HARMONY_KEYS))
+        print('=' * 86)
 
 
 if __name__ == '__main__':
