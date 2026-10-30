@@ -161,6 +161,60 @@ def bass_track(midi):
     return best
 
 
+# v5: GM program families that play chords. Piano, organ, guitar, ensemble
+# (string sections, choirs) and synth pads. Not chromatic percussion, solo
+# strings, brass, reed, pipe or synth lead, which mostly carry a melody.
+CHORDAL_FAMILIES = ((0, 8), (16, 24), (24, 32), (48, 56), (88, 96))
+CHORD_FRAC = 0.25
+
+
+def chordal_tracks(midi, bass, chord_frac: float = CHORD_FRAC):
+    """v5: the pitched tracks that accompany the bass with chords.
+
+    A track qualifies by family (CHORDAL_FAMILIES) and by behaviour: at least
+    `chord_frac` of the steps it plays on carry two or more of its notes, so a
+    guitar picking a single-note riff is left out and one strumming is kept.
+    The bass itself, drums and the melodic families are never included.
+    """
+    out = []
+    for ins in midi.instruments:
+        if ins is bass or ins.is_drum or len(ins.notes) < 20:
+            continue
+        if not any(lo <= ins.program < hi for lo, hi in CHORDAL_FAMILIES):
+            continue
+        per_step = collections.Counter(int(round(n.start)) for n in ins.notes)
+        chords = sum(1 for c in per_step.values() if c >= 2)
+        if chords >= chord_frac * len(per_step):
+            out.append(ins)
+    return out
+
+
+def bass_first(cut: torch.Tensor, onset, lo: int, program: int,
+               max_polyphony: int):
+    """v5: move the bass onset of every step into slot 0.
+
+    Upstream sorts a step's notes by velocity, so with several tracks slot 0
+    is the quietest note, while the rule model reads the key from slot 0 of
+    step 0 and the in-training probe scores slot 0 of each downbeat. The
+    remaining notes keep upstream's order; the EOS slot and padding move down
+    by one with them. None if a bass onset is not in the tensor (it was cut
+    by the polyphony cap), which the caller counts as a lost span.
+    """
+    d = cut.view(-1, max_polyphony, 4)
+    for t in range(len(d)):
+        pitches = onset[lo + t]
+        if not pitches:
+            continue
+        step = d[t]
+        hit = ((step[:, 0] == program) & (step[:, 1] == min(pitches))).nonzero()
+        if len(hit) == 0:
+            return None
+        j = int(hit[0])
+        if j:
+            d[t] = torch.cat([step[j:j + 1], step[:j], step[j + 1:]], 0)
+    return d.reshape(len(d), -1)
+
+
 def bass_grid(ins, n_sub: int):
     """Per-subbeat onsets, sustain coverage and polyphony of one track."""
     onset: list[list[int]] = [[] for _ in range(n_sub)]
@@ -218,7 +272,8 @@ def bar_roots_from_bass(midi, ins, n_sub: int, *, bar_subbeats: int,
 
 def scan_file(src, upstream: str, *, beat_div: int, bar_subbeats: int,
               max_polyphony: int, tracks: str, min_bars: int,
-              cover_min: float, require_mono: bool, quant_filter: bool):
+              cover_min: float, require_mono: bool, quant_filter: bool,
+              chord_frac: float = CHORD_FRAC):
     """Find every rule-following span in one file and cut the CP tensors.
 
     `src` is (name, blob). A blob of None means read `name` off the disk;
@@ -265,6 +320,17 @@ def scan_file(src, upstream: str, *, beat_div: int, bar_subbeats: int,
     if tracks == 'bass':
         src = pretty_midi.PrettyMIDI(initial_tempo=60.0 / beat_div)
         src.instruments.append(ins)
+    elif tracks == 'chordal':
+        # v5: the bass plus the tracks that play chords under it. The bass
+        # goes in first: upstream fills a step's slots in track order and
+        # stops at the polyphony cap, so the bass note is never the one cut.
+        chords = chordal_tracks(midi, ins, chord_frac)
+        if not chords:
+            return {'reject': 'no_chordal_track', 'why': dict(why)}
+        src = pretty_midi.PrettyMIDI(initial_tempo=60.0 / beat_div)
+        src.instruments.append(ins)
+        src.instruments.extend(chords)
+        onset, _, _ = bass_grid(ins, n_sub)
     else:
         src = midi
 
@@ -280,7 +346,13 @@ def scan_file(src, upstream: str, *, beat_div: int, bar_subbeats: int,
         if res is None:
             continue
         data, _ = res
-        out.append({'data': data[lo:hi].clone(), 'key': int(key),
+        cut = data[lo:hi].clone()
+        if tracks == 'chordal':
+            cut = bass_first(cut, onset, lo, ins.program, max_polyphony)
+            if cut is None:
+                why['bass_lost'] += 1
+                continue
+        out.append({'data': cut, 'key': int(key),
                     'n_bars': int(length), 'start_bar': int(b0),
                     'start_subbeat': int(lo), 'path': name,
                     'why': dict(why)})
@@ -380,11 +452,17 @@ def iter_batches(args, skip: set[str], batch: int):
     one ZipFile handle (they are not shareable across processes) and bounds
     memory at one batch of MIDI files, which is a few tens of MB.
     """
+    only = None
+    if args.only_files_from:
+        only = {s['path'] for s in stage_get(args.only_files_from)[0]}
+        print(f'--only_files_from: {len(only)} files behind {args.only_files_from}')
     if args.midi_zip:
         with zipfile.ZipFile(args.midi_zip) as zf:
             names = [n for n in zf.namelist()
                      if n.lower().endswith(('.mid', '.midi'))]
             names.sort()
+            if only is not None:
+                names = [n for n in names if n in only]
             if args.max_files:
                 names = names[:args.max_files]
             todo = [n for n in names if n not in skip]
@@ -400,6 +478,8 @@ def iter_batches(args, skip: set[str], batch: int):
                 if fn.lower().endswith(('.mid', '.midi')):
                     paths.append(os.path.join(dirpath, fn))
         paths.sort()
+        if only is not None:
+            paths = [p for p in paths if p in only]
         if args.max_files:
             paths = paths[:args.max_files]
         todo = [p for p in paths if p not in skip]
@@ -443,6 +523,27 @@ def check_invariants(songs: list[dict], bar_subbeats: int, max_polyphony: int):
     print(f'  length is a whole cycle         : {cycle_ok / n:.3f}  '
           f'({cycle_ok}/{len(songs)} songs)')
     return key_ok == len(songs) and bar_ok == bar_n and cycle_ok == len(songs)
+
+
+def check_slot0(songs: list[dict], bar_subbeats: int, max_polyphony: int):
+    """v5: slot 0 of every downbeat is the rule root, and it is a bass note.
+
+    With several tracks, check_invariants' second line reads the LOWEST note
+    of the downbeat, which a chord voicing could supply. The in-training probe
+    and the rule model read slot 0, so that is what has to hold.
+    """
+    ok = n = 0
+    for s in songs:
+        d = s['data'].view(-1, max_polyphony, 4)
+        for b in range(len(d) // bar_subbeats):
+            step = d[b * bar_subbeats]
+            n += 1
+            if (int(step[0, 1]) != 255 and int(step[0, 0]) < 127
+                    and int(step[0, 1]) % 12 == (s['key'] + OFFSETS[b % 4]) % 12
+                    and int(step[0, 1]) <= 60):
+                ok += 1
+    print(f'  downbeat slot 0 is the bass root : {ok / max(n, 1):.3f}  ({ok}/{n} bars)')
+    return ok == n
 
 
 def write_split(prefix: str, split: str, songs: list[dict], pitch_shift: bool):
@@ -502,9 +603,19 @@ def main():
                    help='16 is what la_cp16_v2 used; the subseq width must '
                         'match it or the frozen local encoder sees beats of a '
                         'width it never met (and it does not mask pads)')
-    p.add_argument('--tracks', default='bass', choices=['bass', 'all'],
+    p.add_argument('--tracks', default='bass', choices=['bass', 'chordal', 'all'],
                    help="'bass' keeps only the bass line, so step 0 slot 0 is "
-                        'the root the rule model reads as the key')
+                        "the root the rule model reads as the key. 'chordal' "
+                        '(v5) keeps the bass and the chord-playing tracks, no '
+                        'drums, with the bass moved into slot 0 of every step')
+    p.add_argument('--chord_frac', type=float, default=CHORD_FRAC,
+                   help="--tracks chordal: a track counts as chordal if at "
+                        'least this fraction of its onsets are 2+ notes')
+    p.add_argument('--only_files_from', default=None,
+                   help='scan only the files behind the spans of this stage '
+                        '(e.g. the v4 stage), not the whole corpus. The span '
+                        'selection depends only on the bass, so another track '
+                        'mode over the same files finds the same spans')
     p.add_argument('--min_bars', type=int, default=24,
                    help='shortest span to keep, in bars. 24 bars = 384 '
                         'subbeats = one training window')
@@ -555,7 +666,8 @@ def main():
                   max_polyphony=args.max_polyphony, tracks=args.tracks,
                   min_bars=args.min_bars, cover_min=args.cover_min,
                   require_mono=not args.allow_poly_bass,
-                  quant_filter=not args.no_quant_filter)
+                  quant_filter=not args.no_quant_filter,
+                  chord_frac=args.chord_frac)
 
     songs: list[dict] = []
     rejects = collections.Counter()
@@ -654,7 +766,20 @@ def main():
               'augmentation, so it is in distribution, but say so in the table)')
 
     all_songs = [s for k in range(12) for s in by_key[k]]
-    if not check_invariants(all_songs, bar_subbeats, args.max_polyphony):
+    ok = check_invariants(all_songs, bar_subbeats, args.max_polyphony)
+    if args.tracks == 'chordal':
+        # The second line above reads the LOWEST note of the downbeat, and a
+        # chord voicing can sit under the bass. What the rule model and the
+        # probe read is slot 0, so that is the verdict here; the key and
+        # whole-cycle lines must still hold.
+        print('  (chordal: the lowest-note line above is informational; '
+              'slot 0 is what is read)')
+        slot0 = check_slot0(all_songs, bar_subbeats, args.max_polyphony)
+        cycles = all(len(s['data']) % (bar_subbeats * CYCLE_BARS) == 0 for s in all_songs)
+        keys = all(int(s['data'].view(-1, args.max_polyphony, 4)[0, 0, 1]) % 128 % 12
+                   == s['key'] for s in all_songs)
+        ok = slot0 and cycles and keys
+    if not ok:
         print('  !! an invariant failed -- the files below would train a model '
               'against a rule input that does not describe them. Do not train '
               'on this; send the three numbers above.')
@@ -688,6 +813,8 @@ def main():
         'bar_subbeats': bar_subbeats, 'cycle_subbeats': bar_subbeats * CYCLE_BARS,
         'max_polyphony': args.max_polyphony, 'tracks': args.tracks,
         'min_bars': args.min_bars, 'balance_keys': args.balance_keys,
+        'chord_frac': args.chord_frac if args.tracks == 'chordal' else None,
+        'only_files_from': args.only_files_from,
         'splits': {k: {'keys': v, 'songs': counts[k]} for k, v in splits.items()},
         'rejects': dict(rejects), 'bar_reasons': dict(bar_why),
         'per_key': {k: len(by_key[k]) for k in range(12)},

@@ -71,7 +71,9 @@ def main():
             origin[lbl] = f
             results[lbl] = b['results'][lbl]
             for m in METRICS:
-                metrics[m][lbl] = b['metrics'][m][lbl]
+                # a table written before a tier existed shows it as nan
+                metrics[m][lbl] = b['metrics'].get(m, {}).get(
+                    lbl, {r[0]: float('nan') for r in rows})
             chord[lbl] = b['chord_tone'][lbl]
             per_key[lbl] = b['per_key'][lbl]
 

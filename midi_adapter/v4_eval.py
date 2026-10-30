@@ -134,10 +134,12 @@ def infer_root(hist: torch.Tensor) -> torch.Tensor:
     return (hist + 0.5 * fifth + 0.5 * third).argmax(-1)
 
 
-METRICS = ('acc', 'root_exact', 'root_chordtone')
-METRIC_NAMES = {'acc': 'downbeat note is the rule root',
-                'root_exact': 'histogram root equals the rule root',
-                'root_chordtone': 'histogram root is root, 3rd or 5th of the rule chord'}
+METRICS = ('acc', 'root_exact', 'root_chordtone', 'bass_exact', 'bass_chordtone')
+METRIC_NAMES = {'acc': 'downbeat slot-0 note is the rule root',
+                'root_exact': 'histogram root (all notes) equals the rule root',
+                'root_chordtone': 'histogram root (all notes) is root, 3rd or 5th of the rule chord',
+                'bass_exact': 'histogram root of the bass line (lowest note per step) equals the rule root',
+                'bass_chordtone': 'bass-line histogram root is root, 3rd or 5th of the rule chord'}
 
 
 def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int):
@@ -152,7 +154,9 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     """
     B, n_gen, _ = gen.shape
     prog, pd = gen[..., 0], gen[..., 1]
-    valid = (prog < 128) & (pd >= 128)                      # (B, n_gen)
+    # program 127 is the drum kit: its 'pitch' is a kit piece, not a pitch
+    # class, so drums never enter a histogram.
+    valid = (prog < 127) & (pd >= 128)                      # (B, n_gen)
     pc = (pd % 128) % 12
     t = torch.arange(n_prompt, n_prompt + n_gen, device=gen.device)
     off = torch.tensor(OFFSETS, device=gen.device)[(t // spc) % 4]
@@ -165,7 +169,7 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     # clipped at the bar line so a long note does not vote for the next bar.
     W = gen.shape[-1] // 2
     pairs = gen.view(B, n_gen, W, 2)
-    v_all = (pairs[..., 0] < 128) & (pairs[..., 1] >= 128)          # (B, n_gen, W)
+    v_all = (pairs[..., 0] < 127) & (pairs[..., 1] >= 128)          # (B, n_gen, W)
     pc_all = (pairs[..., 1] % 128) % 12
     dur_idx = (pairs[..., 1] // 128 - 1).clamp(0, len(DURATION_TEMPLATES) - 1)
     dur = torch.tensor(DURATION_TEMPLATES, device=gen.device)[dur_idx].float()
@@ -176,14 +180,27 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     hist = torch.zeros(B, n_bars_i, 12, device=gen.device)
     flat_idx = (bar_of * 12 + pc_all).reshape(B, -1)
     hist = hist.view(B, -1).scatter_add(1, flat_idx, w.reshape(B, -1)).view(B, n_bars_i, 12)
-    root = infer_root(hist)                                          # (B, n_bars_i)
     gt = (keys.view(-1, 1) + torch.tensor(OFFSETS, device=gen.device)[
         (torch.arange(n_bars_i, device=gen.device) + n_prompt // spc) % 4].view(1, -1)) % 12
-    rel = (root - gt) % 12
-    sounding = hist.sum(-1) > 0
-    root_exact = ((rel == 0) & sounding).float().mean(1)
-    root_chordtone = (((rel == 0) | (rel == 3) | (rel == 4) | (rel == 7))
-                      & sounding).float().mean(1)
+
+    def tiers(h):
+        rel = (infer_root(h) - gt) % 12
+        sounding = h.sum(-1) > 0
+        return (((rel == 0) & sounding).float().mean(1),
+                (((rel == 0) | (rel == 3) | (rel == 4) | (rel == 7)) & sounding)
+                .float().mean(1))
+
+    root_exact, root_chordtone = tiers(hist)
+
+    # The bass line: the lowest sounding note of each step (v5 has chords
+    # above the bass; in v4 every step holds one note and this equals the
+    # all-notes histogram). Same duration weighting and bar clipping.
+    pitch_all = pairs[..., 1] % 128
+    lowest = torch.where(v_all, pitch_all, torch.full_like(pitch_all, 999)).argmin(-1)   # (B, n_gen)
+    is_low = torch.zeros_like(v_all).scatter_(2, lowest.unsqueeze(-1), True) & v_all
+    hist_b = torch.zeros(B, n_bars_i * 12, device=gen.device).scatter_add(
+        1, flat_idx, (w * is_low).reshape(B, -1)).view(B, n_bars_i, 12)
+    bass_exact, bass_chordtone = tiers(hist_b)
 
     step = (pc - exp) % 12
     in_chord = torch.zeros(12, dtype=torch.bool, device=gen.device)
@@ -196,6 +213,8 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
         'acc':            acc,
         'root_exact':     root_exact,
         'root_chordtone': root_chordtone,
+        'bass_exact':     bass_exact,
+        'bass_chordtone': bass_chordtone,
         'chord':          (in_chord[step] & valid).sum(1) / onsets,
         'scale':          (in_scale[step] & valid).sum(1) / onsets,
         'outside':        (~in_chord[step] & ~in_scale[step] & valid).sum(1) / onsets,

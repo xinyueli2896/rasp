@@ -73,15 +73,19 @@ else
 fi
 
 # --- the v4 configuration --------------------------------------------------
-export TRAIN_DATA="${TRAIN_DATA:-data/v4_bass_finetune.pt}"
+# DATA_PREFIX picks the dataset: data/v4_bass (bass only) or data/v5_chordal
+# (bass plus chord tracks, same spans, same splits). Everything else is the
+# same experiment.
+DATA_PREFIX="${DATA_PREFIX:-data/v4_bass}"
+export TRAIN_DATA="${TRAIN_DATA:-${DATA_PREFIX}_finetune.pt}"
 # v4 has no pretrain-key set: the host pretrained on the whole LA corpus, so
 # every key is "seen in pretrain" and the split is two-way, finetune keys vs
 # the held-out F# and G#. The scratch stem still wants a second file to
 # interleave; it gets the finetune file, so scratch = a random-init host
 # trained with the adapter on the finetune keys.
-export PRETRAIN_DATA="${PRETRAIN_DATA:-data/v4_bass_finetune.pt}"
-export VAL_DATA="${VAL_DATA:-data/v4_bass_all.pt}"
-export UNSEEN_DATA="${UNSEEN_DATA:-data/v4_bass_unseen.pt}"
+export PRETRAIN_DATA="${PRETRAIN_DATA:-${DATA_PREFIX}_finetune.pt}"
+export VAL_DATA="${VAL_DATA:-${DATA_PREFIX}_all.pt}"
+export UNSEEN_DATA="${UNSEEN_DATA:-${DATA_PREFIX}_unseen.pt}"
 export CKPT_DIR="${CKPT_DIR:-checkpoints_$TAG}"
 export LOG_DIR="${LOG_DIR:-logs_$TAG}"
 export N_SKIP="${N_SKIP:-1}"
