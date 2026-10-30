@@ -211,17 +211,33 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
 def generate(model, is_adapter: bool, prompt: torch.Tensor, total: int,
              temperature: float, device) -> torch.Tensor:
     """(B, total - n_prompt, subseq) processed tokens of the continuation."""
-    n_prompt = prompt.shape[1]
+    n_prompt, width = prompt.shape[1], prompt.shape[2]
+    # The prompt is a [:, :n_prompt] slice of the processed window, which is
+    # not contiguous, and local_encode .view()s its input.
+    prompt = prompt.contiguous()
     if is_adapter:
         sampled = model.global_sampling(prompt, max_seq_len=total,
                                         temperature=temperature)
         return torch.stack(sampled[n_prompt:], 1)
+    # _sample is B=1, and its steps stop at EOS, so they come back at
+    # different widths; pad them out to the data's width like the prompt.
+    pad = model.tokenizer.pad_token
     outs = []
-    for i in range(prompt.shape[0]):                       # _sample is B=1
+    for i in range(prompt.shape[0]):
         s = _sample(model, prompt[i:i + 1], total, temperature, device,
                     show_progress=False)
-        outs.append(torch.cat(s[n_prompt:], 0))
+        steps = [_fit_width(t, width, pad) for t in s[n_prompt:]]
+        outs.append(torch.cat(steps, 0))
     return torch.stack(outs, 0)
+
+
+def _fit_width(step: torch.Tensor, width: int, pad: int) -> torch.Tensor:
+    """(1, w) -> (1, width): right-padded with pad, or cut to width."""
+    w = step.shape[-1]
+    if w >= width:
+        return step[..., :width]
+    return torch.cat([step, torch.full((step.shape[0], width - w), pad,
+                                       dtype=step.dtype, device=step.device)], -1)
 
 
 def write_midi(tokens: torch.Tensor, tokenizer, path: str) -> None:
