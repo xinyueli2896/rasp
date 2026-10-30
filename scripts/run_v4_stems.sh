@@ -229,6 +229,10 @@ for t in $TEMPS; do
     echo; echo "=== combined across seeds, ${PROBE_PROMPT}-step prompt, temperature $t ==="
     python -m midi_adapter.aggregate_seeds $jsons 2>&1 \
       | tee "$LOG_DIR/table_all_seeds_p${PROBE_PROMPT}_T${t}.log"
+    # every tier (histogram root, bass line), mean ± std over seeds
+    python -m midi_adapter.aggregate_v4_seeds $jsons \
+      --out "$LOG_DIR/table_tiers_all_seeds_p${PROBE_PROMPT}_T${t}.json" 2>&1 \
+      | tee "$LOG_DIR/table_tiers_all_seeds_p${PROBE_PROMPT}_T${t}.log"
   fi
 done
 echo; echo "all seeds done."
