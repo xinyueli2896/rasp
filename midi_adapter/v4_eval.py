@@ -311,6 +311,9 @@ def main():
     p.add_argument('--json_out', default=None)
     p.add_argument('--data_only', action='store_true',
                    help='no checkpoints: the Data row and data MIDIs only')
+    p.add_argument('--skip_pretrain', action='store_true',
+                   help='leave out the Pretrain row (a partial table whose '
+                        'Pretrain row comes from the full one at merge time)')
     p.add_argument('--device', default=None)
     args = p.parse_args()
 
@@ -356,6 +359,8 @@ def main():
         from midi_adapter.cp_results_table import build_entries
         entries = build_entries(args, device)
         base = entries[0][1]
+        if args.skip_pretrain:
+            entries = [e for e in entries if e[0] != 'Pretrain']
 
     print()
     print('=' * 60)
@@ -379,11 +384,39 @@ def main():
         print('  '.join(f'{metrics["root_exact"][lbl][r]:.3f}' for r, _, _ in rows)
               + '   (root_exact)')
 
+    protocol = {'n_prompt_beats': args.n_prompt_beats,
+                'n_gen_beats': args.n_gen_beats, 'n_trials': args.n_trials,
+                'beats_per_chord': args.beats_per_chord,
+                'temperature': args.temperature,
+                'prompt_data': args.prompt_data, 'prompt_split': args.prompt_split}
+    print_tables(protocol, rows, results, metrics, chord, per_key_all)
+
+    if args.json_out:
+        os.makedirs(os.path.dirname(args.json_out) or '.', exist_ok=True)
+        with open(args.json_out, 'w') as f:
+            json.dump({'protocol': protocol,
+                       # 'results' stays the downbeat metric so aggregate_seeds
+                       # reads it as before; the three tiers are under 'metrics'.
+                       'results': results, 'metrics': metrics, 'chord_tone': chord,
+                       'rows': [[lbl, keys, s] for lbl, keys, s in rows],
+                       'per_key': {l: {str(k): v for k, v in pk.items()}
+                                   for l, pk in per_key_all.items()}},
+                      f, indent=2)
+        print(f'\nwrote {args.json_out}')
+    if args.save_midi_dir:
+        print(f'midi -> {args.save_midi_dir}/<model>/key_<root>.mid '
+              f'(prompt first, then the continuation; Data/ is the real one)')
+
+
+def print_tables(protocol, rows, results, metrics, chord, per_key_all):
+    """The three tiers, the harmonic profile and the per-key line, as text.
+    Shared with merge_tables so a merged table prints exactly like a direct one."""
     labels = list(results)
+    spc = protocol['beats_per_chord']
     print()
-    print(f'{args.n_prompt_beats}-step prompt, {args.n_gen_beats} generated, '
-          f'{args.n_gen_beats // args.beats_per_chord} scored bars per prompt, '
-          f'temperature {args.temperature}')
+    print(f'{protocol["n_prompt_beats"]}-step prompt, {protocol["n_gen_beats"]} generated, '
+          f'{protocol["n_gen_beats"] // spc} scored bars per prompt, '
+          f'temperature {protocol["temperature"]}')
     for m in METRICS:
         print()
         print(f'{m}: {METRIC_NAMES[m]}')
@@ -401,30 +434,10 @@ def main():
     print('per key, root_exact')
     print(f'{"":<16}' + ''.join(f'{ROOT_NAMES[k]:>6}' for k in range(12)))
     for l in labels:
+        pk = {int(k): v for k, v in per_key_all[l].items()}
         print(f'{l[:16]:<16}' + ''.join(
-            f'{per_key_all[l][k]["root_exact"]:>6.2f}' if k in per_key_all[l] else f'{"-":>6}'
+            f'{pk[k]["root_exact"]:>6.2f}' if k in pk else f'{"-":>6}'
             for k in range(12)))
-
-    if args.json_out:
-        os.makedirs(os.path.dirname(args.json_out) or '.', exist_ok=True)
-        with open(args.json_out, 'w') as f:
-            json.dump({'protocol': {'n_prompt_beats': args.n_prompt_beats,
-                                    'n_gen_beats': args.n_gen_beats,
-                                    'n_trials': args.n_trials,
-                                    'beats_per_chord': args.beats_per_chord,
-                                    'temperature': args.temperature,
-                                    'prompt_data': args.prompt_data,
-                                    'prompt_split': args.prompt_split},
-                       # 'results' stays the downbeat metric so aggregate_seeds
-                       # reads it as before; the three tiers are under 'metrics'.
-                       'results': results, 'metrics': metrics, 'chord_tone': chord,
-                       'per_key': {l: {str(k): v for k, v in pk.items()}
-                                   for l, pk in per_key_all.items()}},
-                      f, indent=2)
-        print(f'\nwrote {args.json_out}')
-    if args.save_midi_dir:
-        print(f'midi -> {args.save_midi_dir}/<model>/key_<root>.mid '
-              f'(prompt first, then the continuation; Data/ is the real one)')
 
 
 if __name__ == '__main__':

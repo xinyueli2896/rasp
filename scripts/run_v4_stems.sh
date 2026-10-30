@@ -28,6 +28,9 @@
 #   BASE_CKPT   the pretrained host. Default is the v0.42 checkpoint.
 #   SEEDS       default "1 2 3"
 #   STEMS       default "finetune frozen lora noinput trainar scratch"
+#   EVAL_STEMS  which runs the eval stage scores; default = STEMS. A subset
+#               writes table_s<seed>_<tag>_<stems>.json without the Pretrain
+#               row, for merge_tables to union with the other node's table.
 #   TEMPS       default "0 1"
 #   PARALLEL=0  run the stems of a wave one after another instead of together
 #
@@ -48,8 +51,26 @@ has () { [[ " $STAGES " == *" $1 "* ]]; }
 TAG="${TAG:-v4}"
 export BASE_CKPT="${BASE_CKPT:-checkpoints/cp_transformer_v0.42_size1_batch_48_schedule.epoch=00.fin.ckpt}"
 SEEDS="${SEEDS:-1 2 3}"
-STEMS="${STEMS:-finetune frozen lora noinput trainar scratch}"
+ALL_STEMS="finetune frozen lora noinput trainar scratch"
+STEMS="${STEMS:-$ALL_STEMS}"
+EVAL_STEMS="${EVAL_STEMS:-$STEMS}"
 PARALLEL="${PARALLEL:-1}"
+run_of () {   # stem -> run name prefix, as run_cp_stems.sh names them
+  case "$1" in
+    finetune) echo cp_bass_ft ;;        frozen)  echo cp_yy_frozen ;;
+    lora)     echo cp_yy_lora ;;        trainar) echo cp_yy_trainar ;;
+    scratch)  echo cp_yy_scratch ;;     noinput) echo cp_yy_noinput_mlp_aux1 ;;
+    *) echo "unknown stem: $1" >&2; exit 1 ;;
+  esac
+}
+# A partial eval (not every stem) is one node's share of the table: it is
+# named after its stems and leaves the Pretrain row to the full table.
+if [[ "$(echo $EVAL_STEMS | tr ' ' '\n' | sort | tr '\n' ' ')" == \
+      "$(echo $ALL_STEMS  | tr ' ' '\n' | sort | tr '\n' ' ')" ]]; then
+  TABLE_SUFFIX=""; PARTIAL=0
+else
+  TABLE_SUFFIX="_$(echo $EVAL_STEMS | tr ' ' '-')"; PARTIAL=1
+fi
 
 # --- the v4 configuration --------------------------------------------------
 export TRAIN_DATA="${TRAIN_DATA:-data/v4_bass_finetune.pt}"
@@ -122,24 +143,31 @@ echo "data : $TRAIN_DATA / $UNSEEN_DATA / $PRETRAIN_DATA / $VAL_DATA"
 
 # --- the table for one seed ------------------------------------------------
 eval_seed () {
-  local sd="$1" ft args t tag
-  ft="$(ls -1 "$CKPT_DIR/cp_bass_ft_${TAG}_s$sd"/*.ckpt 2>/dev/null \
-        | grep -v 'last\.ckpt' | sort -t= -k3 -g | head -1)"
-  if [[ -n "$ft" ]]; then echo "  finetune baseline: $(basename "$ft")"
-  else echo "  finetune baseline: none found -- the Finetune column is omitted"; fi
+  local sd="$1" ft args t tag s runs=() want_ft=0
+  for s in $EVAL_STEMS; do
+    if [[ "$s" == finetune ]]; then want_ft=1; else runs+=("$(run_of "$s")_${TAG}_s$sd"); fi
+  done
+  ft=""
+  if [[ "$want_ft" == 1 ]]; then
+    ft="$(ls -1 "$CKPT_DIR/cp_bass_ft_${TAG}_s$sd"/*.ckpt 2>/dev/null \
+          | grep -v 'last\.ckpt' | sort -t= -k3 -g | head -1)"
+    if [[ -n "$ft" ]]; then echo "  finetune baseline: $(basename "$ft")"
+    else echo "  finetune baseline: none found -- the Finetune column is omitted"; fi
+  fi
+  echo "  eval stems: $EVAL_STEMS  -> runs: ${runs[*]:-none}$([[ "$PARTIAL" == 1 ]] && echo '  (partial table, no Pretrain row)')"
 
   for t in $TEMPS; do
-    tag="p${PROBE_PROMPT}_T${t}"
+    tag="p${PROBE_PROMPT}_T${t}${TABLE_SUFFIX}"
     args=(--base_ckpt "$BASE_CKPT" --ckpt_dir "$CKPT_DIR"
-          --runs "cp_yy_frozen_${TAG}_s$sd" "cp_yy_lora_${TAG}_s$sd" "cp_yy_trainar_${TAG}_s$sd"
-                 "cp_yy_scratch_${TAG}_s$sd" "cp_yy_noinput_mlp_aux1_${TAG}_s$sd"
           --adapter_rank 256 --n_skip "$N_SKIP" --rule_key_select "$KEY_SELECT"
           --prompt_data "$TRAIN_DATA" "$UNSEEN_DATA"
           --beats_per_chord "$BEATS_PER_CHORD"
           --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
           --n_trials "$N_TRIALS" --temperature "$t"
           --json_out "$LOG_DIR/table_s${sd}_${tag}.json")
-    [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/$tag")
+    [[ ${#runs[@]} -gt 0 ]] && args+=(--runs "${runs[@]}")
+    [[ "$PARTIAL" == 1 ]] && args+=(--skip_pretrain)
+    [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/p${PROBE_PROMPT}_T${t}")
     [[ -n "$ft" ]] && args+=(--ft_ckpt "$ft")
     echo "=== table, seed $sd, temperature $t ==="
     python -m midi_adapter.v4_eval "${args[@]}" 2>&1 | tee "$LOG_DIR/table_s${sd}_${tag}.log"
@@ -178,6 +206,14 @@ for sd in $SEEDS; do
 done
 
 has eval || { echo; echo "train stage done (no eval requested)."; exit 0; }
+if [[ "$PARTIAL" == 1 ]]; then
+  echo; echo "partial table(s) written:"
+  for sd in $SEEDS; do for t in $TEMPS; do
+    echo "  $LOG_DIR/table_s${sd}_p${PROBE_PROMPT}_T${t}${TABLE_SUFFIX}.json"
+  done; done
+  echo "union with the other node's table:  python -m midi_adapter.merge_tables <a.json> <b.json> --out <merged.json>"
+  exit 0
+fi
 for t in $TEMPS; do
   jsons=""
   for sd in $SEEDS; do
