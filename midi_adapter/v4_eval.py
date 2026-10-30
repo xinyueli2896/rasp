@@ -301,11 +301,15 @@ def eval_entry(label, model, is_adapter, base, pool, args, device, midi_dir):
         per_key[key] = {k: float(v.mean()) for k, v in sc.items()}
         per_key[key]['n'] = len(items)
         if midi_dir:
-            # Prompt + continuation of the first trial, so the file opens on
-            # the bar the model was given and what it made of it follows.
-            full = torch.cat([proc[0, :args.n_prompt_beats], gen[0]], 0)
-            write_midi(full, base.tokenizer,
-                       os.path.join(midi_dir, label, f'key_{ROOT_NAMES[key]}.mid'))
+            # Prompt + continuation, so the file opens on the bar the model
+            # was given and what it made of it follows. The first trial keeps
+            # the plain name; further ones (--save_midi_per_key) add _t<i>.
+            for i in range(min(args.save_midi_per_key, len(items))):
+                full = torch.cat([proc[i, :args.n_prompt_beats], gen[i]], 0)
+                suffix = '' if i == 0 else f'_t{i}'
+                write_midi(full, base.tokenizer,
+                           os.path.join(midi_dir, label,
+                                        f'key_{ROOT_NAMES[key]}{suffix}.mid'))
     return per_key
 
 
@@ -343,6 +347,10 @@ def main():
                    help='prompts per key (fewer if the split has fewer)')
     p.add_argument('--temperature', type=float, default=0.0)
     p.add_argument('--save_midi_dir', default=None)
+    p.add_argument('--save_midi_per_key', type=int, default=1,
+                   help='how many prompts per key to write as MIDI (at most '
+                        '--n_trials); the first is key_<root>.mid, the rest '
+                        'key_<root>_t<i>.mid')
     p.add_argument('--json_out', default=None)
     p.add_argument('--data_only', action='store_true',
                    help='no checkpoints: the Data row and data MIDIs only')
@@ -439,7 +447,8 @@ def main():
                       f, indent=2)
         print(f'\nwrote {args.json_out}')
     if args.save_midi_dir:
-        print(f'midi -> {args.save_midi_dir}/<model>/key_<root>.mid '
+        print(f'midi -> {args.save_midi_dir}/<model>/key_<root>[_t<i>].mid, '
+              f'{args.save_midi_per_key} per key '
               f'(prompt first, then the continuation; Data/ is the real one)')
 
 

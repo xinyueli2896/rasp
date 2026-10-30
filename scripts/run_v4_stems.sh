@@ -112,6 +112,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
 N_TRIALS="${N_TRIALS:-10}"
 TEMPS="${TEMPS:-0 1}"
 MIDI_DIR="${MIDI_DIR-eval_midi_$TAG}"
+MIDI_PER_KEY="${MIDI_PER_KEY:-1}"       # prompts per key written as MIDI
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -171,7 +172,8 @@ eval_seed () {
           --json_out "$LOG_DIR/table_s${sd}_${tag}.json")
     [[ ${#runs[@]} -gt 0 ]] && args+=(--runs "${runs[@]}")
     [[ "$PARTIAL" == 1 ]] && args+=(--skip_pretrain)
-    [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/p${PROBE_PROMPT}_T${t}")
+    [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/p${PROBE_PROMPT}_T${t}"
+                                   --save_midi_per_key "$MIDI_PER_KEY")
     [[ -n "$ft" ]] && args+=(--ft_ckpt "$ft")
     echo "=== table, seed $sd, temperature $t ==="
     python -m midi_adapter.v4_eval "${args[@]}" 2>&1 | tee "$LOG_DIR/table_s${sd}_${tag}.log"
