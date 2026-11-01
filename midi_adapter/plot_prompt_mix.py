@@ -37,9 +37,10 @@ import numpy as np
 CLASSES = (('root', 'root', '#2a9d3f'),
            ('chord', '3rd / 5th', '#e0a800'),
            ('nct', 'non-chord tone', '#d7301f'))
-# --two_classes: root and 3rd/5th merged into chord tones; the two shares
-# sum to 1, so only the chord-tone cloud is drawn (the other is its mirror).
-TWO_CLASSES = (('ct', 'chord tone (root, 3rd, 5th)', '#2a9d3f'),)
+# --two_classes: root and 3rd/5th merged into chord tones, against the
+# non-chord tones (the two shares sum to 1, so the clouds mirror each other).
+TWO_CLASSES = (('ct', 'chord tone (root, 3rd, 5th)', '#2a9d3f'),
+               ('nct', 'non-chord tone', '#d7301f'))
 PREFIX = {'count': 'p_', 'dur': 'pdur_', 'bass': 'pbass_'}
 METRIC_TITLES = {'acc': 'downbeat accuracy',
                  'root_exact': 'root_exact',
@@ -141,8 +142,10 @@ def main():
     ap.add_argument('--jitter', type=float, default=0.015,
                     help='vertical jitter so the discrete scores do not stack')
     ap.add_argument('--two_classes', action='store_true',
-                    help='x = share of chord tones (root + 3rd/5th) only; the '
-                         'non-chord-tone share is 1 minus that')
+                    help='two clouds: chord tones (root + 3rd/5th) in green, '
+                         'non-chord tones in red')
+    ap.add_argument('--separate', action='store_true',
+                    help='also write one PNG per model and metric')
     ap.add_argument('--tag', default='', help='suffix for the figure file names')
     args = ap.parse_args()
 
@@ -233,6 +236,31 @@ def main():
         fig.savefig(out, dpi=150)
         plt.close(fig)
         print(f'  -> {out}')
+        if args.separate:
+            sep_dir = os.path.join(args.out_dir, 'per_model')
+            os.makedirs(sep_dir, exist_ok=True)
+            for model in models:
+                sub = [r for r in rows if r['model'] == model]
+                y = np.array([r[metric] for r in sub])
+                f1, ax = plt.subplots(figsize=(5, 4))
+                for cls, lbl, color in classes:
+                    x = 100 * np.array([r[pre + cls] for r in sub])
+                    ax.scatter(x, y + rng.uniform(-args.jitter, args.jitter, len(y)),
+                               s=12, alpha=0.4, color=color, edgecolors='none', label=lbl)
+                    res = fit_curve(x, y, args.degree, rng=rng) if args.trend == 'fit' else None
+                    if res is not None:
+                        gx, gy, lo, hi, _ = res
+                        ax.fill_between(gx, lo, hi, color=color, alpha=0.15, lw=0)
+                        ax.plot(gx, gy, '-', color=color, lw=2)
+                ax.set_xlim(-2, 102); ax.set_ylim(-0.05, 1.05); ax.grid(alpha=0.25)
+                ax.set_xlabel(f'% of prompt notes ({args.weight})')
+                ax.set_ylabel(f'{METRIC_TITLES.get(metric, metric)} of generated bars')
+                ax.set_title(f'{model}  (n={len(sub)}{grp})', fontsize=10)
+                ax.legend(loc='lower left', fontsize=8, framealpha=0.9)
+                f1.tight_layout()
+                f1.savefig(os.path.join(sep_dir, f'prompt_mix_{metric}_{model}{suffix}.png'), dpi=150)
+                plt.close(f1)
+            print(f'     per-model files in {sep_dir}/')
 
 
 if __name__ == '__main__':
