@@ -37,6 +37,9 @@ import numpy as np
 CLASSES = (('root', 'root', '#2a9d3f'),
            ('chord', '3rd / 5th', '#e0a800'),
            ('nct', 'non-chord tone', '#d7301f'))
+# --two_classes: root and 3rd/5th merged into chord tones; the two shares
+# sum to 1, so only the chord-tone cloud is drawn (the other is its mirror).
+TWO_CLASSES = (('ct', 'chord tone (root, 3rd, 5th)', '#2a9d3f'),)
 PREFIX = {'count': 'p_', 'dur': 'pdur_', 'bass': 'pbass_'}
 METRIC_TITLES = {'acc': 'downbeat accuracy',
                  'root_exact': 'root_exact',
@@ -137,6 +140,9 @@ def main():
     ap.add_argument('--bins', type=int, default=10, help='equal-width bins over 0..100%%')
     ap.add_argument('--jitter', type=float, default=0.015,
                     help='vertical jitter so the discrete scores do not stack')
+    ap.add_argument('--two_classes', action='store_true',
+                    help='x = share of chord tones (root + 3rd/5th) only; the '
+                         'non-chord-tone share is 1 minus that')
     ap.add_argument('--tag', default='', help='suffix for the figure file names')
     args = ap.parse_args()
 
@@ -157,6 +163,10 @@ def main():
         for r in rows:
             r['model'] = 'all models'
     pre = PREFIX[args.weight]
+    classes = TWO_CLASSES if args.two_classes else CLASSES
+    for r in rows:
+        for q in PREFIX.values():
+            r[q + 'ct'] = r[q + 'root'] + r[q + 'chord']
     seeds = sorted({r['seed'] for r in rows})
     os.makedirs(args.out_dir, exist_ok=True)
     rng = np.random.default_rng(0)
@@ -166,9 +176,9 @@ def main():
     print('per class: Spearman rho between the prompt share and the outcome, and the '
           f'fitted change in the outcome per +10 points of share (degree {args.degree})')
     head = f'{"model":<26}{"metric":<16}{"n":>5}' + ''.join(
-        f'{lbl:>18}' for _, lbl, _ in CLASSES)
+        f'{lbl:>28}' for _, lbl, _ in classes)
     print(head)
-    print(f'{"":<47}' + ''.join(f'{"rho":>9}{"/10pt":>9}' for _ in CLASSES))
+    print(f'{"":<47}' + ''.join(f'{"rho":>19}{"/10pt":>9}' for _ in classes))
 
     for metric in args.metrics:
         n_panels = len(models)
@@ -182,7 +192,7 @@ def main():
             sub = [r for r in rows if r['model'] == model]
             y = np.array([r[metric] for r in sub])
             line = f'{model:<26}{metric:<16}{len(sub):>5}'
-            for cls, lbl, color in CLASSES:
+            for cls, lbl, color in classes:
                 x = 100 * np.array([r[pre + cls] for r in sub])
                 yj = y + rng.uniform(-args.jitter, args.jitter, len(y))
                 ax.scatter(x, yj, s=9, alpha=0.35, color=color, edgecolors='none',
@@ -198,7 +208,7 @@ def main():
                     bx, by, _ = binned(x, y, edges)
                     if len(bx):
                         ax.plot(bx, by, '-o', color=color, ms=4, lw=1.6)
-                line += f'{spearman(x, y):>9.3f}{slope:>9.3f}'
+                line += f'{spearman(x, y):>19.3f}{slope:>9.3f}'
             print(line)
             ax.set_title(f'{model}  (n={len(sub)})', fontsize=10)
             ax.set_xlim(-2, 102)
@@ -217,7 +227,8 @@ def main():
                      fontsize=11)
         fig.tight_layout(rect=(0, 0, 1, 0.96))
         suffix = f'_{args.weight}' + ('' if args.group == 'all' else f'_{args.group}') \
-                 + ('_pooled' if args.pool else '') + args.tag
+                 + ('_pooled' if args.pool else '') \
+                 + ('_ct' if args.two_classes else '') + args.tag
         out = os.path.join(args.out_dir, f'prompt_mix_{metric}{suffix}.png')
         fig.savefig(out, dpi=150)
         plt.close(fig)
