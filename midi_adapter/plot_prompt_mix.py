@@ -54,6 +54,8 @@ def load(paths: list[str]) -> list[dict]:
                 r = {k: (float(v) if k not in ('model', 'key_name', 'group', 'file')
                          else v) for k, v in r.items()}
                 r['seed'] = seed
+                # cp_yy_lora_v5_s1 and _s2 are one model across seeds
+                r['model'] = re.sub(r'_s\d+$', '', r['model'])
                 rows.append(r)
     return rows
 
