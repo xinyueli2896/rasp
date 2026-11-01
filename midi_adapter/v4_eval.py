@@ -222,6 +222,57 @@ def score_tokens(gen: torch.Tensor, keys: torch.Tensor, n_prompt: int, spc: int)
     }
 
 
+def prompt_mix(prompt: torch.Tensor, keys: torch.Tensor, spc: int) -> dict:
+    """The prompt-mix experiment's x axis: how the prompt's notes split into
+    the three classes relative to the rule root of their bar.
+
+    prompt: (B, n_prompt, subseq) PROCESSED tokens for absolute steps
+    0 .. n_prompt-1. Every note slot of every step counts (drums excluded,
+    as in the scorer); a note is 'root' when its pitch class is the bar's
+    rule root, 'chord' when it is the third (major or minor) or the fifth,
+    'nct' (non-chord tone) otherwise. Returns (B,) tensors: the share of
+    notes in each class (count-based, summing to 1 when the prompt has any
+    note), the same shares weighted by duration, the same for the bass line
+    (lowest note of each step), and the note count.
+    """
+    B, n_prompt, _ = prompt.shape
+    W = prompt.shape[-1] // 2
+    pairs = prompt.view(B, n_prompt, W, 2)
+    valid = (pairs[..., 0] < 127) & (pairs[..., 1] >= 128)           # (B, n, W)
+    pc = (pairs[..., 1] % 128) % 12
+    t = torch.arange(n_prompt, device=prompt.device)
+    root = (keys.view(-1, 1) + torch.tensor(OFFSETS, device=prompt.device)[
+        (t // spc) % 4].view(1, -1)) % 12                              # (B, n)
+    rel = (pc - root.unsqueeze(-1)) % 12
+    is_root = (rel == 0) & valid
+    is_chord = ((rel == 3) | (rel == 4) | (rel == 7)) & valid
+    is_nct = valid & ~is_root & ~is_chord
+    dur_idx = (pairs[..., 1] // 128 - 1).clamp(0, len(DURATION_TEMPLATES) - 1)
+    dur = torch.tensor(DURATION_TEMPLATES, device=prompt.device)[dur_idx].float()
+    pitch = pairs[..., 1] % 128
+    lowest = torch.where(valid, pitch, torch.full_like(pitch, 999)).argmin(-1)
+    is_low = torch.zeros_like(valid).scatter_(2, lowest.unsqueeze(-1), True) & valid
+
+    def shares(weight, prefix):
+        tot = (weight * valid).sum((1, 2)).clamp(min=1e-9)
+        return {f'{prefix}root': (weight * is_root).sum((1, 2)) / tot,
+                f'{prefix}chord': (weight * is_chord).sum((1, 2)) / tot,
+                f'{prefix}nct': (weight * is_nct).sum((1, 2)) / tot}
+
+    out = shares(torch.ones_like(dur), 'p_')
+    out.update(shares(dur, 'pdur_'))
+    out.update(shares(is_low.float(), 'pbass_'))
+    out['p_notes'] = valid.sum((1, 2)).float()
+    out['p_steps_sounding'] = valid.any(-1).sum(1).float()
+    return out
+
+
+PROMPT_MIX_COLS = ('p_root', 'p_chord', 'p_nct', 'pdur_root', 'pdur_chord',
+                   'pdur_nct', 'pbass_root', 'pbass_chord', 'pbass_nct',
+                   'p_notes', 'p_steps_sounding')
+PER_PROMPT_OUTCOMES = METRICS + ('onsets_per_bar',)
+
+
 # ---------------------------------------------------------------------------
 # Generation
 # ---------------------------------------------------------------------------
@@ -275,11 +326,16 @@ def write_midi(tokens: torch.Tensor, tokenizer, path: str) -> None:
 # One model over the prompt pool
 # ---------------------------------------------------------------------------
 
-def eval_entry(label, model, is_adapter, base, pool, args, device, midi_dir):
+def eval_entry(label, model, is_adapter, base, pool, args, device, midi_dir,
+               per_prompt: list | None = None):
     """{key: {'acc':..., 'chord':..., ...}} averaged over that key's prompts.
 
     model=None scores the DATA: the real continuation of each prompt, run
     through the same scorer -- the reference row.
+
+    per_prompt, when a list, collects one dict per (prompt, model): the
+    prompt-mix features of the prompt bar and the unaveraged scores of its
+    continuation (--per_prompt_csv).
     """
     spc = args.beats_per_chord
     total = args.n_prompt_beats + args.n_gen_beats
@@ -300,6 +356,15 @@ def eval_entry(label, model, is_adapter, base, pool, args, device, midi_dir):
         sc = score_tokens(gen, keys, args.n_prompt_beats, spc)
         per_key[key] = {k: float(v.mean()) for k, v in sc.items()}
         per_key[key]['n'] = len(items)
+        if per_prompt is not None:
+            mix = prompt_mix(proc[:, :args.n_prompt_beats], keys, spc)
+            for i, (fname, song, _) in enumerate(items):
+                row = {'model': label, 'key': key, 'key_name': ROOT_NAMES[key],
+                       'group': 'unseen' if key in UNSEEN else 'finetuned',
+                       'prompt': i, 'file': fname, 'song': song}
+                row.update({c: float(mix[c][i]) for c in PROMPT_MIX_COLS})
+                row.update({m: float(sc[m][i]) for m in PER_PROMPT_OUTCOMES})
+                per_prompt.append(row)
         if midi_dir:
             # Prompt + continuation, so the file opens on the bar the model
             # was given and what it made of it follows. The first trial keeps
@@ -352,6 +417,11 @@ def main():
                         '--n_trials); the first is key_<root>.mid, the rest '
                         'key_<root>_t<i>.mid')
     p.add_argument('--json_out', default=None)
+    p.add_argument('--per_prompt_csv', default=None,
+                   help='prompt-mix experiment: one row per (prompt, model) '
+                        'with the prompt bar\'s root / third-fifth / '
+                        'non-chord-tone shares and the unaveraged scores of '
+                        'its continuation (plot_prompt_mix.py reads it)')
     p.add_argument('--data_only', action='store_true',
                    help='no checkpoints: the Data row and data MIDIs only')
     p.add_argument('--skip_pretrain', action='store_true',
@@ -410,10 +480,11 @@ def main():
     print('Evaluating')
     print('=' * 60)
     results, metrics, chord, per_key_all = {}, {m: {} for m in METRICS}, {}, {}
+    per_prompt = [] if args.per_prompt_csv else None
     for lbl, model, is_ad in [('Data', None, False)] + list(entries):
         print(f'  {lbl} ...', end='  ', flush=True)
         pk = eval_entry(lbl, model, is_ad, base, pool, args, device,
-                        args.save_midi_dir)
+                        args.save_midi_dir, per_prompt)
         per_key_all[lbl] = pk
         results[lbl], chord[lbl] = {}, {}
         for m in METRICS:
@@ -446,6 +517,15 @@ def main():
                                    for l, pk in per_key_all.items()}},
                       f, indent=2)
         print(f'\nwrote {args.json_out}')
+    if per_prompt is not None:
+        import csv
+        os.makedirs(os.path.dirname(args.per_prompt_csv) or '.', exist_ok=True)
+        with open(args.per_prompt_csv, 'w', newline='') as f:
+            wr = csv.DictWriter(f, fieldnames=list(per_prompt[0]))
+            wr.writeheader()
+            wr.writerows(per_prompt)
+        print(f'wrote {args.per_prompt_csv}  ({len(per_prompt)} rows: '
+              f'prompt mix + unaveraged scores per prompt and model)')
     if args.save_midi_dir:
         print(f'midi -> {args.save_midi_dir}/<model>/key_<root>[_t<i>].mid, '
               f'{args.save_midi_per_key} per key '

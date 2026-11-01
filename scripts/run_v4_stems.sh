@@ -113,6 +113,10 @@ N_TRIALS="${N_TRIALS:-10}"
 TEMPS="${TEMPS:-0 1}"
 MIDI_DIR="${MIDI_DIR-eval_midi_$TAG}"
 MIDI_PER_KEY="${MIDI_PER_KEY:-1}"       # prompts per key written as MIDI
+# Prompt-mix experiment: PER_PROMPT=1 (default) also writes
+# prompt_mix_s<seed>_<tag>.csv, one row per prompt and model, for
+# midi_adapter/plot_prompt_mix.py. PER_PROMPT=0 turns it off.
+PER_PROMPT="${PER_PROMPT:-1}"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -174,6 +178,7 @@ eval_seed () {
     [[ "$PARTIAL" == 1 ]] && args+=(--skip_pretrain)
     [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/p${PROBE_PROMPT}_T${t}"
                                    --save_midi_per_key "$MIDI_PER_KEY")
+    [[ "$PER_PROMPT" == 1 ]] && args+=(--per_prompt_csv "$LOG_DIR/prompt_mix_s${sd}_${tag}.csv")
     [[ -n "$ft" ]] && args+=(--ft_ckpt "$ft")
     echo "=== table, seed $sd, temperature $t ==="
     python -m midi_adapter.v4_eval "${args[@]}" 2>&1 | tee "$LOG_DIR/table_s${sd}_${tag}.log"
