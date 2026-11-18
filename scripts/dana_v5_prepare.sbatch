@@ -1,0 +1,196 @@
+#!/bin/bash
+# Build the v4 (bass) and v5 (bass + chord tracks) datasets on DANA, from the
+# LA MIDI corpus, in one CPU job: download, scan, finalise.
+#
+#   WORK=/l/users/$USER/v5 CONDA_ENV=rasp sbatch scripts/dana_v5_prepare.sbatch
+#
+# WORK is the only thing you must set -- point it at the new disk. Everything
+# the job makes lives under it, and nothing is written to the repo.
+#
+# Submission-time overrides work as usual, e.g. a bigger slice:
+#   sbatch --cpus-per-task=128 --time=24:00:00 scripts/dana_v5_prepare.sbatch
+#
+# RESUMABLE. If the job hits its time limit, submit it again, unchanged: the
+# download resumes (huggingface_hub keeps the partial blob) and the scan
+# resumes from its stage, which logs every member it has already read. Two
+# runs give the same datasets as one uninterrupted run; that is checked in the
+# repo against a zip scanned as 300 + 300 members.
+#
+# ---------------------------------------------------------------------------
+# Why the steps are in this order
+#
+# v5 keeps the bass plus the tracks playing chords under it, and drops a file
+# that has no chordal track ('no_chordal_track'). So v5's spans are a SUBSET
+# of v4's. Span selection itself looks only at the bass line, which means the
+# expensive pass -- every member of a 404,714-file corpus -- is the BASS one,
+# and v5 then reads only the files that pass, via --only_files_from. Done the
+# other way round, deriving v4 from a v5 stage would silently lose every
+# bass-only song. Both datasets for roughly the price of one, on identical
+# spans, so the v4 and v5 tables compare directly.
+#
+# The scans run at --min_bars 8 and the datasets are finalised at 24. The
+# stage keeps the span tensors, so raising the floor later is a seconds-long
+# --from_stage run, while LOWERING it would mean scanning the corpus again --
+# which is the part that costs hours. Scan low, finalise high.
+#
+# On DANA's Lustre guidance about many small files: the corpus stays a single
+# zip and is never extracted. UglyMIDI takes a file object, so members are
+# parsed in memory. The job's own writes are ~200 batched stage files, not
+# 404,714 of them.
+# ---------------------------------------------------------------------------
+
+#SBATCH --job-name=v5prep
+#SBATCH --output=v5prep-%j.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=64G
+#SBATCH --partition=cscc-cpu-p
+#SBATCH --qos=cscc-cpu-qos
+#SBATCH --time=12:00:00
+
+set -euo pipefail
+
+WORK="${WORK:?set WORK to a directory on the new disk, e.g. /l/users/$USER/v5}"
+CONDA_ENV="${CONDA_ENV:-rasp}"
+BRANCH="${BRANCH:-claude/modulo-sequence-generator-gzR8i}"
+REPO_URL="${REPO_URL:-https://github.com/xinyueli2896/rasp.git}"
+SCAN_MIN_BARS="${SCAN_MIN_BARS:-8}"     # what gets staged
+MIN_BARS="${MIN_BARS:-24}"              # what the datasets are built at
+BATCH="${BATCH:-2000}"                  # members per dispatch round
+MAX_FILES="${MAX_FILES:-0}"             # >0 for a probe run
+# Extra flags for both scans, e.g. EXTRA="--chord_frac 0.15" to loosen what
+# counts as a chord track, or "--cover_min 0.6" to accept a sparser bass.
+EXTRA="${EXTRA:-}"
+
+ZIP_NAME=Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA.zip
+ZIP="$WORK/LAMD/$ZIP_NAME"
+REPO="$WORK/rasp"
+UPSTREAM="$WORK/mald-upstream"
+
+mkdir -p "$WORK"/{LAMD,data,stage_bass,stage_chordal,tmp,logs}
+
+# One worker per core, and one thread per worker. Without this each joblib
+# worker lets torch/BLAS open as many threads as there are cores, and 64
+# workers times 64 threads thrashes the node for no extra throughput.
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export JOBLIB_TEMP_FOLDER="$WORK/tmp"
+# Keep the download cache off the home quota; it holds the partial blob that
+# makes a resumed download cheap.
+export HF_HOME="$WORK/hf_home"
+JOBS="${SLURM_CPUS_PER_TASK:-8}"
+
+echo "host      $(hostname)"
+echo "job       ${SLURM_JOB_ID:-interactive}"
+echo "work      $WORK"
+echo "workers   $JOBS"
+echo "started   $(date -Is)"
+
+if ! command -v conda >/dev/null; then
+  echo "conda not on PATH -- load it as you do for the mitosis project" >&2
+  exit 1
+fi
+eval "$(conda shell.bash hook)"
+conda activate "$CONDA_ENV"
+python -c "import torch, pretty_midi, joblib, huggingface_hub" \
+  || { echo "environment $CONDA_ENV is missing deps; run scripts/dana_setup_env.sh" >&2; exit 1; }
+
+# --- 1. code ---------------------------------------------------------------
+if [[ -d "$REPO/.git" ]]; then
+  git -C "$REPO" fetch origin "$BRANCH" && git -C "$REPO" checkout "$BRANCH" \
+    && git -C "$REPO" pull origin "$BRANCH"
+else
+  git clone --branch "$BRANCH" "$REPO_URL" "$REPO"
+fi
+# The upstream preprocessing: prepare_v4_data imports UglyMIDI and
+# preprocess_midi from it rather than reimplementing them, so the CP tensors
+# match what the frozen v0.42 host was pretrained on.
+[[ -d "$UPSTREAM/.git" ]] \
+  || git clone --depth 1 https://github.com/instr3/MIDI-AutoLabel-Dataset "$UPSTREAM"
+
+# --- 2. corpus -------------------------------------------------------------
+if [[ -s "$ZIP" ]]; then
+  echo "corpus already present: $ZIP ($(du -h "$ZIP" | cut -f1))"
+else
+  echo "downloading the LA MIDI corpus ..."
+  python - <<PY
+from huggingface_hub import hf_hub_download
+p = hf_hub_download(repo_id='projectlosangeles/Los-Angeles-MIDI-Dataset',
+                    filename='$ZIP_NAME',
+                    repo_type='dataset', local_dir='$WORK/LAMD')
+print('downloaded', p)
+PY
+fi
+df -h "$WORK" | tail -1
+
+cd "$REPO"
+common=(--midi_zip "$ZIP" --upstream "$UPSTREAM" --jobs "$JOBS" --batch "$BATCH")
+[[ "$MAX_FILES" != 0 ]] && common+=(--max_files "$MAX_FILES")
+# shellcheck disable=SC2206  -- word splitting is what EXTRA is for
+[[ -n "$EXTRA" ]] && common+=($EXTRA)
+
+# prepare_v4_data exits non-zero when a pass finds no spans at all, which is
+# a legitimate outcome for one track mode and not a reason to throw away the
+# other. Each pass runs under `if` so `set -e` does not end the job on it.
+
+# --- 3. the expensive pass: bass, every member -----------------------------
+echo
+echo "=== scan: bass, min_bars $SCAN_MIN_BARS ==="
+if python -m midi_adapter.prepare_v4_data "${common[@]}" \
+     --tracks bass --stage_dir "$WORK/stage_bass" \
+     --min_bars "$SCAN_MIN_BARS" \
+     --out_prefix "$WORK/data/v4_bass_min${SCAN_MIN_BARS}" \
+     2>&1 | tee -a "$WORK/logs/scan_bass.log"; then
+  echo "bass pass done"
+else
+  echo "bass pass found no spans -- see $WORK/logs/scan_bass.log for which" >&2
+  echo "reject or bar reason dominated. Nothing downstream can run." >&2
+  exit 1
+fi
+
+# --- 4. the cheap pass: chordal, only the files that yielded spans ---------
+echo
+echo "=== scan: chordal (v5), only the files behind the bass spans ==="
+if python -m midi_adapter.prepare_v4_data "${common[@]}" \
+     --tracks chordal --only_files_from "$WORK/stage_bass" \
+     --stage_dir "$WORK/stage_chordal" \
+     --min_bars "$SCAN_MIN_BARS" \
+     --out_prefix "$WORK/data/v5_chordal_min${SCAN_MIN_BARS}" \
+     2>&1 | tee -a "$WORK/logs/scan_chordal.log"; then
+  echo "chordal pass done"
+else
+  echo "chordal pass found no spans -- 'no_chordal_track' in the log means" >&2
+  echo "these songs carry no track that both belongs to a chordal GM family" >&2
+  echo "and plays 2+ notes on --chord_frac of its steps. v4 is unaffected." >&2
+fi
+
+# --- 5. the datasets, at the training window's floor -----------------------
+for pair in "bass:v4_bass" "chordal:v5_chordal"; do
+  stage="stage_${pair%%:*}"; prefix="${pair##*:}"
+  if ! compgen -G "$WORK/$stage/spans/*.pt" > /dev/null; then
+    echo; echo "=== $prefix: stage is empty, nothing to finalise ==="
+    continue
+  fi
+  echo
+  echo "=== finalise $prefix at min_bars $MIN_BARS ==="
+  python -m midi_adapter.prepare_v4_data \
+    --from_stage "$WORK/$stage" --upstream "$UPSTREAM" \
+    --tracks "${pair%%:*}" --min_bars "$MIN_BARS" \
+    --out_prefix "$WORK/data/$prefix" \
+    2>&1 | tee -a "$WORK/logs/finalise_$prefix.log"
+done
+
+echo
+echo "finished  $(date -Is)"
+echo "datasets  $WORK/data/{v4_bass,v5_chordal}_{finetune,unseen,all}.pt"
+echo "manifests $WORK/data/{v4_bass,v5_chordal}.manifest.json"
+echo "stages    $WORK/{stage_bass,stage_chordal}   (keep these: rebuilding a"
+echo "          dataset at another floor or with --balance_keys needs no rescan)"
+echo
+echo "Check in the logs, before training on any of it:"
+echo "  * the three invariants read 1.000 (and for v5, slot 0 is the bass root)"
+echo "  * the per-key table -- if the held-out keys F# and G# are thin, rerun"
+echo "    the finalise step with --balance_keys N, which takes seconds:"
+echo "    python -m midi_adapter.prepare_v4_data --from_stage $WORK/stage_chordal \\"
+echo "        --upstream $UPSTREAM --tracks chordal --min_bars $MIN_BARS \\"
+echo "        --balance_keys N --out_prefix $WORK/data/v5_chordal"

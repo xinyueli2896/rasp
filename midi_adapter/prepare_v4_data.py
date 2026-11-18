@@ -717,6 +717,20 @@ def main():
         print(f'\nstage {stage}: {len(songs)} spans from '
               f'{len(stage_done(stage))} files scanned in total')
 
+    # --min_bars again, now over whatever the stage holds. Scanning applies it
+    # too, so this is a no-op on a fresh single pass -- but it is what lets a
+    # stage be scanned once at a low floor and finalised at any higher one,
+    # which matters when the scan costs hours of cluster time and the span
+    # tensors cannot be rebuilt without rescanning the corpus. Without it, a
+    # stage scanned at 8 bars would hand a dataset of 8-bar songs to a run
+    # whose manifest claims 24, and FramedDataset would silently drop them for
+    # being shorter than one training window.
+    short = [s for s in songs if s['n_bars'] < args.min_bars]
+    if short:
+        songs = [s for s in songs if s['n_bars'] >= args.min_bars]
+        print(f'dropped {len(short)} staged spans shorter than '
+              f'--min_bars {args.min_bars}')
+
     n_files = max(scanned, len(stage_done(stage)) if stage else 0)
     print(f'\nfiles accepted: {n_files - sum(rejects.values())}/{n_files}')
     for k, v in rejects.most_common():
