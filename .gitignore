@@ -18,5 +18,6 @@ data/
 /v6/
 # SLURM job output, when -o is not passed
 v5prep-*.out
+rasp-env-*.out
 slurm-*.out
 
