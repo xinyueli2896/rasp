@@ -41,10 +41,10 @@
 # bass-only song. Both datasets for roughly the price of one, on identical
 # spans, so the v4 and v5 tables compare directly.
 #
-# The scans run at --min_bars 8 and the datasets are finalised at 24. The
-# stage keeps the span tensors, so raising the floor later is a seconds-long
-# --from_stage run, while LOWERING it would mean scanning the corpus again --
-# which is the part that costs hours. Scan low, finalise high.
+# The scans stage spans down to --min_bars 8, which is what the protocol uses.
+# The stage keeps the span tensors, so changing the floor UPWARD later is a
+# seconds-long --from_stage run, while lowering it would mean scanning the
+# corpus again -- the part that costs hours. So stage low, whatever you build.
 #
 # On DANA's Lustre guidance about many small files: the corpus stays a single
 # zip and is never extracted. UglyMIDI takes a file object, so members are
@@ -81,7 +81,14 @@ WORK="${WORK:?set WORK to a directory on the new disk, e.g. /l/users/$USER/v5}"
 CONDA_ENV="${CONDA_ENV:-rasp}"
 BRANCH="${BRANCH:-claude/modulo-sequence-generator-gzR8i}"
 SCAN_MIN_BARS="${SCAN_MIN_BARS:-8}"     # what gets staged
-MIN_BARS="${MIN_BARS:-24}"              # what the datasets are built at
+# What the datasets are built at. 8 bars = 128 subbeats, which is exactly what
+# this experiment's protocol uses: run_v4_stems.sh sets TRAIN_LENGTH=128 and
+# evaluates with a 16-subbeat prompt and 112 generated, one bar plus seven.
+# This default was 24 for a while, carried over from v1-v3's 384-subbeat
+# window, and it cost 95% of the data: on the LA corpus the chordal pass gives
+# 4032 spans at 8 bars against 184 at 24, and 288 held-out-key spans against
+# 13. Raise it only for a protocol that really needs longer songs.
+MIN_BARS="${MIN_BARS:-8}"
 BATCH="${BATCH:-2000}"                  # members per dispatch round
 MAX_FILES="${MAX_FILES:-0}"             # >0 for a probe run
 # Extra flags for both scans, e.g. EXTRA="--chord_frac 0.15" to loosen what
