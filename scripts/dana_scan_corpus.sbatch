@@ -52,6 +52,20 @@
 # 404,714 of them.
 # ---------------------------------------------------------------------------
 
+#
+# PARTITION AND QOS. DANA's docs give --partition=cscc-cpu-p with
+# --qos=cscc-cpu-qos, and that is what this job asked for until a submission
+# came back "Invalid qos specification": the docs state policy, while what a
+# given account may request lives in its SLURM association. So no QoS is
+# hardcoded here -- submitting without one uses your association's default,
+# which is usually right. Add it on the command line once you know the name:
+#
+#   sacctmgr show assoc where user=$USER format=Account,Partition,QOS,DefQOS -p
+#   sbatch --qos=<name> [-A <account>] ...
+#
+# Command-line flags override the directives below, so the partition can be
+# redirected the same way.
+
 #SBATCH --job-name=scan
 #SBATCH --output=scan-%j.out
 #SBATCH --nodes=1
@@ -59,7 +73,6 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
 #SBATCH --partition=cscc-cpu-p
-#SBATCH --qos=cscc-cpu-qos
 #SBATCH --time=12:00:00
 
 set -euo pipefail
