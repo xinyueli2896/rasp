@@ -10,3 +10,13 @@ dist/
 build/
 .env
 data/
+# The cluster work directory: the corpus zip, the scan stages, the datasets
+# and the conda env all live under it, inside the checkout. Everything in
+# there is rebuildable from the stage, and none of it belongs in git.
+/v4/
+/v5/
+/v6/
+# SLURM job output, when -o is not passed
+v5prep-*.out
+slurm-*.out
+

@@ -54,7 +54,6 @@ set -euo pipefail
 WORK="${WORK:?set WORK to a directory on the new disk, e.g. /l/users/$USER/v5}"
 CONDA_ENV="${CONDA_ENV:-rasp}"
 BRANCH="${BRANCH:-claude/modulo-sequence-generator-gzR8i}"
-REPO_URL="${REPO_URL:-https://github.com/xinyueli2896/rasp.git}"
 SCAN_MIN_BARS="${SCAN_MIN_BARS:-8}"     # what gets staged
 MIN_BARS="${MIN_BARS:-24}"              # what the datasets are built at
 BATCH="${BATCH:-2000}"                  # members per dispatch round
@@ -65,8 +64,14 @@ EXTRA="${EXTRA:-}"
 
 ZIP_NAME=Los-Angeles-MIDI-Dataset-Ver-4-0-CC-BY-NC-SA.zip
 ZIP="$WORK/LAMD/$ZIP_NAME"
-REPO="$WORK/rasp"
-UPSTREAM="$WORK/mald-upstream"
+# The repo is the checkout you submitted from, not a copy the job makes: WORK
+# may sit INSIDE it (the repo gitignores /v6/), and cloning into WORK would
+# then nest the repo in itself. SLURM_SUBMIT_DIR is where sbatch was run.
+REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
+UPSTREAM="${UPSTREAM:-$WORK/mald-upstream}"
+# Off by default: this is your working checkout, and the job has no business
+# moving it under you. Pull before submitting, or pass PULL=1.
+PULL="${PULL:-0}"
 
 mkdir -p "$WORK"/{LAMD,data,stage_bass,stage_chordal,tmp,logs}
 
@@ -106,11 +111,15 @@ python -c "import torch, pretty_midi, joblib, huggingface_hub" \
   || { echo "environment $CONDA_ENV is missing deps; run scripts/dana_setup_env.sh" >&2; exit 1; }
 
 # --- 1. code ---------------------------------------------------------------
-if [[ -d "$REPO/.git" ]]; then
+if [[ ! -f "$REPO/midi_adapter/prepare_v4_data.py" ]]; then
+  echo "REPO=$REPO is not a checkout of this repository." >&2
+  echo "Submit from the repository root, or pass REPO=/path/to/rasp." >&2
+  exit 1
+fi
+echo "repo      $REPO ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout'))"
+if [[ "$PULL" == 1 ]]; then
   git -C "$REPO" fetch origin "$BRANCH" && git -C "$REPO" checkout "$BRANCH" \
     && git -C "$REPO" pull origin "$BRANCH"
-else
-  git clone --branch "$BRANCH" "$REPO_URL" "$REPO"
 fi
 # The upstream preprocessing: prepare_v4_data imports UglyMIDI and
 # preprocess_midi from it rather than reimplementing them, so the CP tensors
