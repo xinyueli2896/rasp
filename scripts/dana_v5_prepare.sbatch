@@ -86,8 +86,18 @@ echo "work      $WORK"
 echo "workers   $JOBS"
 echo "started   $(date -Is)"
 
+# sbatch exports the submitting environment, so conda is usually already on
+# PATH from your login shell. Where it comes from a module instead, name it:
+#   MODULES="miniconda/3" WORK=... sbatch scripts/dana_v5_prepare.sbatch
+if [[ -n "${MODULES:-}" ]]; then
+  # shellcheck disable=SC1091
+  [[ -s /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
+  # shellcheck disable=SC2086
+  module load $MODULES
+fi
 if ! command -v conda >/dev/null; then
-  echo "conda not on PATH -- load it as you do for the mitosis project" >&2
+  echo "conda not on PATH. If it comes from a module on DANA, resubmit with" >&2
+  echo "MODULES=\"<the module you load for the mitosis project>\"." >&2
   exit 1
 fi
 eval "$(conda shell.bash hook)"
