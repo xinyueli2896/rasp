@@ -22,7 +22,7 @@
 #   JOB=$(ENV_PREFIX=$PWD/v6/env sbatch --parsable \
 #           -o $PWD/v6/logs/env-%j.out scripts/dana_setup_env.sh)
 #   WORK=$PWD/v6 CONDA_ENV=$PWD/v6/env sbatch --dependency=afterok:$JOB \
-#       -o $PWD/v6/logs/scan-%j.out scripts/dana_v5_prepare.sbatch
+#       -o $PWD/v6/logs/scan-%j.out scripts/dana_scan_corpus.sbatch
 #
 # srun with the same flags works too when you want to watch it live, and plain
 # `bash` still works wherever running it directly is appropriate -- the
@@ -125,4 +125,4 @@ echo
 echo "done. Submit the preparation job FROM THE REPOSITORY ROOT, so it finds"
 echo "the code through SLURM_SUBMIT_DIR:"
 echo "  WORK=\$PWD/v6 CONDA_ENV=$activate \\"
-echo "    sbatch -o \$PWD/v6/logs/scan-%j.out scripts/dana_v5_prepare.sbatch"
+echo "    sbatch -o \$PWD/v6/logs/scan-%j.out scripts/dana_scan_corpus.sbatch"

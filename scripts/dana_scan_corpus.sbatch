@@ -1,14 +1,27 @@
 #!/bin/bash
-# Build the v4 (bass) and v5 (bass + chord tracks) datasets on DANA, from the
-# LA MIDI corpus, in one CPU job: download, scan, finalise.
+# Scan the LA MIDI corpus into the two STAGES every version is built from, in
+# one CPU job: download, scan, finalise.
 #
-#   WORK=/l/users/$USER/v5 CONDA_ENV=rasp sbatch scripts/dana_v5_prepare.sbatch
+#   WORK=$PWD/v6 CONDA_ENV=$PWD/v6/env sbatch scripts/dana_scan_corpus.sbatch
+#
+# The scan is version-agnostic, which is why this job is not named after one.
+# It writes stage_bass and stage_chordal, and from those:
+#
+#   v4   = stage_bass,    roots only, bass line alone
+#   v5   = stage_chordal, roots only, bass plus the chord tracks
+#   v6   = stage_chordal  PLUS the chord-quality filter, which is a separate
+#          --from_stage step once census_v6_quality has said which QUAL
+#          patterns the corpus actually plays
+#
+# So going "straight to v6" still starts here: the stages are the expensive
+# artifact, every version after them is a seconds-long rebuild, and the
+# datasets this job writes (v4_bass, v5_chordal) are the roots-only ones.
 #
 # WORK is the only thing you must set -- point it at the new disk. Everything
 # the job makes lives under it, and nothing is written to the repo.
 #
 # Submission-time overrides work as usual, e.g. a bigger slice:
-#   sbatch --cpus-per-task=128 --time=24:00:00 scripts/dana_v5_prepare.sbatch
+#   sbatch --cpus-per-task=128 --time=24:00:00 scripts/dana_scan_corpus.sbatch
 #
 # RESUMABLE. If the job hits its time limit, submit it again, unchanged: the
 # download resumes (huggingface_hub keeps the partial blob) and the scan
@@ -39,8 +52,8 @@
 # 404,714 of them.
 # ---------------------------------------------------------------------------
 
-#SBATCH --job-name=v5prep
-#SBATCH --output=v5prep-%j.out
+#SBATCH --job-name=scan
+#SBATCH --output=scan-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=64
@@ -93,7 +106,7 @@ echo "started   $(date -Is)"
 
 # sbatch exports the submitting environment, so conda is usually already on
 # PATH from your login shell. Where it comes from a module instead, name it:
-#   MODULES="miniconda/3" WORK=... sbatch scripts/dana_v5_prepare.sbatch
+#   MODULES="miniconda/3" WORK=... sbatch scripts/dana_scan_corpus.sbatch
 if [[ -n "${MODULES:-}" ]]; then
   # shellcheck disable=SC1091
   [[ -s /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
