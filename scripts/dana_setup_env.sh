@@ -82,9 +82,31 @@ if [[ -n "${MODULES:-}" ]]; then
   # shellcheck disable=SC2086
   module load $MODULES
 fi
+# A batch job does not read your .bashrc, so conda is on PATH only if the
+# submitting shell had it. Rather than fail on that, look where it usually
+# lives -- including beside the env itself, since CONDA_ENV is often a prefix
+# inside the same installation that created it.
 if ! command -v conda >/dev/null; then
-  echo "conda not on PATH. A batch job does not read your .bashrc, so if" >&2
-  echo "conda comes from a module, resubmit with MODULES=\"<that module>\"." >&2
+  # ${CONDA_EXE%...} would abort under `set -u` when CONDA_EXE is unset, which
+  # is exactly the case this loop exists for. Empty leaves /etc/profile.d,
+  # itself a legitimate place for a system-wide conda.
+  cexe="${CONDA_EXE:-}"
+  for csh in "${cexe%/bin/conda}/etc/profile.d/conda.sh" \
+             "$CONDA_ENV/../../etc/profile.d/conda.sh" \
+             "$HOME/miniconda3/etc/profile.d/conda.sh" \
+             "$HOME/anaconda3/etc/profile.d/conda.sh" \
+             "$HOME/miniforge3/etc/profile.d/conda.sh" \
+             /opt/conda/etc/profile.d/conda.sh; do
+    if [[ -s "$csh" ]]; then
+      # shellcheck disable=SC1090
+      source "$csh" && echo "conda      sourced from $csh" && break
+    fi
+  done
+fi
+if ! command -v conda >/dev/null; then
+  echo "conda not on PATH, and not in any of the usual places. A batch job" >&2
+  echo "does not read your .bashrc: either submit from a shell where" >&2
+  echo "'which conda' works, or pass MODULES=\"<your conda module>\"." >&2
   exit 1
 fi
 eval "$(conda shell.bash hook)"
