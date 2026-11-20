@@ -127,42 +127,20 @@ echo "started   $(date -Is)"
 # sbatch exports the submitting environment, so conda is usually already on
 # PATH from your login shell. Where it comes from a module instead, name it:
 #   MODULES="miniconda/3" WORK=... sbatch scripts/dana_scan_corpus.sbatch
-if [[ -n "${MODULES:-}" ]]; then
-  # shellcheck disable=SC1091
-  [[ -s /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
-  # shellcheck disable=SC2086
-  module load $MODULES
-fi
-# A batch job does not read your .bashrc, so conda is on PATH only if the
-# submitting shell had it. Rather than fail on that, look where it usually
-# lives -- including beside the env itself, since CONDA_ENV is often a prefix
-# inside the same installation that created it.
-if ! command -v conda >/dev/null; then
-  # ${CONDA_EXE%...} would abort under `set -u` when CONDA_EXE is unset, which
-  # is exactly the case this loop exists for. Empty leaves /etc/profile.d,
-  # itself a legitimate place for a system-wide conda.
-  cexe="${CONDA_EXE:-}"
-  for csh in "${cexe%/bin/conda}/etc/profile.d/conda.sh" \
-             "$CONDA_ENV/../../etc/profile.d/conda.sh" \
-             "$HOME/miniconda3/etc/profile.d/conda.sh" \
-             "$HOME/anaconda3/etc/profile.d/conda.sh" \
-             "$HOME/miniforge3/etc/profile.d/conda.sh" \
-             /opt/conda/etc/profile.d/conda.sh; do
-    if [[ -s "$csh" ]]; then
-      # shellcheck disable=SC1090
-      source "$csh" && echo "conda     sourced from $csh" && break
-    fi
-  done
-fi
-if ! command -v conda >/dev/null; then
-  echo "conda not on PATH, and not in any of the usual places. A batch job" >&2
-  echo "does not read your .bashrc: either submit from a shell where" >&2
-  echo "'which conda' works, or pass MODULES=\"<your conda module>\"." >&2
+# The env's interpreter is named directly rather than activated. `conda
+# activate` is a shell function that conda init writes into your .bashrc, and a
+# batch job never sources that, so activating inside a job needs a conda on
+# PATH plus the shell hook -- and whether it is there depends on which shell
+# you submitted from. Naming the interpreter needs none of it.
+PY="${PY:-$CONDA_ENV/bin/python}"
+if [[ ! -x "$PY" ]]; then
+  echo "no interpreter at $PY." >&2
+  echo "CONDA_ENV should be the env PREFIX (a path), e.g. \$PWD/v6/env." >&2
+  echo "For an env known only by name, pass PY=/path/to/that/env/bin/python." >&2
   exit 1
 fi
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV"
-python -c "import torch, pretty_midi, joblib, huggingface_hub" \
+echo "python    $PY"
+"$PY" -c "import torch, pretty_midi, joblib, huggingface_hub" \
   || { echo "environment $CONDA_ENV is missing deps; run scripts/dana_setup_env.sh" >&2; exit 1; }
 
 # --- 1. code ---------------------------------------------------------------
@@ -187,13 +165,13 @@ if [[ -s "$ZIP" ]]; then
   echo "corpus already present: $ZIP ($(du -h "$ZIP" | cut -f1))"
 else
   echo "downloading the LA MIDI corpus ..."
-  python - <<PY
+  "$PY" - <<PYEOF
 from huggingface_hub import hf_hub_download
 p = hf_hub_download(repo_id='projectlosangeles/Los-Angeles-MIDI-Dataset',
                     filename='$ZIP_NAME',
                     repo_type='dataset', local_dir='$WORK/LAMD')
 print('downloaded', p)
-PY
+PYEOF
 fi
 df -h "$WORK" | tail -1
 
@@ -210,7 +188,7 @@ common=(--midi_zip "$ZIP" --upstream "$UPSTREAM" --jobs "$JOBS" --batch "$BATCH"
 # --- 3. the expensive pass: bass, every member -----------------------------
 echo
 echo "=== scan: bass, min_bars $SCAN_MIN_BARS ==="
-if python -m midi_adapter.prepare_v4_data "${common[@]}" \
+if "$PY" -m midi_adapter.prepare_v4_data "${common[@]}" \
      --tracks bass --stage_dir "$WORK/stage_bass" \
      --min_bars "$SCAN_MIN_BARS" \
      --out_prefix "$WORK/data/v4_bass_min${SCAN_MIN_BARS}" \
@@ -225,7 +203,7 @@ fi
 # --- 4. the cheap pass: chordal, only the files that yielded spans ---------
 echo
 echo "=== scan: chordal (v5), only the files behind the bass spans ==="
-if python -m midi_adapter.prepare_v4_data "${common[@]}" \
+if "$PY" -m midi_adapter.prepare_v4_data "${common[@]}" \
      --tracks chordal --only_files_from "$WORK/stage_bass" \
      --stage_dir "$WORK/stage_chordal" \
      --min_bars "$SCAN_MIN_BARS" \
@@ -247,7 +225,7 @@ for pair in "bass:v4_bass" "chordal:v5_chordal"; do
   fi
   echo
   echo "=== finalise $prefix at min_bars $MIN_BARS ==="
-  python -m midi_adapter.prepare_v4_data \
+  "$PY" -m midi_adapter.prepare_v4_data \
     --from_stage "$WORK/$stage" --upstream "$UPSTREAM" \
     --tracks "${pair%%:*}" --min_bars "$MIN_BARS" \
     --out_prefix "$WORK/data/$prefix" \
@@ -265,6 +243,6 @@ echo "Check in the logs, before training on any of it:"
 echo "  * the three invariants read 1.000 (and for v5, slot 0 is the bass root)"
 echo "  * the per-key table -- if the held-out keys F# and G# are thin, rerun"
 echo "    the finalise step with --balance_keys N, which takes seconds:"
-echo "    python -m midi_adapter.prepare_v4_data --from_stage $WORK/stage_chordal \\"
+echo "    "$PY" -m midi_adapter.prepare_v4_data --from_stage $WORK/stage_chordal \\"
 echo "        --upstream $UPSTREAM --tracks chordal --min_bars $MIN_BARS \\"
 echo "        --balance_keys N --out_prefix $WORK/data/v5_chordal"

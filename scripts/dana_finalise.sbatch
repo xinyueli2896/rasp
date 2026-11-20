@@ -25,9 +25,6 @@
 # its PARTITION QoS, applied automatically, while --qos asks for a JOB QoS
 # from your SLURM association, which does not list it ("Invalid qos
 # specification"). Add one on the command line if that ever changes.
-#
-# MODULES="..." loads modules first, for a conda that comes from one: a batch
-# job does not read your .bashrc.
 
 #SBATCH --job-name=finalise
 #SBATCH --output=finalise-%j.out
@@ -52,41 +49,19 @@ CENSUS="${CENSUS:-1}"
 
 mkdir -p "$WORK/logs"
 
-if [[ -n "${MODULES:-}" ]]; then
-  # shellcheck disable=SC1091
-  [[ -s /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
-  # shellcheck disable=SC2086
-  module load $MODULES
-fi
-# A batch job does not read your .bashrc, so conda is on PATH only if the
-# submitting shell had it. Rather than fail on that, look where it usually
-# lives -- including beside the env itself, since CONDA_ENV is often a prefix
-# inside the same installation that created it.
-if ! command -v conda >/dev/null; then
-  # ${CONDA_EXE%...} would abort under `set -u` when CONDA_EXE is unset, which
-  # is exactly the case this loop exists for. Empty leaves /etc/profile.d,
-  # itself a legitimate place for a system-wide conda.
-  cexe="${CONDA_EXE:-}"
-  for csh in "${cexe%/bin/conda}/etc/profile.d/conda.sh" \
-             "$CONDA_ENV/../../etc/profile.d/conda.sh" \
-             "$HOME/miniconda3/etc/profile.d/conda.sh" \
-             "$HOME/anaconda3/etc/profile.d/conda.sh" \
-             "$HOME/miniforge3/etc/profile.d/conda.sh" \
-             /opt/conda/etc/profile.d/conda.sh; do
-    if [[ -s "$csh" ]]; then
-      # shellcheck disable=SC1090
-      source "$csh" && echo "conda      sourced from $csh" && break
-    fi
-  done
-fi
-if ! command -v conda >/dev/null; then
-  echo "conda not on PATH, and not in any of the usual places. A batch job" >&2
-  echo "does not read your .bashrc: either submit from a shell where" >&2
-  echo "'which conda' works, or pass MODULES=\"<your conda module>\"." >&2
+# The env's interpreter is named directly rather than activated. `conda
+# activate` is a shell function that conda init writes into your .bashrc, and a
+# batch job never sources that, so activating inside a job needs a conda on
+# PATH plus the shell hook -- and whether it is there depends on which shell
+# you submitted from. Naming the interpreter needs none of it.
+PY="${PY:-$CONDA_ENV/bin/python}"
+if [[ ! -x "$PY" ]]; then
+  echo "no interpreter at $PY." >&2
+  echo "CONDA_ENV should be the env PREFIX (a path), e.g. \$PWD/v6/env." >&2
+  echo "For an env known only by name, pass PY=/path/to/that/env/bin/python." >&2
   exit 1
 fi
-eval "$(conda shell.bash hook)"
-conda activate "$CONDA_ENV"
+echo "python    $PY"
 
 if [[ ! -f "$REPO/midi_adapter/prepare_v4_data.py" ]]; then
   echo "REPO=$REPO is not a checkout of this repository." >&2
@@ -115,7 +90,7 @@ for pair in "bass:v4_bass" "chordal:v5_chordal"; do
         --tracks "${pair%%:*}" --min_bars "$MIN_BARS"
         --out_prefix "$WORK/data/$prefix")
   [[ "$BALANCE_KEYS" != 0 ]] && args+=(--balance_keys "$BALANCE_KEYS")
-  python -m midi_adapter.prepare_v4_data "${args[@]}" \
+  "$PY" -m midi_adapter.prepare_v4_data "${args[@]}" \
     2>&1 | tee "$WORK/logs/finalise_${prefix}.log"
 done
 
@@ -125,7 +100,7 @@ done
 if [[ "$CENSUS" == 1 ]] && compgen -G "$WORK/stage_chordal/spans/*.pt" > /dev/null; then
   echo
   echo "=== v6 quality census over stage_chordal ==="
-  python -m midi_adapter.census_v6_quality \
+  "$PY" -m midi_adapter.census_v6_quality \
     --stage "$WORK/stage_chordal" --min_bars "$MIN_BARS" \
     --json_out "$WORK/logs/census_min${MIN_BARS}.json" \
     2>&1 | tee "$WORK/logs/census_min${MIN_BARS}.log"
