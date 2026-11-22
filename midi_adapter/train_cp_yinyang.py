@@ -353,6 +353,7 @@ def main(args):
         rule_enc_hidden   = args.rule_enc_hidden,
         rule_key_select   = args.rule_key_select,
         rule_subbeats_per_chord = args.beats_per_chord,
+        chord_minor_pattern     = args.chord_minor_pattern,
         rule_rate               = args.rule_rate,
         strict_causal     = args.strict_causal,
         gate_init         = args.gate_init,
@@ -557,11 +558,24 @@ def get_args():
                    help='Auxiliary CE loss weight for encoder current-pitch-class reconstruction. '
                         'Directly supervises dims 0-11 of encoder output to predict the current pc. '
                         'Only active when --encoder_injected. Recommended: 1.0.')
+    p.add_argument('--chord_minor_pattern', type=str, default='harmonic',
+                   choices=['harmonic', 'natural'],
+                   help="Only with --rule_mode chord. Which minor cadence the "
+                        "rule states: harmonic (i iv V i, the corpus's 12:1 "
+                        'majority) or natural (i iv v i). Must match whatever '
+                        'prepare_v6_data selected the dataset with.')
     p.add_argument('--rule_mode', type=str, default='current',
-                   choices=['current', 'period4', 'seed_broadcast', 'compiled'],
+                   choices=['current', 'period4', 'seed_broadcast', 'compiled',
+                            'chord'],
                    help='current: analytical 16-dim rule model (existing); '
                         'period4: TRACR attention 28-dim, dims 12-23=next pc; '
                         'seed_broadcast: 28-dim, dims 12-23=seed pc; '
+                        'chord: v6 -- the rule is a CADENCE over the 24 '
+                        'triads rather than a sequence of roots, so the '
+                        'adapter reads a 52-dim chord stream (24 under '
+                        '--rule_view root_next) and takes its tonic chord from '
+                        'the prompt bar. Needs a v6 dataset and '
+                        '--beats_per_chord 16; '
                         'compiled: full TracR compilation (BassRaspCompiled) -- '
                         'attention head retrieves the key, MLP computes the next '
                         'root, so the rule is in the weights. Use --rule_view to '
