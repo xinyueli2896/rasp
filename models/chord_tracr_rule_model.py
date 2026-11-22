@@ -108,7 +108,33 @@ class ChordTracrRuleModel(nn.Module):
     """chord[b] = CADENCE[tonic_chord][b % 4], over a 24-triad vocabulary."""
 
     def __init__(self, rule_mode: str = 'period4',
-                 minor_pattern: str = 'harmonic'):
+                 minor_pattern: str = 'harmonic',
+                 subbeats_per_chord: int = 1,
+                 shift: int = 1,
+                 input_shift: int = 0,
+                 view: str = 'all'):
+        """subbeats_per_chord, shift, input_shift, view carry RaspCompiledRule's
+        alignment conventions, because v4 and v5 trained with
+        `--rule_mode compiled --rule_view root_next` and v6 has to sit in the
+        same frame to be comparable:
+
+          subbeats_per_chord  positions per bar. A CP bar is 16 subbeats, so
+                              phase is (t // spc) % 4, not t % 4. With the
+                              default 1 one position IS one bar.
+          input_shift         what the token at stream index t actually is.
+                              The CP stack shifts its stream by one before the
+                              global blocks, so the adapter at t produces beat
+                              t while its state encodes beat t-1: input_shift
+                              = -1. Row 0 is then zeroed, since nothing is
+                              knowable before the first beat.
+          shift               how far ahead the lookup reads, relative to
+                              input_shift, so the rule emits for the beat the
+                              adapter is about to influence. input_shift +
+                              shift is the offset of the predicted step.
+          view                'all' exposes the whole stream; 'chord_next'
+                              exposes only the next-chord block, the analogue
+                              of v4/v5's root_next.
+        """
         super().__init__()
         if rule_mode not in ('current', 'period4', 'seed_broadcast'):
             raise ValueError("rule_mode must be 'current', 'period4' or "
@@ -116,8 +142,16 @@ class ChordTracrRuleModel(nn.Module):
         if minor_pattern not in MINOR_PATTERNS:
             raise ValueError(f'minor_pattern must be one of '
                              f'{sorted(MINOR_PATTERNS)}, got {minor_pattern!r}')
+        if view not in ('all', 'chord_next'):
+            raise ValueError(f"view must be 'all' or 'chord_next', got {view!r}")
+        if view == 'chord_next' and rule_mode != 'period4':
+            raise ValueError("view='chord_next' needs rule_mode='period4'")
         self.rule_mode = rule_mode
         self.minor_pattern = minor_pattern
+        self.subbeats_per_chord = int(subbeats_per_chord)
+        self.shift = int(shift)
+        self.input_shift = int(input_shift)
+        self.view = view
 
         off = 0
         self.sl_cur = slice(off, off + N_CHORDS); off += N_CHORDS
@@ -131,6 +165,8 @@ class ChordTracrRuleModel(nn.Module):
             self.sl_next = self.sl_seed = None
         self.sl_phase = slice(off, off + N_POS); off += N_POS
         self.d_model = off
+        # What the adapter actually reads, as RaspCompiledRule names it.
+        self.rule_d_model = N_CHORDS if view == 'chord_next' else off
 
         # CADENCE[tonic_chord, phase] -> chord index. The whole rule, 24 x 4.
         quals = torch.tensor(MINOR_PATTERNS[minor_pattern], dtype=torch.long)
@@ -146,6 +182,15 @@ class ChordTracrRuleModel(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def phase_at(self, T: int, device, shift: int = 0) -> torch.Tensor:
+        """Which bar of the cycle each stream position belongs to.
+
+        RaspCompiledRule's formula verbatim: a bar spans subbeats_per_chord
+        positions, so the division comes before the modulo.
+        """
+        t = torch.arange(T, device=device) + shift
+        return (t // self.subbeats_per_chord) % N_POS
+
     def expected(self, chord_0: torch.Tensor, T: int) -> torch.Tensor:
         """The rule's answer at every position: (B, T) chord indices.
 
@@ -153,8 +198,8 @@ class ChordTracrRuleModel(nn.Module):
         The data prep and the metrics score against this, so the rule lives in
         one place.
         """
-        t = torch.arange(T, device=chord_0.device) % N_POS
-        return self.cadence.to(chord_0.device)[chord_0.long()][:, t]
+        ph = self.phase_at(T, chord_0.device, self.input_shift)
+        return self.cadence.to(chord_0.device)[chord_0.long()][:, ph]
 
     def build_rule_hidden_analytic(self, chord_0: torch.Tensor, T: int,
                                    device: torch.device | None = None):
@@ -164,17 +209,26 @@ class ChordTracrRuleModel(nn.Module):
         B = chord_0.shape[0]
         t = torch.arange(T, device=device)
 
-        cur = self.expected(chord_0, T)
+        cad = self.cadence.to(device)[chord_0]
+        cur = cad[:, self.phase_at(T, device, self.input_shift)]
         h = torch.zeros(B, T, self.d_model, device=device)
         h[:, :, self.sl_cur] = F.one_hot(cur, N_CHORDS).float()
         if self.sl_next is not None:
-            nxt = self.cadence.to(device)[chord_0][:, (t + 1) % N_POS]
+            nxt = cad[:, self.phase_at(T, device, self.input_shift + self.shift)]
             h[:, :, self.sl_next] = F.one_hot(nxt, N_CHORDS).float()
         if self.sl_seed is not None:
             h[:, :, self.sl_seed] = F.one_hot(chord_0, N_CHORDS).float()[
                 :, None, :].expand(-1, T, -1)
-        h[:, :, self.sl_phase] = F.one_hot(t % N_POS, N_POS).float()[
+        h[:, :, self.sl_phase] = F.one_hot(
+            self.phase_at(T, device, self.input_shift), N_POS).float()[
             None].expand(B, -1, -1)
+        if self.input_shift < 0:
+            # The host has seen no beat yet at index 0, so nothing about the
+            # cadence is knowable there. Same convention as RaspCompiledRule.
+            h = h.clone()
+            h[:, 0] = 0.0
+        if self.view == 'chord_next':
+            return h[:, :, self.sl_next]
         return h
 
     def forward(self, chords: torch.Tensor, return_hidden: bool = False):

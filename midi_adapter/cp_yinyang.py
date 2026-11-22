@@ -43,6 +43,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.bass_tracr_rule_model import BassTracrRuleModel, TRACR_D_MODEL
+from models.chord_tracr_rule_model import ChordTracrRuleModel, chord_index
+# The duration table the CP representation is quantised onto; the chord
+# extractor weights a bar's notes by it, as the data prep does.
+from midi_adapter.generate_synthetic_bass import DURATION_TEMPLATES
 from models.rasp_compiled_rule     import RaspCompiledRule
 from models.ar_state_encoder       import ARStateRuleEncoder
 
@@ -276,6 +280,7 @@ class CPYinyangTransformer(nn.Module):
         rule_enc_hidden:  int  = 64,
         rule_key_select:  str  = 'phase0',
         rule_subbeats_per_chord: int = 1,
+        chord_minor_pattern:     str = 'harmonic',
         rule_rate:        str  = 'beat',       # 'beat' | 'bar'
         strict_causal:    bool = False,
         gate_init:        float = 0.0,
@@ -349,6 +354,24 @@ class CPYinyangTransformer(nn.Module):
                 subbeats_per_chord=rule_subbeats_per_chord,
                 shift=1, input_shift=-1,
                 view=rule_view, key_select=rule_key_select)
+        elif rule_mode.startswith('chord'):
+            # v6: the rule is a cadence over the 24 triads, not a sequence of
+            # roots. The adapter holds the rule model and reads its residual
+            # stream; it never recomputes the rule itself. rule_mode is
+            # 'chord' (period4) or 'chord_<layout>' for another layout.
+            layout = rule_mode.split('_', 1)[1] if '_' in rule_mode else 'period4'
+            # Same alignment v4/v5 trained under (--rule_mode compiled
+            # --rule_view root_next): a bar spans subbeats_per_chord positions,
+            # input_shift=-1 because the CP stack shifts its stream by one
+            # before the global blocks, shift=1 so the rule emits for the beat
+            # the adapter is about to influence, and only the next-chord block
+            # is exposed -- the analogue of root_next.
+            self.rule_model = ChordTracrRuleModel(
+                rule_mode=layout, minor_pattern=chord_minor_pattern,
+                subbeats_per_chord=rule_subbeats_per_chord,
+                shift=1, input_shift=-1,
+                view=('chord_next' if rule_view in ('root_next', 'chord_next')
+                      else 'all'))
         else:
             self.rule_model = BassTracrRuleModel(rule_mode=rule_mode)
         # BassRaspCompiled.d_model is the full stream (44); rule_d_model is the
@@ -488,6 +511,41 @@ class CPYinyangTransformer(nn.Module):
         idx = self._bar_key_index(rule_hidden.shape[1], rule_hidden.device)
         return rule_hidden.index_select(1, idx), idx
 
+    def _tonic_chord(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """(B,) tonic chord index 0..23, read from the prompt's first bar.
+
+        v6's rule is keyed on a CHORD, so the prompt has to disclose both
+        halves of it, and they live in different places:
+
+          root     slot 0 of step 0 -- the bass note on the downbeat, which is
+                   where prepare_v6_data put it and what its invariant checks
+          quality  the duration-weighted mass on the major third against the
+                   minor third over the rest of bar 0, excluding slot 0 so a
+                   bass passing through the third cannot decide it
+
+        The same definition census_v6_quality and prepare_v6_data use on the
+        data, so the chord the adapter reads is the chord the dataset was
+        selected for. The data prep guarantees bar 0 states it unambiguously
+        (its 'tonic CHORD readable from bar 0' invariant), so ties cannot
+        arise on data built by it; a tie here resolves to major.
+        """
+        spc = max(1, int(self.rule_subbeats_per_chord))
+        bar = x_proc[:, :min(spc, x_proc.shape[1]), :]            # (B, n, subseq)
+        B, n, W2 = bar.shape
+        pairs = bar.view(B, n, W2 // 2, 2)
+        root = (pairs[:, 0, 0, 1] % 128 % 12).clamp(0, 11)        # (B,)
+        valid = (pairs[..., 0] < 127) & (pairs[..., 1] >= 128)
+        valid[:, :, 0] = False                                    # drop the bass
+        dur_idx = (pairs[..., 1] // 128 - 1).clamp(0, len(DURATION_TEMPLATES) - 1)
+        dur = torch.as_tensor(DURATION_TEMPLATES, device=x_proc.device,
+                              dtype=torch.float32)[dur_idx]
+        t = torch.arange(n, device=x_proc.device).view(1, n, 1)
+        w = (torch.minimum(dur, (n - t).float()).clamp(min=0) * valid)
+        rel = ((pairs[..., 1] % 128) - root.view(B, 1, 1)) % 12
+        maj = (w * (rel == 4)).sum((1, 2))
+        mino = (w * (rel == 3)).sum((1, 2))
+        return root + 12 * (mino > maj).long()
+
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
 
@@ -496,6 +554,12 @@ class CPYinyangTransformer(nn.Module):
         Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
         hidden[t] encodes the CURRENT pitch class: (key + OFFSETS[t%4]) % 12.
         """
+        if self.rule_mode.startswith('chord'):
+            # Straight from the rule model's own analytic construction -- the
+            # adapter supplies the tonic chord and reads the residual stream
+            # back, and holds no second copy of the rule.
+            return self.rule_model.build_rule_hidden_analytic(
+                self._tonic_chord(x_proc), x_proc.shape[1], x_proc.device)
         pc = x_proc[:, :, 1] % 128 % 12   # (B, T)
         if self.rule_mode == 'compiled':
             # Shift right by one so stream index t carries beat t-1, matching
@@ -635,6 +699,10 @@ class CPYinyangTransformer(nn.Module):
             h_enc   = F.pad(h_enc, (0, d - h_enc.shape[-1]))            # (B, max_seq_len, d)
             pos_emb = self.rule_model.W_pos[t_idx % 4]                  # (max_seq_len, d)
             rule_hidden = h_enc + pos_emb.unsqueeze(0)
+        elif self.rule_mode.startswith('chord'):
+            tonic = self._tonic_chord(x)
+            rule_hidden = self.rule_model.build_rule_hidden_analytic(
+                tonic, max_seq_len, x.device)
         elif not self.bidirectional:
             rule_hidden = self.rule_model.build_rule_hidden_analytic(pc_0, max_seq_len, x.device)
         else:

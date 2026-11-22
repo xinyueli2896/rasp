@@ -136,10 +136,45 @@ def main():
     check('the tonic chord is read from position 0',
           not torch.equal(m(shifted).argmax(-1), m(chords).argmax(-1)))
 
+    print('\nCP alignment: a bar spans subbeats_per_chord positions')
+    spc = 16
+    cp = ChordTracrRuleModel(subbeats_per_chord=spc, shift=1, input_shift=-1)
+    check('phase_at divides before the modulo',
+          cp.phase_at(2 * spc, torch.device('cpu'))[::spc].tolist() == [0, 1])
+    check('input_shift=-1 puts bar 0 at positions 1..spc',
+          cp.phase_at(spc + 2, torch.device('cpu'), -1)[1:spc + 1].tolist()
+          == [0] * spc,
+          'which is why _bar_key_index reads bar 0 at t=1, not t=0')
+    c0 = torch.tensor([0])                       # C major
+    h = cp.build_rule_hidden_analytic(c0, 8 * spc)
+    nxt = h[0, :, cp.sl_next].argmax(-1)
+    got = [CHORD_NAMES[int(nxt[b * spc])] for b in range(8)]
+    check('the next-chord block at each bar downbeat is the cadence',
+          got == ['C', 'F', 'G', 'C'] * 2, ' '.join(got))
+    check('row 0 is zeroed when input_shift < 0', bool((h[:, 0] == 0).all()))
+    flat = ChordTracrRuleModel(subbeats_per_chord=spc, input_shift=0)
+    check('row 0 is NOT zeroed at input_shift=0',
+          not bool((flat.build_rule_hidden_analytic(c0, spc)[:, 0] == 0).all()))
+
+    print("\nview='chord_next', the analogue of v4/v5's root_next")
+    cn = ChordTracrRuleModel(subbeats_per_chord=spc, shift=1, input_shift=-1,
+                             view='chord_next')
+    check('rule_d_model is 24, d_model still 52',
+          cn.rule_d_model == 24 and cn.d_model == 52)
+    hv = cn.build_rule_hidden_analytic(c0, 4 * spc)
+    check('it returns exactly the next-chord block',
+          tuple(hv.shape) == (1, 4 * spc, 24)
+          and torch.equal(hv, h[:, :4 * spc, cp.sl_next]))
+    check("view='all' keeps the full width",
+          ChordTracrRuleModel(view='all').rule_d_model == 52)
+
     print('\nvalidation')
     for name, fn in (
         ('bad rule_mode', lambda: ChordTracrRuleModel(rule_mode='period8')),
         ('bad minor_pattern', lambda: ChordTracrRuleModel(minor_pattern='dorian')),
+        ('bad view', lambda: ChordTracrRuleModel(view='roots')),
+        ("chord_next without period4",
+         lambda: ChordTracrRuleModel(rule_mode='current', view='chord_next')),
     ):
         try:
             fn()
