@@ -46,6 +46,13 @@ UPSTREAM="${UPSTREAM:-$WORK/mald-upstream}"
 MIN_BARS="${MIN_BARS:-8}"
 BALANCE_KEYS="${BALANCE_KEYS:-0}"
 CENSUS="${CENSUS:-1}"
+# v6: select the spans whose whole CHORD cadence matches one of the 24, and
+# split on tonic chords rather than tonics. V6=0 skips it.
+V6="${V6:-1}"
+V6_HOLD_OUT="${V6_HOLD_OUT:-F# D#m G# Fm}"
+V6_MINOR="${V6_MINOR:-harmonic}"
+V6_BALANCE="${V6_BALANCE:-0}"
+V6_ALLOW_UNVOICED="${V6_ALLOW_UNVOICED:-0}"
 
 mkdir -p "$WORK/logs"
 
@@ -106,11 +113,32 @@ if [[ "$CENSUS" == 1 ]] && compgen -G "$WORK/stage_chordal/spans/*.pt" > /dev/nu
     2>&1 | tee "$WORK/logs/census_min${MIN_BARS}.log"
 fi
 
+# --- the v6 dataset --------------------------------------------------------
+# Downstream of the same chordal stage: v4/v5 keep spans whose ROOTS follow the
+# rule, which pools the major and minor cadence on each tonic since their roots
+# are identical. v6 asks for the whole cadence and splits on tonic CHORDS.
+if [[ "$V6" == 1 ]] && compgen -G "$WORK/stage_chordal/spans/*.pt" > /dev/null; then
+  echo
+  echo "=== v6 dataset from stage_chordal, holding out $V6_HOLD_OUT ==="
+  v6=(--stage "$WORK/stage_chordal" --out_prefix "$WORK/data/v6_chordal"
+      --min_bars "$MIN_BARS" --minor_pattern "$V6_MINOR")
+  # shellcheck disable=SC2206  -- word splitting is what the variable is for
+  v6+=(--hold_out $V6_HOLD_OUT)
+  [[ "$V6_BALANCE" != 0 ]] && v6+=(--balance "$V6_BALANCE")
+  [[ "$V6_ALLOW_UNVOICED" == 1 ]] && v6+=(--allow_unvoiced)
+  "$PY" -m midi_adapter.prepare_v6_data "${v6[@]}" \
+    2>&1 | tee "$WORK/logs/prepare_v6.log"
+fi
+
 echo
 echo "finished  $(date -Is)"
 echo "datasets  $WORK/data/{v4_bass,v5_chordal}_{finetune,unseen,pretrain,all}.pt"
+echo "v6        $WORK/data/v6_chordal_{finetune,unseen,all}.pt  (+ .chords.pt)"
 echo "census    $WORK/logs/census_min${MIN_BARS}.{log,json}"
 echo
 echo "Before training on any of it, the invariants above must read 1.000 --"
 echo "and for the chordal set, 'downbeat slot 0 is the bass root' is the one"
 echo "that counts, since the rule model and the probe both read slot 0."
+echo "For v6, the one to watch is 'tonic CHORD readable from bar 0': the rule"
+echo "model is handed a chord, so a prompt that gives the root but not the"
+echo "quality makes it compute a consistent but DIFFERENT cadence."
