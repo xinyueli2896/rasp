@@ -98,20 +98,30 @@ FROZEN_OPTS=()
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
-# Common to every stem. rule_mode compiled + rule_view root_next is the
-# flagship rule model: the compiled MLP computes (key + OFFSETS[p]) % 12 and
-# the adapter reads the answer subspace.
+# Which rule model the adapter reads. The default is the flagship root rule:
+# the compiled MLP computes (key + OFFSETS[p]) % 12 and the adapter reads the
+# answer subspace. RULE_MODE=chord switches to v6's CADENCE over the 24
+# triads, where the symbol IS the chord and the adapter reads the next-chord
+# block -- that needs a v6 dataset and BEATS_PER_CHORD=16.
+RULE_MODE="${RULE_MODE:-compiled}"
+RULE_VIEW="${RULE_VIEW:-root_next}"
+CHORD_MINOR="${CHORD_MINOR:-harmonic}"
+MODE_OPTS=(--rule_mode "$RULE_MODE" --rule_view "$RULE_VIEW")
+[[ "$RULE_MODE" == chord ]] && MODE_OPTS+=(--chord_minor_pattern "$CHORD_MINOR")
+# Every run still logs to cp_bass unless told otherwise.
+WANDB_PROJECT="${WANDB_PROJECT:-cp_bass}"
+
 COMMON=(
   --base_ckpt   "$BASE_CKPT"
   --train_data  "$TRAIN_DATA"
   --val_data    "$VAL_DATA"
   --unseen_data "$UNSEEN_DATA"
   --model_size 1 --batch_size 8 --n_skip "$N_SKIP"
-  --rule_mode compiled --rule_view root_next
+  "${MODE_OPTS[@]}"
   "${RULE_OPTS[@]}"
   --max_steps "$MAX_STEPS" --val_check_interval 500
   --ckpt_dir "$CKPT_DIR"
-  --no_tensorboard --wandb_project cp_bass
+  --no_tensorboard --wandb_project "$WANDB_PROJECT"
 )
 
 run () {            # run <run_name> <extra args...>
@@ -140,11 +150,11 @@ stem () {
           --train_data "$TRAIN_DATA" --pretrain_data "$PRETRAIN_DATA" \
           --val_data "$VAL_DATA" --unseen_data "$UNSEEN_DATA" \
           --model_size 1 --batch_size 8 --n_skip "$N_SKIP" \
-          --rule_mode compiled --rule_view root_next \
+          "${MODE_OPTS[@]}" \
           "${RULE_OPTS[@]}" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --no_tensorboard \
-          --wandb_project cp_bass \
+          --wandb_project "$WANDB_PROJECT" \
           --unfreeze_base --run_name "cp_yy_scratch$RUN_SUFFIX" \
           2>&1 | tee "$LOG_DIR/cp_yy_scratch$RUN_SUFFIX.log"
       ;;
@@ -158,7 +168,7 @@ stem () {
           --train_length "$TRAIN_LENGTH" --sample_step "$SAMPLE_STEP" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
           --ckpt_dir "$CKPT_DIR" --run_name "cp_bass_ft$RUN_SUFFIX" \
-          --no_tensorboard --wandb_project cp_bass \
+          --no_tensorboard --wandb_project "$WANDB_PROJECT" \
           2>&1 | tee "$LOG_DIR/cp_bass_ft$RUN_SUFFIX.log"
       ;;
     # No input to the rule model: the host's pre-block state is encoded into
