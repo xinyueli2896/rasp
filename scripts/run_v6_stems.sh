@@ -98,27 +98,42 @@ echo "data    $DATA_PREFIX  (rule $RULE_MODE/$RULE_VIEW, $CHORD_MINOR minor)"
 echo "seeds   $SEEDS"
 echo "stems   $STEMS"
 
+# Each stem's own output goes to its launch log, so a failure is only visible
+# here as an exit status -- which has to be checked and propagated. An earlier
+# version printed "done" unconditionally in the serial path, and a stem that
+# died in three seconds on an ImportError reported success; inside a job array
+# that is 18 tasks all claiming to have trained.
 train_seed () {
-  local sd="$1" s pids=()
+  local sd="$1" s pids=() failed=0 log
   export SEED="$sd" RUN_SUFFIX="_${TAG}_s$sd"
   echo "=== seed $sd ==="
   for s in $STEMS; do
+    log="$LOG_DIR/launch_${s}_${TAG}_s${sd}.log"
     if [[ "$PARALLEL" == 1 ]]; then
-      ./scripts/run_cp_stems.sh "$s" >| "$LOG_DIR/launch_${s}_${TAG}_s${sd}.log" 2>&1 &
+      ./scripts/run_cp_stems.sh "$s" >| "$log" 2>&1 &
       pids+=($!); echo "  $s pid=${pids[-1]}"; sleep 30
+    elif ./scripts/run_cp_stems.sh "$s" >| "$log" 2>&1; then
+      echo "  $s: done"
     else
-      ./scripts/run_cp_stems.sh "$s" >| "$LOG_DIR/launch_${s}_${TAG}_s${sd}.log" 2>&1
-      echo "  $s done"
+      echo "  $s: FAILED (exit $?) -- $log" >&2
+      tail -5 "$log" | sed 's/^/      /' >&2
+      failed=1
     fi
   done
   local i=0
   for s in $STEMS; do
     if [[ "$PARALLEL" == 1 ]]; then
+      log="$LOG_DIR/launch_${s}_${TAG}_s${sd}.log"
       if wait "${pids[$i]}"; then echo "  $s: done"
-      else echo "  $s: FAILED (see $LOG_DIR/launch_${s}_${TAG}_s${sd}.log)"; fi
+      else
+        echo "  $s: FAILED -- $log" >&2
+        tail -5 "$log" | sed 's/^/      /' >&2
+        failed=1
+      fi
       i=$((i + 1))
     fi
   done
+  return "$failed"
 }
 
 eval_seed () {
@@ -143,15 +158,22 @@ eval_seed () {
   done
 }
 
+rc=0
 for sd in $SEEDS; do
-  has train && train_seed "$sd"
-  has eval  && eval_seed  "$sd"
+  if has train; then train_seed "$sd" || rc=1; fi
+  has eval && eval_seed "$sd"
 done
 
 echo
-echo "done."
+if (( rc )); then
+  echo "FINISHED WITH FAILURES -- see the launch logs named above." >&2
+else
+  echo "done."
 for sd in $SEEDS; do for t in $TEMPS; do
   echo "  table  $LOG_DIR/table_s${sd}_T${t}.log"
 done; done
 [[ -n "$MIDI_DIR" ]] && echo "  midi   $MIDI_DIR/s<seed>/T<temp>/<model>/"
-true
+fi
+# Non-zero so a SLURM array task that trained nothing is marked FAILED rather
+# than passing quietly.
+exit "$rc"

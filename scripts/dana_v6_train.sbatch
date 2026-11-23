@@ -57,6 +57,14 @@ if [[ ! -f "$REPO/midi_adapter/train_cp_yinyang.py" ]]; then
   echo "REPO=$REPO is not a checkout of this repository." >&2
   exit 1
 fi
+# Fail here, with something actionable, rather than three seconds into the
+# first stem with an ImportError inside a per-stem launch log.
+if ! "$PY" -c "import torch, transformers, pytorch_lightning, peft" 2>/dev/null; then
+  echo "$PY is missing the training stack (transformers, pytorch_lightning," >&2
+  echo "peft). Install it into the same env and resubmit:" >&2
+  echo "  WITH_TRAINING=1 ENV_PREFIX=$CONDA_ENV sbatch scripts/dana_setup_env.sh" >&2
+  exit 1
+fi
 cd "$REPO"
 
 # The driver shells out to `python`, so the env's interpreter has to be first

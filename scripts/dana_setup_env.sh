@@ -28,7 +28,12 @@
 # `bash` still works wherever running it directly is appropriate -- the
 # directives are only comments to a shell.
 #
-#   WITH_TRAINING=1 ...   also install the training stack
+#   WITH_TRAINING=0 ...   prep dependencies only, no training stack. The
+#                         default installs both: the prep set is a subset, the
+#                         four extra packages are nothing beside torch, and an
+#                         env without them fails three seconds into a training
+#                         job with an ImportError buried in a launch log --
+#                         which is exactly what happened.
 #   ENV_NAME=rasp-v6 ...  name it, instead of giving a path
 #   MODULES="..."         modules to load first, if conda comes from one
 #
@@ -74,7 +79,7 @@ set -euo pipefail
 ENV_NAME="${ENV_NAME:-rasp}"
 ENV_PREFIX="${ENV_PREFIX:-}"
 PY_VERSION="${PY_VERSION:-3.11}"
-WITH_TRAINING="${WITH_TRAINING:-0}"
+WITH_TRAINING="${WITH_TRAINING:-1}"
 
 if [[ -n "${MODULES:-}" ]]; then
   # shellcheck disable=SC1091
@@ -134,8 +139,9 @@ python -m pip install \
   "numpy>=2" torch "pretty_midi>=0.2.11" mido six joblib huggingface_hub
 
 if [[ "$WITH_TRAINING" == "1" ]]; then
-  # The adapter stems and the tables. Only needed once you train on DANA's GPU
-  # partitions; the preparation job never imports them.
+  # The adapter stems and the tables. train_cp_yinyang imports
+  # pytorch_lightning and cp_transformer imports transformers, so training
+  # needs these even though the preparation jobs never touch them.
   python -m pip install \
     "transformers==4.52.4" "pytorch_lightning>=2.5.3" "peft>=0.15.2" matplotlib
 fi
