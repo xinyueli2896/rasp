@@ -95,10 +95,9 @@ RULE_OPTS=(--rule_key_select "$KEY_SELECT" --rule_rate "$RULE_RATE"
 FROZEN_OPTS=()
 [[ "$FREEZE_BASE_EVAL" == "1" ]] && FROZEN_OPTS+=(--freeze_base_eval)
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
-# SHIFT_AUG=1: v0.42's pitch-shift augmentation, restricted so no shift
-# carries a song out of its own split (midi_adapter/shift_aug.py). Off by
-# default so earlier runs reproduce; needs data built with the current
-# prepare_v4_data / prepare_v6_data, which write <split>.shift_mask.pt.
+# SHIFT_AUG=1: v0.42's pitch-shift augmentation, applied per window in the
+# training loop, skipping any shift that would carry a song out of its own
+# split (midi_adapter/shift_aug.py). Off by default so earlier runs reproduce.
 SHIFT_AUG="${SHIFT_AUG:-0}"
 AUG_OPTS=()
 [[ "$SHIFT_AUG" == "1" ]] && AUG_OPTS+=(--shift_aug)

@@ -53,7 +53,6 @@ from midi_adapter.prepare_v4_data import (
     transpose,
 )
 from midi_adapter.census_v6_quality import bar_quality as _bar_quality
-from midi_adapter.shift_aug import shift_mask, summarize
 from midi_adapter.census_v6_quality import MAJ, MIN, AMB, NONE
 from models.chord_tracr_rule_model import (
     ChordTracrRuleModel, CHORD_NAMES, N_CHORDS, chord_index, chord_root,
@@ -112,8 +111,7 @@ def span_chords(song: dict, rule: ChordTracrRuleModel, *, bar_len: int,
 # Writing
 # ---------------------------------------------------------------------------
 
-def write_split(prefix: str, split: str, songs: list[dict], chords=None,
-                max_polyphony: int = MAX_POLYPHONY) -> int:
+def write_split(prefix: str, split: str, songs: list[dict]) -> int:
     if not songs:
         print(f'  {split:9s}: empty, nothing written')
         return 0
@@ -126,18 +124,6 @@ def write_split(prefix: str, split: str, songs: list[dict], chords=None,
     # window is a different tonic CHORD, which is what the split partitions on.
     torch.save(torch.zeros(len(songs), 2, dtype=torch.int8).reshape(-1),
                f'{name}.pitch_shift_range.pt')
-    # The augmentation v0.42 pretrained with, restricted to this split's own
-    # tonic chords: a shift keeps the mode and moves the root, so a song may
-    # take it only if the chord it lands on belongs to this split. Read only
-    # by trainers run with --shift_aug; the range above stays [0, 0].
-    if chords is not None:
-        mask = shift_mask(
-            songs, label_of=lambda s: s['tonic'],
-            shifted_label=lambda c, k: chord_index((chord_root(c) + k) % 12,
-                                                   chord_is_minor(c)),
-            allowed=set(chords), max_polyphony=max_polyphony)
-        torch.save(mask, f'{name}.shift_mask.pt')
-        print(f'  {split:9s}: {summarize(mask)}')
     torch.save(torch.tensor([s['tonic'] for s in songs], dtype=torch.int16),
                f'{name}.chords.pt')
     torch.save(torch.tensor([chord_root(s['tonic']) for s in songs],
@@ -327,8 +313,7 @@ def main():
     for split, chords in splits.items():
         sel = [s for c in chords for s in by_chord[c]]
         sel.sort(key=lambda s: (s['tonic'], s['path'], s['start_bar']))
-        counts[split] = write_split(args.out_prefix, split, sel, chords,
-                                    args.max_polyphony)
+        counts[split] = write_split(args.out_prefix, split, sel)
 
     manifest = {
         'rule': 'chord cadence', 'minor_pattern': args.minor_pattern,

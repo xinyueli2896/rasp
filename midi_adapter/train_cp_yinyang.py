@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
-from midi_adapter.shift_aug import sample as sample_shift, summarize
+from midi_adapter.shift_aug import sample as sample_shift, allowed_mask as shift_allowed_mask
 
 TRAIN_LENGTH = 24
 MAX_STEPS    = 100_000
@@ -68,22 +68,17 @@ class BassFramedDataset(FramedDataset):
                  **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
         self.disable_pitch_shift = disable_pitch_shift
-        # --shift_aug: v0.42's pitch-shift augmentation, drawn per window from
-        # the split-respecting mask the data builder wrote (shift_aug.py).
-        # Never on val/test windows, exactly as FramedDataset zeroes their range.
+        # --shift_aug: v0.42's pitch-shift augmentation, drawn per window in the
+        # loop, never into a key outside this file's split (shift_aug.py).
+        # Off for val/test, exactly as FramedDataset zeroes their range.
         self.shift_aug = shift_aug and self.split not in ('val', 'test')
         self.shift_mask = None
-        if self.shift_aug:
-            mpath = file_path[:-3] + '.shift_mask.pt'
-            if not os.path.exists(mpath):
-                raise SystemExit(
-                    f'--shift_aug needs {mpath}; rebuild the data with the '
-                    f'current prepare_v4_data / prepare_v6_data, which writes it.')
-            self.shift_mask = torch.load(mpath, weights_only=True).bool()
-            if len(self.shift_mask) != len(self.length):
-                raise SystemExit(f'{mpath} has {len(self.shift_mask)} rows for '
-                                 f'{len(self.length)} songs -- stale mask')
-            print(f'shift_aug {os.path.basename(file_path)}: {summarize(self.shift_mask)}')
+
+    def _init_shift_mask(self):
+        if self.shift_aug and self.shift_mask is None:
+            self.shift_mask, note = shift_allowed_mask(
+                self.data, self.start, self.length, self.file_path)
+            print(f'shift_aug {os.path.basename(self.file_path)}: {note}')
 
     def preload(self, shared_data_cache: dict | None = None):
         """Load data and pitch_shift_range into memory now.
@@ -104,6 +99,7 @@ class BassFramedDataset(FramedDataset):
         if self.split in ('val', 'test'):
             psr = torch.zeros_like(psr)
         self.pitch_shift_range = psr
+        self._init_shift_mask()
 
     def __iter__(self):
         if self.data is None:
@@ -116,6 +112,7 @@ class BassFramedDataset(FramedDataset):
             if self.split in ('val', 'test'):
                 self.pitch_shift_range = torch.zeros_like(self.pitch_shift_range)
             print(f'Data for dataset {self.file_path} loaded.')
+            self._init_shift_mask()
 
         while True:
             if self.random_order:
@@ -636,10 +633,10 @@ def get_args():
                         'token. Identical outputs on rule-following input; '
                         'they differ only when the stream breaks the rule.')
     p.add_argument('--shift_aug',          action='store_true',
-                   help="v0.42's pitch-shift augmentation (uniform per window "
-                        'over -5..6), restricted to shifts that keep each song '
-                        "inside its own split's keys/tonic chords. Needs the "
-                        '<data>.shift_mask.pt the current data builders write')
+                   help="v0.42's pitch-shift augmentation, applied per window "
+                        "in the loop (uniform over the song's range clamped to "
+                        '-5..6), skipping any shift that would move the song '
+                        "to a key/tonic chord outside this file's split")
     p.add_argument('--seed',               type=int, default=42,
                    help='Seed for pl.seed_everything. Pass a distinct '
                         '--run_name per seed so the runs do not share a '

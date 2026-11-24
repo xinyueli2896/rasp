@@ -206,8 +206,8 @@ def get_args():
                         'I-IV-V-I cycle. Must match the pretrain.')
     p.add_argument('--run_name',      type=str, default=None)
     p.add_argument('--shift_aug',     action='store_true',
-                   help='pitch-shift augmentation restricted to the split '
-                        '(needs <train_data>.shift_mask.pt)')
+                   help="v0.42's per-window pitch-shift augmentation, never "
+                        "into a key outside the training file's split")
     p.add_argument('--seed',          type=int, default=42,
                    help='Seed for pl.seed_everything. Pass a distinct --run_name '
                         'per seed so the runs do not share a checkpoint dir.')
