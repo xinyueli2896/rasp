@@ -64,8 +64,8 @@ if [[ ! -f "$REPO/midi_adapter/train_cp_yinyang.py" ]]; then
 fi
 # Fail here, with something actionable, rather than three seconds into the
 # first stem with an ImportError inside a per-stem launch log.
-if ! "$PY" -c "import torch, transformers, pytorch_lightning, peft" 2>/dev/null; then
-  echo "$PY is missing the training stack (transformers, pytorch_lightning," >&2
+if ! "$PY" -c "import torch, transformers, pytorch_lightning, peft, wandb" 2>/dev/null; then
+  echo "$PY is missing the training stack (transformers, pytorch_lightning, wandb," >&2
   echo "peft). Install it into the same env and resubmit:" >&2
   echo "  WITH_TRAINING=1 ENV_PREFIX=$CONDA_ENV sbatch scripts/dana_setup_env.sh" >&2
   exit 1

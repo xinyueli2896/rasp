@@ -142,8 +142,13 @@ if [[ "$WITH_TRAINING" == "1" ]]; then
   # The adapter stems and the tables. train_cp_yinyang imports
   # pytorch_lightning and cp_transformer imports transformers, so training
   # needs these even though the preparation jobs never touch them.
+  # wandb is not optional: the stem driver passes --wandb_project, so
+  # train_cp_yinyang constructs a WandbLogger and pytorch_lightning raises
+  # ModuleNotFoundError without it -- after loading the checkpoint, which makes
+  # it look like a training failure rather than a missing package.
   python -m pip install \
-    "transformers==4.52.4" "pytorch_lightning>=2.5.3" "peft>=0.15.2" matplotlib
+    "transformers==4.52.4" "pytorch_lightning>=2.5.3" "peft>=0.15.2" \
+    "wandb>=0.12.10" matplotlib
 fi
 
 echo
@@ -154,7 +159,7 @@ for m in ('numpy', 'torch', 'pretty_midi', 'mido', 'six', 'joblib',
           'huggingface_hub'):
     mod = importlib.import_module(m)
     print(f'  {m:16s} {getattr(mod, "__version__", "?")}')
-for m in ('transformers', 'pytorch_lightning', 'peft', 'matplotlib'):
+for m in ('transformers', 'pytorch_lightning', 'peft', 'wandb', 'matplotlib'):
     try:
         mod = importlib.import_module(m)
         print(f'  {m:16s} {getattr(mod, "__version__", "?")}')
