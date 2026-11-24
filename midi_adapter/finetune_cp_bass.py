@@ -98,10 +98,19 @@ def main(args):
                                  'interval': 'step', 'frequency': 10 ** 9}}
     net.configure_optimizers = _configure_optimizers
 
+    if args.shift_aug:
+        # Same split-respecting augmentation the adapter stems get, so the
+        # Finetune row stays comparable to them (see midi_adapter/shift_aug.py).
+        from midi_adapter.train_cp_yinyang import BassFramedDataset
+        train_ds = BassFramedDataset(args.train_data, args.train_length,
+                                     args.batch_size, sample_step=args.sample_step,
+                                     split=args.train_split, shift_aug=True)
+    else:
+        train_ds = FramedDataset(args.train_data, args.train_length, args.batch_size,
+                                 sample_step=args.sample_step,
+                                 split=args.train_split)
     train_loader = DataLoader(
-        FramedDataset(args.train_data, args.train_length, args.batch_size,
-                      sample_step=args.sample_step,
-                      split=args.train_split),
+        train_ds,
         batch_size=None, num_workers=1, persistent_workers=True,
     )
     val_loader = DataLoader(
@@ -196,6 +205,9 @@ def get_args():
                    help='Align window starts to a multiple of this; 4 = one '
                         'I-IV-V-I cycle. Must match the pretrain.')
     p.add_argument('--run_name',      type=str, default=None)
+    p.add_argument('--shift_aug',     action='store_true',
+                   help='pitch-shift augmentation restricted to the split '
+                        '(needs <train_data>.shift_mask.pt)')
     p.add_argument('--seed',          type=int, default=42,
                    help='Seed for pl.seed_everything. Pass a distinct --run_name '
                         'per seed so the runs do not share a checkpoint dir.')

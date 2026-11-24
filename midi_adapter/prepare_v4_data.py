@@ -546,7 +546,8 @@ def check_slot0(songs: list[dict], bar_subbeats: int, max_polyphony: int):
     return ok == n
 
 
-def write_split(prefix: str, split: str, songs: list[dict], pitch_shift: bool):
+def write_split(prefix: str, split: str, songs: list[dict], pitch_shift: bool,
+                keys=None, max_polyphony: int = MAX_POLYPHONY):
     if not songs:
         print(f'  {split:9s}: empty, nothing written')
         return 0
@@ -564,6 +565,16 @@ def write_split(prefix: str, split: str, songs: list[dict], pitch_shift: bool):
     torch.save(data, f'{name}.pt')
     torch.save(lengths, f'{name}.length.pt')
     torch.save(psr.reshape(-1), f'{name}.pitch_shift_range.pt')
+    # v0.42's augmentation, restricted to this split's own keys so no shift
+    # can carry a finetune song into an unseen (or pretrain-only) key. Read
+    # only by trainers run with --shift_aug; see midi_adapter/shift_aug.py.
+    if keys is not None:
+        from midi_adapter.shift_aug import shift_mask, summarize
+        mask = shift_mask(songs, label_of=lambda s: s['key'],
+                          shifted_label=lambda k0, k: (k0 + k) % 12,
+                          allowed=set(keys), max_polyphony=max_polyphony)
+        torch.save(mask, f'{name}.shift_mask.pt')
+        print(f'  {split:9s}: {summarize(mask)}')
     torch.save(torch.tensor([s['key'] for s in songs], dtype=torch.int8),
                f'{name}.keys.pt')
     with open(f'{name}.txt', 'w') as f:
@@ -820,7 +831,8 @@ def main():
         sel = [s for k in keys for s in by_key[k]]
         sel.sort(key=lambda s: (s['key'], s['path'], s['start_bar']))
         counts[split] = write_split(args.out_prefix, split, sel,
-                                    args.pitch_shift_from_data)
+                                    args.pitch_shift_from_data, keys,
+                                    args.max_polyphony)
 
     manifest = {
         'offsets': OFFSETS, 'beat_div': args.beat_div,

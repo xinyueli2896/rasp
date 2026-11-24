@@ -30,6 +30,9 @@
 #   SEEDS="1"              one seed (edit --array to match: stems - 1)
 #   STEMS="frozen lora"    fewer stems (likewise)
 #   MAX_STEPS=2000         a short smoke run before committing the full one
+#   SHIFT_AUG=1            v0.42's pitch-shift augmentation, never into a
+#                          held-out key (midi_adapter/shift_aug.py); use a new
+#                          TAG so the runs do not overwrite the unaugmented ones
 #
 # PARTITION AND QOS. No QoS is requested in the directives, so the partition's
 # own QoS applies: cscc-gpu-p carries cscc-gpu-qos. Pass one explicitly when
@@ -68,6 +71,10 @@ REPO="${REPO:-${SLURM_SUBMIT_DIR:-$PWD}}"
 SEEDS_ALL="${SEEDS:-1 2 3}"
 STEMS_ALL="${STEMS:-finetune frozen lora noinput trainar scratch}"
 STAGES="${STAGES:-train}"
+# The experiment driver. run_v6_stems.sh by default; DRIVER=./scripts/run_v4_stems.sh
+# runs v4/v5 through the same job (give it DATA_PREFIX, BASE_CKPT, CKPT_DIR and
+# LOG_DIR under $WORK, since its own defaults are relative to the repo).
+DRIVER="${DRIVER:-./scripts/run_v6_stems.sh}"
 
 PY="${PY:-$CONDA_ENV/bin/python}"
 if [[ ! -x "$PY" ]]; then
@@ -107,7 +114,7 @@ nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0}" \
 
 if [[ "$STAGES" == eval ]]; then
   echo "=== v6 tables, all seeds ==="
-  STAGES=eval WORK="$WORK" ./scripts/run_v6_stems.sh
+  STAGES=eval WORK="$WORK" "$DRIVER"
   echo "finished $(date -Is)"
   exit 0
 fi
@@ -119,7 +126,7 @@ if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
   echo "cscc-gpu-qos's 2-job cap leaves room for."
   echo "started $(date -Is)"
   STAGES=train SEEDS="$SEEDS_ALL" STEMS="$STEMS_ALL" PARALLEL=0 WORK="$WORK" \
-    ./scripts/run_v6_stems.sh
+    "$DRIVER"
   echo "finished $(date -Is)"
   exit 0
 fi
@@ -143,6 +150,6 @@ echo "started $(date -Is)"
 # PARALLEL=0: this task owns one GPU and trains one stem on it. The driver's
 # own parallelism is for a workstation with room for several at once.
 STAGES=train SEEDS="$seed" STEMS="$stem" PARALLEL=0 WORK="$WORK" \
-  ./scripts/run_v6_stems.sh
+  "$DRIVER"
 
 echo "finished $(date -Is)"

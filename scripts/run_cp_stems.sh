@@ -95,6 +95,14 @@ RULE_OPTS=(--rule_key_select "$KEY_SELECT" --rule_rate "$RULE_RATE"
 FROZEN_OPTS=()
 [[ "$FREEZE_BASE_EVAL" == "1" ]] && FROZEN_OPTS+=(--freeze_base_eval)
 [[ "$STRICT_CAUSAL" == "1" ]] && RULE_OPTS+=(--strict_causal)
+# SHIFT_AUG=1: v0.42's pitch-shift augmentation, restricted so no shift
+# carries a song out of its own split (midi_adapter/shift_aug.py). Off by
+# default so earlier runs reproduce; needs data built with the current
+# prepare_v4_data / prepare_v6_data, which write <split>.shift_mask.pt.
+SHIFT_AUG="${SHIFT_AUG:-0}"
+AUG_OPTS=()
+[[ "$SHIFT_AUG" == "1" ]] && AUG_OPTS+=(--shift_aug)
+RULE_OPTS+=(${AUG_OPTS[@]+"${AUG_OPTS[@]}"})
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
@@ -167,7 +175,7 @@ stem () {
           --model_size 1 --batch_size 8 --seed "$SEED" \
           --train_length "$TRAIN_LENGTH" --sample_step "$SAMPLE_STEP" \
           --max_steps "$MAX_STEPS" --val_check_interval 500 \
-          --ckpt_dir "$CKPT_DIR" --run_name "cp_bass_ft$RUN_SUFFIX" \
+          --ckpt_dir "$CKPT_DIR" --run_name "cp_bass_ft$RUN_SUFFIX" ${AUG_OPTS[@]+"${AUG_OPTS[@]}"} \
           --no_tensorboard --wandb_project "$WANDB_PROJECT" \
           2>&1 | tee "$LOG_DIR/cp_bass_ft$RUN_SUFFIX.log"
       ;;

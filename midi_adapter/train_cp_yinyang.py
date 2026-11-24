@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer, FramedDataset
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.generate_synthetic_bass import SUBBEATS_PER_BAR, OFFSETS
+from midi_adapter.shift_aug import sample as sample_shift, summarize
 
 TRAIN_LENGTH = 24
 MAX_STEPS    = 100_000
@@ -63,9 +64,26 @@ class BassFramedDataset(FramedDataset):
     """
 
     def __init__(self, file_path, target_length, batch_size,
-                 disable_pitch_shift: bool = False, **kwargs):
+                 disable_pitch_shift: bool = False, shift_aug: bool = False,
+                 **kwargs):
         super().__init__(file_path, target_length, batch_size, **kwargs)
         self.disable_pitch_shift = disable_pitch_shift
+        # --shift_aug: v0.42's pitch-shift augmentation, drawn per window from
+        # the split-respecting mask the data builder wrote (shift_aug.py).
+        # Never on val/test windows, exactly as FramedDataset zeroes their range.
+        self.shift_aug = shift_aug and self.split not in ('val', 'test')
+        self.shift_mask = None
+        if self.shift_aug:
+            mpath = file_path[:-3] + '.shift_mask.pt'
+            if not os.path.exists(mpath):
+                raise SystemExit(
+                    f'--shift_aug needs {mpath}; rebuild the data with the '
+                    f'current prepare_v4_data / prepare_v6_data, which writes it.')
+            self.shift_mask = torch.load(mpath, weights_only=True).bool()
+            if len(self.shift_mask) != len(self.length):
+                raise SystemExit(f'{mpath} has {len(self.shift_mask)} rows for '
+                                 f'{len(self.length)} songs -- stale mask')
+            print(f'shift_aug {os.path.basename(file_path)}: {summarize(self.shift_mask)}')
 
     def preload(self, shared_data_cache: dict | None = None):
         """Load data and pitch_shift_range into memory now.
@@ -122,6 +140,8 @@ class BassFramedDataset(FramedDataset):
                 )
                 if self.disable_pitch_shift:
                     pitch_shift = torch.zeros(len(raw_ids), dtype=torch.long)
+                elif self.shift_mask is not None:
+                    pitch_shift = sample_shift(self.shift_mask[raw_ids])
                 else:
                     pitch_shift = (
                         torch.floor(
@@ -401,13 +421,13 @@ def main(args):
     # boundary so position encodes phase. Must match whatever the base was
     # pretrained with, or the adapter sees a different alignment than its host.
     train_ds = BassFramedDataset(args.train_data, args.train_length, args.batch_size,
-                                 split=args.train_split,
+                                 split=args.train_split, shift_aug=args.shift_aug,
                                  sample_step=args.sample_step)
     train_ds.preload(_cache)
 
     if args.pretrain_data and os.path.exists(args.pretrain_data):
         pretrain_ds = BassFramedDataset(args.pretrain_data, args.train_length, args.batch_size,
-                                        split=args.train_split,
+                                        split=args.train_split, shift_aug=args.shift_aug,
                                         sample_step=args.sample_step)
         pretrain_ds.preload(_cache)
         effective_train_ds = InterleavedDataset(pretrain_ds, train_ds)
@@ -615,6 +635,11 @@ def get_args():
                         'holding beat 0, so the head attends exactly one '
                         'token. Identical outputs on rule-following input; '
                         'they differ only when the stream breaks the rule.')
+    p.add_argument('--shift_aug',          action='store_true',
+                   help="v0.42's pitch-shift augmentation (uniform per window "
+                        'over -5..6), restricted to shifts that keep each song '
+                        "inside its own split's keys/tonic chords. Needs the "
+                        '<data>.shift_mask.pt the current data builders write')
     p.add_argument('--seed',               type=int, default=42,
                    help='Seed for pl.seed_everything. Pass a distinct '
                         '--run_name per seed so the runs do not share a '
