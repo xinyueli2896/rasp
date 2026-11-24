@@ -47,6 +47,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import sys
 import types
 
@@ -63,6 +64,7 @@ from midi_adapter.v4_eval import generate, write_midi
 # carries no metric at all.
 from midi_adapter.cp_results_table import best_ckpt
 from midi_adapter.generate_synthetic_bass import DURATION_TEMPLATES
+from midi_adapter.evaluate_cp_yinyang import _report_load
 from models.chord_tracr_rule_model import (
     ChordTracrRuleModel, CHORD_NAMES, N_CHORDS, N_POS, N_ROOTS, chord_index,
     chord_root, chord_is_minor,
@@ -266,6 +268,80 @@ def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
     return out
 
 
+# Config buffers recorded by CPYinyangTransformer. Absent from older
+# checkpoints, in which case the command line supplies the value.
+_CONFIG_BUFFERS = ('rule_subbeats_per_chord', 'rule_key_select_first',
+                   'rule_rate_bar', 'strict_causal')
+
+
+def load_v6_adapter(ck: str, args) -> CPYinyangTransformer:
+    """Rebuild a v6 adapter exactly as it trained, then load its weights.
+
+    Two silent failures this replaces. (1) train_cp_yinyang's Lightning wrapper
+    holds the adapter as `self.model`, so every key in the .ckpt starts with
+    `model.`; loading that with strict=False into a bare CPYinyangTransformer
+    matched NOTHING and left a randomly initialised host and adapter, which is
+    what the first v6 tables scored. (2) The rebuild took lora_rank,
+    rule_input, rule_rate and rule_key_select from defaults rather than from
+    the run, so LoRA and the noinput encoder were dropped even when the keys
+    lined up. Everything recoverable is now read from the checkpoint, and a
+    load that leaves any real weight missing stops the eval.
+    """
+    raw = torch.load(ck, map_location='cpu')
+    sd = raw.get('state_dict', raw) if isinstance(raw, dict) else raw
+    if any(k.startswith('model.') for k in sd):
+        sd = {k[len('model.'):]: v for k, v in sd.items() if k.startswith('model.')}
+
+    def buf(name):
+        return next((v for k, v in sd.items() if k.endswith(name)), None)
+
+    n_layers = [6, 12, 24, 32][args.model_size]
+    n_adapters = len({int(m.group(1)) for k in sd
+                      for m in [re.search(r'yinyang_attn\.(\d+)\.', k)] if m})
+    n_skip = n_layers // n_adapters if n_adapters else args.n_skip
+    lora_rank = next((v.shape[0] for k, v in sd.items() if 'lora_A' in k), 0)
+    rule_input = ('ar_state' if any('rule_input_encoder.fc_out' in k for k in sd)
+                  else 'tokens')
+    w1 = next((v for k, v in sd.items()
+               if k.endswith('rule_input_encoder.fc1.weight')), None)
+    enc_type = 'mlp' if (w1 is not None or rule_input == 'tokens') else 'linear'
+    enc_hidden = w1.shape[0] if w1 is not None else 64
+    spc, rr, ks, sc = (buf(n) for n in _CONFIG_BUFFERS)
+
+    cfg = dict(
+        adapter_rank=args.adapter_rank, n_skip=n_skip, lora_rank=lora_rank,
+        rule_mode='chord', rule_view=args.rule_view,
+        rule_input=rule_input, rule_enc_type=enc_type, rule_enc_hidden=enc_hidden,
+        rule_subbeats_per_chord=int(spc) if spc is not None else args.beats_per_chord,
+        rule_rate=('bar' if bool(rr) else 'beat') if rr is not None else 'bar',
+        rule_key_select=('first' if bool(ks) else 'phase0') if ks is not None else 'first',
+        strict_causal=bool(sc) if sc is not None else False,
+        chord_minor_pattern=args.minor_pattern)
+
+    base = RoFormerSymbolicTransformer(size=args.model_size)
+    # The pretrained host first, so an adapter-only state dict still sits on
+    # the right host; a full Lightning checkpoint then overwrites it.
+    if args.base_ckpt and os.path.exists(args.base_ckpt):
+        bst = torch.load(args.base_ckpt, map_location='cpu')
+        base.load_state_dict(bst.get('state_dict', bst))
+    ad = CPYinyangTransformer(base_model=base, **cfg)
+    missing, unexpected = ad.load_state_dict(sd, strict=False)
+    _report_load(missing, unexpected)
+    real_missing = [k for k in missing
+                    if not k.startswith('base.')
+                    and not any(k.endswith(c) for c in _CONFIG_BUFFERS)]
+    if real_missing or unexpected:
+        raise SystemExit(f'{ck}: rebuild does not match the checkpoint -- '
+                         f'{len(real_missing)} adapter weights missing '
+                         f'({real_missing[:3]}), {len(unexpected)} unexpected '
+                         f'({unexpected[:3]}). Refusing to score a model that '
+                         f'did not load.')
+    print(f'    loaded {len(sd)} tensors  n_skip={n_skip} lora_rank={lora_rank} '
+          f'rule_input={rule_input} spc={cfg["rule_subbeats_per_chord"]} '
+          f'rate={cfg["rule_rate"]} key_select={cfg["rule_key_select"]}')
+    return ad
+
+
 def row(per_chord: dict, chords: list[int], metric: str) -> float:
     vals = [(per_chord[c][metric], per_chord[c]['n'])
             for c in chords if c in per_chord]
@@ -348,14 +424,7 @@ def main():
                 print(f'  {run}: no monitored checkpoint in '
                       f'{os.path.join(args.ckpt_dir or ".", run)} -- skipped')
                 continue
-            ad = CPYinyangTransformer(
-                base_model=RoFormerSymbolicTransformer(size=args.model_size),
-                adapter_rank=args.adapter_rank, n_skip=args.n_skip,
-                rule_mode='chord', rule_view=args.rule_view,
-                rule_subbeats_per_chord=args.beats_per_chord,
-                chord_minor_pattern=args.minor_pattern)
-            sd = torch.load(ck, map_location='cpu')
-            ad.load_state_dict(sd.get('state_dict', sd), strict=False)
+            ad = load_v6_adapter(ck, args)
             entries.append((run, ad.to(device).eval(), True))
             print(f'  {run}: {os.path.basename(ck)}')
 
@@ -423,7 +492,7 @@ def main():
             f'{sum(per_bar_acc[label][b]) / len(per_bar_acc[label][b]):>9.3f}'
             for b in bars))
 
-    print('\nper tonic chord, chord_acc  (* held out)')
+    print('\nper tonic chord, chord_acc, DATA row only -- the scorer self-test  (* held out)')
     for mino in (False, True):
         for half in (range(6), range(6, 12)):
             cells = []
