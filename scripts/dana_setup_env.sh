@@ -36,6 +36,8 @@
 #                         which is exactly what happened.
 #   ENV_NAME=rasp-v6 ...  name it, instead of giving a path
 #   MODULES="..."         modules to load first, if conda comes from one
+#   CUDA_TAG=cu126        a different CUDA build of torch (cpu for prep only)
+#   TORCH_SPEC=torch      a different torch version
 #
 # ENV_PREFIX puts the environment on a project filesystem instead of your home
 # quota: a torch install is a couple of GB and home quotas are small. With it
@@ -131,12 +133,23 @@ else
 fi
 conda activate "$activate"
 
-# What the v5 data preparation needs, and nothing more. torch is here because
-# prepare_v4_data writes torch tensors, not because anything trains: the
-# preparation job is CPU-only and asks for no GPU.
+# torch comes from PyTorch's own CUDA-tagged index, not PyPI. PyPI's current
+# torch is built against CUDA 13, and DANA's driver reports 12080 (CUDA 12.8),
+# so that build dies with "The NVIDIA driver on your system is too old" -- and
+# it dies inside Lightning's accelerator setup, AFTER loading the checkpoint,
+# which reads like a training failure rather than a wheel mismatch.
+# CUDA_TAG=cpu gives a CPU-only build, which is all the data-preparation jobs
+# need; check the driver with `nvidia-smi` on a GPU node before changing it.
+TORCH_SPEC="${TORCH_SPEC:-torch==2.7.1}"
+CUDA_TAG="${CUDA_TAG:-cu128}"
 python -m pip install -U pip
+python -m pip install "$TORCH_SPEC" \
+  --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+
+# The rest from PyPI. torch is already satisfied, so pip leaves it alone
+# rather than pulling the CUDA 13 build back in as a dependency.
 python -m pip install \
-  "numpy>=2" torch "pretty_midi>=0.2.11" mido six joblib huggingface_hub
+  "numpy>=2" "pretty_midi>=0.2.11" mido six joblib huggingface_hub
 
 if [[ "$WITH_TRAINING" == "1" ]]; then
   # The adapter stems and the tables. train_cp_yinyang imports
@@ -159,6 +172,9 @@ for m in ('numpy', 'torch', 'pretty_midi', 'mido', 'six', 'joblib',
           'huggingface_hub'):
     mod = importlib.import_module(m)
     print(f'  {m:16s} {getattr(mod, "__version__", "?")}')
+import torch
+print(f'  {"torch CUDA":16s} {torch.version.cuda}  '
+      f'(the driver must be at least this; nvidia-smi on a GPU node shows it)')
 for m in ('transformers', 'pytorch_lightning', 'peft', 'wandb', 'matplotlib'):
     try:
         mod = importlib.import_module(m)
