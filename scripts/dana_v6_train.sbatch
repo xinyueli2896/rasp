@@ -4,23 +4,28 @@
 #   WORK=$PWD/v6 CONDA_ENV=$PWD/v6/env sbatch \
 #       -o $PWD/v6/logs_v6/train-%A_%a.out scripts/dana_v6_train.sbatch
 #
-# 6 stems x 3 seeds = 18 tasks, throttled to 6 at a time: DANA's `long`
-# partition allows up to 8 jobs and 12 GPUs per account, so 6 leaves headroom
-# for the eval and for anything else you are running. Each task takes one GPU.
+# 6 stems x 3 seeds = 18 tasks on cscc-gpu-p, throttled to 2 at a time
+# because that partition allows 2 concurrent jobs and 4 GPUs per account, with
+# a 24 h limit per job. Each task takes one GPU, so 18 tasks is 9 rounds --
+# budget a day or two of wall-clock, and consider SEEDS=1 first (6 tasks, 3
+# rounds) to get a table before spending 3x the time on the other two seeds.
+#
+# DANA's `long` partition would run 6 at a time (8 jobs, 12 GPUs, 72 h), which
+# is three times faster for the same work. If you ever want it:
+#   sbatch --partition=long --qos=gpu-12 --array=0-17%6 --time=48:00:00 ...
 #
 # An array rather than one long job because the stems are independent: a stem
 # that dies costs its own task, not the run, and the queue can start them as
 # GPUs free up instead of waiting for six at once.
 #
-#   SEEDS="1 2"            fewer seeds (edit --array to match: 2*stems - 1)
+#   SEEDS="1"              one seed (edit --array to match: stems - 1)
 #   STEMS="frozen lora"    fewer stems (likewise)
 #   MAX_STEPS=2000         a short smoke run before committing the full one
 #
-# PARTITION AND QOS. No QoS is requested, for the same reason as the CPU jobs:
-# cscc-cpu-p carried cscc-cpu-qos as its PARTITION QoS, applied automatically,
-# while --qos asks for a JOB QoS the association does not list. Check `long`
-# the same way before adding one:
-#   scontrol show partition long | tr ' ' '\n' | grep -i qos
+# PARTITION AND QOS. No QoS is requested in the directives, so the partition's
+# own QoS applies: cscc-gpu-p carries cscc-gpu-qos. Pass one explicitly when
+# you want the other: --qos=gpu-debug-qos for a smoke run, which is what DANA
+# prescribes for environment and dependency checks.
 #
 # The eval is a separate submission once training is in: it needs every stem's
 # checkpoint, so it cannot be an array task.
@@ -29,13 +34,13 @@
 
 #SBATCH --job-name=v6train
 #SBATCH --output=v6train-%A_%a.out
-#SBATCH --array=0-17%6
+#SBATCH --array=0-17%2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --partition=long
+#SBATCH --partition=cscc-gpu-p
 #SBATCH --time=24:00:00
 
 set -euo pipefail
