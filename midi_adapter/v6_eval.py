@@ -48,6 +48,7 @@ import collections
 import json
 import os
 import sys
+import types
 
 import torch
 
@@ -63,12 +64,45 @@ from midi_adapter.v4_eval import generate, write_midi
 from midi_adapter.cp_results_table import best_ckpt
 from midi_adapter.generate_synthetic_bass import DURATION_TEMPLATES
 from models.chord_tracr_rule_model import (
-    ChordTracrRuleModel, CHORD_NAMES, N_CHORDS, N_POS, chord_index, chord_root,
-    chord_is_minor,
+    ChordTracrRuleModel, CHORD_NAMES, N_CHORDS, N_POS, N_ROOTS, chord_index,
+    chord_root, chord_is_minor,
 )
 
 METRICS = ('chord_acc', 'root_acc', 'qual_acc')
 HYPOTHESES = ('rule', 'parallel', 'relative')
+
+
+def corrupt(tonic: torch.Tensor, how: str, rng: torch.Generator) -> torch.Tensor:
+    """A deliberately WRONG tonic chord to hand the rule model.
+
+    The intervention v6 turns on. The adapter reads its tonic chord from the
+    prompt, so feeding it a different one asks the question no accuracy number
+    answers on its own: is the cadence channel load-bearing, or is the host
+    doing this from the prompt alone? The v5 analysis makes that the sharp
+    question -- those adapters already produced harmonic minor at 0.97-0.99
+    with no quality channel at all, matching the corpus's own 0.981.
+
+      follows the corrupted cadence  -> the channel drives the output
+      follows the true one           -> the channel is decoration
+
+    'parallel' keeps the root and flips the mode, which is the subtlest lie:
+    the roots it implies are identical, so only the thirds can reveal which
+    cadence was followed. 'relative' and 'shift' change the roots too, so they
+    show up in root_acc as well.
+    """
+    if how == 'parallel':
+        return (tonic + N_CHORDS // 2) % N_CHORDS
+    if how == 'relative':
+        return torch.tensor([relative_of(int(c)) for c in tonic],
+                            device=tonic.device)
+    if how == 'shift':
+        # Same mode, root up a tritone: maximally far in root space while
+        # leaving the mode untouched, so root_acc alone separates them.
+        return (tonic + 6) % N_ROOTS + (tonic // N_ROOTS) * N_ROOTS
+    if how == 'random':
+        return torch.randint(0, N_CHORDS, tonic.shape, generator=rng,
+                             device=tonic.device)
+    raise ValueError(f'unknown --corrupt_tonic {how!r}')
 
 
 def parallel_of(tonic: int) -> int:
@@ -150,8 +184,13 @@ def read_bar_chords(gen: torch.Tensor, spc: int):
 
 
 def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
-          n_prompt: int, spc: int) -> dict:
-    """Per-sample scores for each hypothesis, plus a per-bar-index breakdown."""
+          n_prompt: int, spc: int, extra: dict | None = None) -> dict:
+    """Per-sample scores for each hypothesis, plus a per-bar-index breakdown.
+
+    `extra` adds named hypotheses keyed on their own tonic chords -- used by
+    --corrupt_tonic to score the generation against the cadence the rule model
+    was actually FED, beside the one the data says it should follow.
+    """
     roots, is_min, voiced = read_bar_chords(gen, spc)
     B, n_bars = roots.shape
     got = roots + 12 * is_min.long()
@@ -160,11 +199,13 @@ def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
     cad = rule.cadence.to(gen.device)
 
     out: dict = {}
-    for name, idx in (('rule', tonic),
-                      ('parallel', torch.tensor(
-                          [parallel_of(int(c)) for c in tonic], device=gen.device)),
-                      ('relative', torch.tensor(
-                          [relative_of(int(c)) for c in tonic], device=gen.device))):
+    hyps = [('rule', tonic),
+            ('parallel', torch.tensor([parallel_of(int(c)) for c in tonic],
+                                      device=gen.device)),
+            ('relative', torch.tensor([relative_of(int(c)) for c in tonic],
+                                      device=gen.device))]
+    hyps += list((extra or {}).items())
+    for name, idx in hyps:
         want = cad[idx][:, phases]                           # (B, n_bars)
         chord_hit = (got == want) & voiced
         root_hit = roots == (want % 12)
@@ -182,7 +223,7 @@ def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
 # ---------------------------------------------------------------------------
 
 def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
-               per_bar_acc, midi_dir=None):
+               per_bar_acc, midi_dir=None, corrupt_how=None):
     """{tonic chord: {metric: value}} averaged over that chord's prompts."""
     spc = args.beats_per_chord
     total = args.n_prompt_beats + args.n_gen_beats
@@ -195,11 +236,21 @@ def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
                                                        device=device))
         prompt = proc[:, :args.n_prompt_beats]
         tn = torch.full((len(items),), tonic, device=device, dtype=torch.long)
+        extra = None
+        if corrupt_how and is_adapter:
+            # Override what the adapter reads off the prompt, so the rule model
+            # is fed a cadence the music does not follow. Patched on the
+            # instance rather than in cp_yinyang: the adapter's own extractor
+            # stays the one that trained, and this lie exists only here.
+            fed = corrupt(tn, corrupt_how, torch.Generator(device=device).manual_seed(0))
+            model._tonic_chord = types.MethodType(
+                lambda self, _x, _f=fed: _f, model)
+            extra = {'fed': fed}
         if model is None:                       # the DATA row: the real continuation
             gen = proc[:, args.n_prompt_beats:total]
         else:
             gen = generate(model, is_adapter, prompt, total, args.temperature, device)
-        sc = score(gen, tn, rule, args.n_prompt_beats, spc)
+        sc = score(gen, tn, rule, args.n_prompt_beats, spc, extra)
         out[tonic] = {k: float(v.mean()) for k, v in sc.items()
                       if not k.startswith('_')}
         out[tonic]['n'] = len(items)
@@ -245,6 +296,13 @@ def main():
     p.add_argument('--rule_view', default='root_next')
     p.add_argument('--split', default='val',
                    choices=['val', 'test', 'train', 'all'])
+    p.add_argument('--corrupt_tonic', default=None,
+                   choices=['parallel', 'relative', 'shift', 'random'],
+                   help='the intervention: feed the rule model a WRONG tonic '
+                        'chord and report whether the generation follows the '
+                        'cadence it was fed or the one the music follows. '
+                        "parallel keeps the root and flips the mode, so only "
+                        'the thirds can tell them apart')
     p.add_argument('--save_midi_dir', default=None)
     p.add_argument('--json_out', default=None)
     args = p.parse_args()
@@ -308,7 +366,7 @@ def main():
             print(f'  {label} ...', end='  ', flush=True)
             per_chord_all[label] = eval_entry(
                 label, model, is_ad, base, pool, rule, args, device,
-                per_bar_acc, args.save_midi_dir)
+                per_bar_acc, args.save_midi_dir, args.corrupt_tonic)
             print('done')
 
     print('\n' + '=' * 78)
@@ -338,6 +396,22 @@ def main():
             f'{row(pc, sorted(pc), h + "/chord_acc"):>12.3f}' for h in HYPOTHESES))
     print('  parallel high with rule low = read the tonic, defaulted to the')
     print('  other mode -- the failure v4/v5 metrics score as perfect.')
+
+    if args.corrupt_tonic:
+        print(f'\nINTERVENTION: the rule model was fed a {args.corrupt_tonic} '
+              'tonic chord, not the one the music follows')
+        print(f'{"model":<26}{"follows FED":>13}{"follows TRUE":>14}'
+              f'{"fed root":>11}{"fed qual":>10}')
+        for label, pc in per_chord_all.items():
+            if label == 'Data':
+                continue        # no model, so nothing was fed anything
+            print(f'{label:<26}{row(pc, sorted(pc), "fed/chord_acc"):>13.3f}'
+                  f'{row(pc, sorted(pc), "rule/chord_acc"):>14.3f}'
+                  f'{row(pc, sorted(pc), "fed/root_acc"):>11.3f}'
+                  f'{row(pc, sorted(pc), "fed/qual_acc"):>10.3f}')
+        print('  FED high, TRUE low  -> the cadence channel drives the output')
+        print('  TRUE high, FED low  -> the channel is ignored; the prompt alone')
+        print('                         is doing the work, as v5 suggested it might')
 
     print('\nchord_acc by generated bar index (cycle bar in brackets)')
     bars = sorted(next(iter(per_bar_acc.values())))
