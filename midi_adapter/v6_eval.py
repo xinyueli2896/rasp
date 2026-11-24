@@ -56,6 +56,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cp_transformer import RoFormerSymbolicTransformer
 from midi_adapter.cp_yinyang import CPYinyangTransformer
 from midi_adapter.v4_eval import generate, write_midi
+# Already solved there: train_cp_yinyang names its series by whichever
+# metric it monitored, so the best checkpoint is the MAX unseen_acc or the
+# MIN val_loss -- not the alphabetically first, and never last.ckpt, which
+# carries no metric at all.
+from midi_adapter.cp_results_table import best_ckpt
 from midi_adapter.generate_synthetic_bass import DURATION_TEMPLATES
 from models.chord_tracr_rule_model import (
     ChordTracrRuleModel, CHORD_NAMES, N_CHORDS, N_POS, chord_index, chord_root,
@@ -280,15 +285,10 @@ def main():
     if not args.data_only:
         entries.append(('Pretrain', base, False))
         for run in args.runs:
-            ck = None
-            if args.ckpt_dir:
-                cands = [f for f in os.listdir(os.path.join(args.ckpt_dir, run))
-                         if f.endswith('.ckpt') and 'last' not in f] \
-                        if os.path.isdir(os.path.join(args.ckpt_dir, run)) else []
-                if cands:
-                    ck = os.path.join(args.ckpt_dir, run, sorted(cands)[0])
+            ck = best_ckpt(os.path.join(args.ckpt_dir, run)) if args.ckpt_dir else None
             if ck is None:
-                print(f'  {run}: no checkpoint found, skipped')
+                print(f'  {run}: no monitored checkpoint in '
+                      f'{os.path.join(args.ckpt_dir or ".", run)} -- skipped')
                 continue
             ad = CPYinyangTransformer(
                 base_model=RoFormerSymbolicTransformer(size=args.model_size),
