@@ -4,14 +4,23 @@
 #   WORK=$PWD/v6 CONDA_ENV=$PWD/v6/env sbatch \
 #       -o $PWD/v6/logs_v6/train-%A_%a.out scripts/dana_v6_train.sbatch
 #
-# 6 stems x 3 seeds = 18 tasks on cscc-gpu-p, throttled to 2 at a time
-# because that partition allows 2 concurrent jobs and 4 GPUs per account, with
-# a 24 h limit per job. Each task takes one GPU, so 18 tasks is 9 rounds --
-# budget a day or two of wall-clock, and consider SEEDS=1 first (6 tasks, 3
-# rounds) to get a table before spending 3x the time on the other two seeds.
+# ONE job, training every requested stem in sequence on its single GPU. Not a
+# job array, because cscc-gpu-qos caps SUBMITTED jobs (queued plus running) at
+# 2 per user and an array counts every task against that -- `--array=0-5%2`
+# is six submitted jobs and is refused outright with
+# QOSMaxSubmitJobPerUserLimit. The %2 throttle limits only what RUNS.
 #
-# DANA's `long` partition would run 6 at a time (8 jobs, 12 GPUs, 72 h), which
-# is three times faster for the same work. If you ever want it:
+# So submit one seed at a time: 6 stems sequentially is roughly 2-3 hours
+# (frozen trains at ~9.5 it/s, so 10k steps is ~18 min; trainar and scratch
+# train the full 112M host and take several times that), well inside the 24 h
+# limit, and one submitted job leaves the other slot free for the eval.
+#
+#   WORK=... SEEDS=1 sbatch scripts/dana_v6_train.sbatch
+#   WORK=... SEEDS=2 sbatch scripts/dana_v6_train.sbatch     # after, or alongside
+#
+# On a partition whose QoS allows more jobs -- `long` with gpu-12 permits 8 --
+# an array is faster, and passing --array switches this script to one task per
+# (seed, stem):
 #   sbatch --partition=long --qos=gpu-12 --array=0-17%6 --time=48:00:00 ...
 #
 # An array rather than one long job because the stems are independent: a stem
@@ -33,8 +42,7 @@
 #       -o $PWD/v6/logs_v6/eval-%j.out scripts/dana_v6_train.sbatch
 
 #SBATCH --job-name=v6train
-#SBATCH --output=v6train-%A_%a.out
-#SBATCH --array=0-17%2
+#SBATCH --output=v6train-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
@@ -91,7 +99,19 @@ if [[ "$STAGES" == eval ]]; then
   exit 0
 fi
 
-# --- one (seed, stem) per array task ---------------------------------------
+# --- no array: every seed x stem in sequence, in this one job ---------------
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+  echo "not an array job: training each of [$STEMS_ALL] for seeds [$SEEDS_ALL]"
+  echo "in sequence on this GPU. One submitted job, which is what"
+  echo "cscc-gpu-qos's 2-job cap leaves room for."
+  echo "started $(date -Is)"
+  STAGES=train SEEDS="$SEEDS_ALL" STEMS="$STEMS_ALL" PARALLEL=0 WORK="$WORK" \
+    ./scripts/run_v6_stems.sh
+  echo "finished $(date -Is)"
+  exit 0
+fi
+
+# --- with --array: one (seed, stem) per task -------------------------------
 read -r -a seeds <<< "$SEEDS_ALL"
 read -r -a stems <<< "$STEMS_ALL"
 n_stems=${#stems[@]}
