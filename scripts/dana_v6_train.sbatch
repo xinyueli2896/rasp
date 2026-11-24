@@ -37,9 +37,18 @@
 # prescribes for environment and dependency checks.
 #
 # The eval is a separate submission once training is in: it needs every stem's
-# checkpoint, so it cannot be an array task.
+# checkpoint, so it cannot be an array task. It is PRODUCTION work -- it
+# generates the results table -- so it takes the partition's production QoS by
+# default and must NOT be given gpu-debug-qos, which DANA reserves for
+# environment checks, dependency validation and short debugging runs.
 #   WORK=$PWD/v6 CONDA_ENV=$PWD/v6/env STAGES=eval sbatch \
 #       -o $PWD/v6/logs_v6/eval-%j.out scripts/dana_v6_train.sbatch
+#
+# Housekeeping, per DANA's data-management rule: once both stages exist the
+# corpus zip under $WORK/LAMD is rebuildable and should go, as should the
+# _min8 datasets if the production floor is what you train on. The stages
+# themselves are kilobytes and worth keeping -- every dataset variation is a
+# --from_stage rebuild off them.
 
 #SBATCH --job-name=v6train
 #SBATCH --output=v6train-%j.out
@@ -90,7 +99,11 @@ echo "host    $(hostname)"
 echo "repo    $REPO ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?'))"
 echo "python  $PY"
 echo "gpu     ${CUDA_VISIBLE_DEVICES:-none}"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
+# Only the GPU SLURM allocated. nvidia-smi otherwise lists every device on the
+# node, which is harmless but misleading in a one-GPU job, and DANA's GPU
+# policy is emphatic about not touching devices that were not allocated.
+nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0}" \
+  --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || true
 
 if [[ "$STAGES" == eval ]]; then
   echo "=== v6 tables, all seeds ==="
