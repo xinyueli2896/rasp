@@ -57,7 +57,14 @@ export TRAIN_DATA="${TRAIN_DATA:-${DATA_PREFIX}_finetune.pt}"
 # held out. scratch still needs a second file to interleave; it gets the
 # finetune file, making it a random-init host trained with the adapter.
 export PRETRAIN_DATA="${PRETRAIN_DATA:-${DATA_PREFIX}_finetune.pt}"
-export VAL_DATA="${VAL_DATA:-${DATA_PREFIX}_all.pt}"
+# Validation and checkpoint selection on the TRAINED tonics only: the
+# finetune file's val split (index % 10 == 1) is never trained on, and the
+# held-out tonics are kept out of model selection entirely. The finetune
+# stem selects on val_loss over this file; the adapter stems on seen_acc,
+# the generation probe over the same songs. Set VAL_DATA=..._all.pt and
+# CKPT_MONITOR=unseen_acc to reproduce the earlier runs' selection.
+export VAL_DATA="${VAL_DATA:-${DATA_PREFIX}_finetune.pt}"
+export CKPT_MONITOR="${CKPT_MONITOR:-seen_acc}"
 export UNSEEN_DATA="${UNSEEN_DATA:-${DATA_PREFIX}_unseen.pt}"
 export CKPT_DIR="${CKPT_DIR:-$WORK/checkpoints_$TAG}"
 export LOG_DIR="${LOG_DIR:-$WORK/logs_$TAG}"

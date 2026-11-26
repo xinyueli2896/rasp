@@ -102,6 +102,10 @@ SHIFT_AUG="${SHIFT_AUG:-0}"
 AUG_OPTS=()
 [[ "$SHIFT_AUG" == "1" ]] && AUG_OPTS+=(--shift_aug)
 RULE_OPTS+=(${AUG_OPTS[@]+"${AUG_OPTS[@]}"})
+# CKPT_MONITOR: what selects each adapter run's checkpoint (see
+# train_cp_yinyang --ckpt_monitor). auto keeps the historical unseen_acc.
+CKPT_MONITOR="${CKPT_MONITOR:-auto}"
+RULE_OPTS+=(--ckpt_monitor "$CKPT_MONITOR")
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 

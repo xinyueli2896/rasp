@@ -71,7 +71,7 @@ def best_ckpt(run_dir: str) -> str | None:
     """
     paths = [p for p in glob.glob(os.path.join(run_dir, '*.ckpt'))
              if os.path.basename(p) != 'last.ckpt']
-    for field, better in (('unseen_acc', max), ('val_loss', min)):
+    for field, better in (('seen_acc', max), ('unseen_acc', max), ('val_loss', min)):
         scored = []
         for p in paths:
             m = re.search(rf'{field}=(-?\d+(?:\.\d+)?)', os.path.basename(p))

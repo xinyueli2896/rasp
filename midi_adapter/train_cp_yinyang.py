@@ -178,7 +178,11 @@ class UnseenAccuracyCallback(L.Callback):
 
     def __init__(self, dataloader: DataLoader, n_batches: int = 5,
                  n_prompt_beats: int = 1, n_gen_beats: int = 23,
-                 beats_per_chord: int = 1):
+                 beats_per_chord: int = 1, name: str = 'unseen'):
+        # name='seen' runs the same probe on the TRAINED tonics' val split,
+        # which is what checkpoints are selected on under --ckpt_monitor
+        # seen_acc, so model selection never looks at the held-out tonics.
+        self.name           = name
         self.dataloader     = dataloader
         self.n_batches      = n_batches
         self.n_prompt_beats = n_prompt_beats
@@ -244,11 +248,11 @@ class UnseenAccuracyCallback(L.Callback):
                     total      += len(pred_pc)
 
         acc = correct / max(total, 1)
-        pl_module.log('unseen_acc', acc, prog_bar=True)
+        pl_module.log(f'{self.name}_acc', acc, prog_bar=True)
         # Surfaced because a rising degenerate rate means the adapter's write is
         # disturbing the local decoder's EOS decision rather than the pitch
         # field -- a different failure from simply naming the wrong root.
-        pl_module.log('unseen_degenerate', degenerate / max(total, 1),
+        pl_module.log(f'{self.name}_degenerate', degenerate / max(total, 1),
                       prog_bar=False)
 
 
@@ -466,10 +470,35 @@ def main(args):
               f'{args.probe_gen_beats} generated')
 
     os.makedirs(args.ckpt_dir, exist_ok=True)
-    if args.unseen_data and os.path.exists(args.unseen_data):
-        ckpt_monitor, ckpt_mode, ckpt_filename = 'unseen_acc', 'max', run_name + '.{epoch:02d}.{unseen_acc:.4f}'
+    # Checkpoint selection. 'auto' is the historical rule: unseen_acc when an
+    # unseen file is given -- which selects on the HELD-OUT tonics and so
+    # makes every unseen number optimistic. 'seen_acc' runs the same AR probe
+    # on the val split of the TRAINING file (songs the trainer never sees,
+    # tonics it does), so held-out tonics play no part in selection; unseen_acc
+    # is still logged for monitoring.
+    monitor = args.ckpt_monitor
+    if monitor == 'auto':
+        monitor = ('unseen_acc' if args.unseen_data and os.path.exists(args.unseen_data)
+                   else 'val_loss')
+    if monitor == 'unseen_acc' and unseen_acc_cb is None:
+        raise SystemExit('--ckpt_monitor unseen_acc needs --unseen_data')
+    seen_acc_cb = None
+    if monitor == 'seen_acc':
+        seen_ds = BassFramedDataset(args.train_data, args.train_length, args.batch_size,
+                                    split='val', sample_step=args.sample_step,
+                                    repeat=True)
+        seen_ds.preload(_cache)
+        seen_acc_cb = UnseenAccuracyCallback(
+            DataLoader(seen_ds, batch_size=None, num_workers=0), n_batches=5,
+            n_prompt_beats=args.probe_prompt_beats,
+            n_gen_beats=args.probe_gen_beats,
+            beats_per_chord=args.beats_per_chord, name='seen')
+        print(f'checkpoints selected on seen_acc: {args.train_data} (val split)')
+    if monitor == 'val_loss':
+        ckpt_mode, ckpt_filename = 'min', run_name + '.{epoch:02d}.{val_loss:.5f}'
     else:
-        ckpt_monitor, ckpt_mode, ckpt_filename = 'val_loss',   'min', run_name + '.{epoch:02d}.{val_loss:.5f}'
+        ckpt_mode, ckpt_filename = 'max', run_name + '.{epoch:02d}.{' + monitor + ':.4f}'
+    ckpt_monitor = monitor
     checkpoint_cb = L.callbacks.ModelCheckpoint(
         monitor           = ckpt_monitor,
         mode              = ckpt_mode,
@@ -506,6 +535,8 @@ def main(args):
     callbacks = [checkpoint_cb]
     if unseen_acc_cb is not None:
         callbacks.append(unseen_acc_cb)
+    if seen_acc_cb is not None:
+        callbacks.append(seen_acc_cb)
 
     trainer = L.Trainer(
         devices            = -1 if use_gpu else 1,
@@ -635,6 +666,13 @@ def get_args():
                         'holding beat 0, so the head attends exactly one '
                         'token. Identical outputs on rule-following input; '
                         'they differ only when the stream breaks the rule.')
+    p.add_argument('--ckpt_monitor',       type=str, default='auto',
+                   choices=['auto', 'seen_acc', 'unseen_acc', 'val_loss'],
+                   help='what picks the best checkpoint. auto = unseen_acc if '
+                        '--unseen_data else val_loss (historical; selects on '
+                        'held-out tonics). seen_acc = the same AR probe on the '
+                        "training file's val split, so held-out tonics never "
+                        'influence selection')
     p.add_argument('--shift_aug',          action='store_true',
                    help="v0.42's pitch-shift augmentation, applied per window "
                         "in the loop (uniform over the song's range clamped to "
