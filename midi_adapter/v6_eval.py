@@ -424,8 +424,18 @@ def main():
                 print(f'  {run}: no monitored checkpoint in '
                       f'{os.path.join(args.ckpt_dir or ".", run)} -- skipped')
                 continue
-            ad = load_v6_adapter(ck, args)
-            entries.append((run, ad.to(device).eval(), True))
+            if run.startswith('cp_bass_ft'):
+                # The Finetune baseline: v0.42 trained on the same finetune
+                # data with no adapter and no rule. finetune_cp_bass trains the
+                # RoFormer itself as the LightningModule, so its keys carry no
+                # prefix and must load completely.
+                ft = RoFormerSymbolicTransformer(size=args.model_size)
+                sd = torch.load(ck, map_location='cpu')
+                ft.load_state_dict(sd.get('state_dict', sd), strict=True)
+                entries.append((run, ft.to(device).eval(), False))
+            else:
+                ad = load_v6_adapter(ck, args)
+                entries.append((run, ad.to(device).eval(), True))
             print(f'  {run}: {os.path.basename(ck)}')
 
     per_chord_all, per_bar_acc = {}, collections.defaultdict(

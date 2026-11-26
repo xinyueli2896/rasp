@@ -139,7 +139,6 @@ train_seed () {
 eval_seed () {
   local sd="$1" t args runs=()
   for s in $EVAL_STEMS; do
-    [[ "$s" == finetune ]] && continue        # no adapter; v6_eval skips it
     runs+=("$(run_of "$s")_${TAG}_s$sd")
   done
   for t in $TEMPS; do
