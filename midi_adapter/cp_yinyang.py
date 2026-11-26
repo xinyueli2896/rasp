@@ -48,6 +48,7 @@ from models.chord_tracr_rule_model import ChordTracrRuleModel, chord_index
 # extractor weights a bar's notes by it, as the data prep does.
 from midi_adapter.generate_synthetic_bass import DURATION_TEMPLATES
 from models.rasp_compiled_rule     import RaspCompiledRule
+from models.rasp_compiled_chord_rule import RaspCompiledChordRule
 from models.ar_state_encoder       import ARStateRuleEncoder
 
 
@@ -354,6 +355,20 @@ class CPYinyangTransformer(nn.Module):
                 subbeats_per_chord=rule_subbeats_per_chord,
                 shift=1, input_shift=-1,
                 view=rule_view, key_select=rule_key_select)
+        elif rule_mode == 'chord_compiled':
+            # v6 built like v5: the same compiled RASP program as 'compiled'
+            # -- an attention head retrieves the tonic from the observed
+            # token stream and an MLP SequenceMap computes the next chord --
+            # over the 24 triads instead of the 12 pitch classes. Same
+            # alignment as v5 (input_shift=-1, shift=1) and the same views,
+            # with chord_next standing in for root_next.
+            self.rule_model = RaspCompiledChordRule(
+                subbeats_per_chord=rule_subbeats_per_chord,
+                shift=1, input_shift=-1,
+                view=('chord_next' if rule_view in ('root_next', 'chord_next')
+                      else rule_view),
+                key_select=rule_key_select,
+                minor_pattern=chord_minor_pattern)
         elif rule_mode.startswith('chord'):
             # v6: the rule is a cadence over the 24 triads, not a sequence of
             # roots. The adapter holds the rule model and reads its residual
@@ -546,6 +561,39 @@ class CPYinyangTransformer(nn.Module):
         mino = (w * (rel == 3)).sum((1, 2))
         return root + 12 * (mino > maj).long()
 
+    def _bar_minor(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """(B, n_bars) bool: is each bar's chord minor, read as _tonic_chord
+        reads bar 0 -- duration-weighted minor third against major third
+        above the bar's downbeat bass, slot 0 excluded."""
+        spc = max(1, int(self.rule_subbeats_per_chord))
+        B, T, W2 = x_proc.shape
+        n_bars = (T + spc - 1) // spc
+        out = torch.zeros(B, n_bars, dtype=torch.bool, device=x_proc.device)
+        for b in range(n_bars):
+            bar = x_proc[:, b * spc:min((b + 1) * spc, T), :]
+            n = bar.shape[1]
+            pairs = bar.reshape(B, n, W2 // 2, 2)
+            root = (pairs[:, 0, 0, 1] % 128 % 12).clamp(0, 11)
+            valid = (pairs[..., 0] < 127) & (pairs[..., 1] >= 128)
+            valid[:, :, 0] = False
+            dur_idx = (pairs[..., 1] // 128 - 1).clamp(0, len(DURATION_TEMPLATES) - 1)
+            dur = torch.as_tensor(DURATION_TEMPLATES, device=x_proc.device,
+                                  dtype=torch.float32)[dur_idx]
+            t = torch.arange(n, device=x_proc.device).view(1, n, 1)
+            w = torch.minimum(dur, (n - t).float()).clamp(min=0) * valid
+            rel = ((pairs[..., 1] % 128) - root.view(B, 1, 1)) % 12
+            out[:, b] = (w * (rel == 3)).sum((1, 2)) > (w * (rel == 4)).sum((1, 2))
+        return out
+
+    def _observed_chords(self, x_proc: torch.Tensor) -> torch.Tensor:
+        """(B, T) chord index 0..23 at every position: v5's token (the bass
+        pitch class in slot 0 at t) with the quality of t's bar. At t = 0 this
+        is exactly _tonic_chord."""
+        spc = max(1, int(self.rule_subbeats_per_chord))
+        pc = (x_proc[:, :, 1] % 128 % 12).clamp(0, 11)
+        bar = torch.arange(x_proc.shape[1], device=x_proc.device) // spc
+        return pc + 12 * self._bar_minor(x_proc)[:, bar].long()
+
     def _rule_hidden(self, x_proc: torch.Tensor) -> torch.Tensor:
         """Extract pitch classes from preprocessed tokens and run frozen TracR rule model.
 
@@ -554,6 +602,17 @@ class CPYinyangTransformer(nn.Module):
         Rule model reads key = pc[:, 0] and returns hidden (B, T, 16) where
         hidden[t] encodes the CURRENT pitch class: (key + OFFSETS[t%4]) % 12.
         """
+        if self.rule_mode == 'chord_compiled':
+            # v5's path over chords: the compiled program reads the OBSERVED
+            # stream, shifted right by one so index t carries beat t-1, and
+            # row 0 is zeroed. The token at t is the bass pitch class at t
+            # (v5's token) plus the quality of t's bar.
+            tok = self._observed_chords(x_proc)
+            tok_shift = torch.zeros_like(tok)
+            tok_shift[:, 1:] = tok[:, :-1]
+            rh = self.rule_model.rule_hidden(tok_shift).clone()
+            rh[:, 0] = 0.0
+            return rh
         if self.rule_mode.startswith('chord'):
             # Straight from the rule model's own analytic construction -- the
             # adapter supplies the tonic chord and reads the residual stream

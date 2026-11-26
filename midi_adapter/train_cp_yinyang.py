@@ -583,7 +583,7 @@ def get_args():
                         'prepare_v6_data selected the dataset with.')
     p.add_argument('--rule_mode', type=str, default='current',
                    choices=['current', 'period4', 'seed_broadcast', 'compiled',
-                            'chord'],
+                            'chord', 'chord_compiled'],
                    help='current: analytical 16-dim rule model (existing); '
                         'period4: TRACR attention 28-dim, dims 12-23=next pc; '
                         'seed_broadcast: 28-dim, dims 12-23=seed pc; '
@@ -593,6 +593,9 @@ def get_args():
                         '--rule_view root_next) and takes its tonic chord from '
                         'the prompt bar. Needs a v6 dataset and '
                         '--beats_per_chord 16; '
+                        'chord_compiled: v6 built like compiled -- the same '
+                        'attention head + MLP SequenceMap, over the 24 triads '
+                        '(models/rasp_compiled_chord_rule.py); '
                         'compiled: full TracR compilation (BassRaspCompiled) -- '
                         'attention head retrieves the key, MLP computes the next '
                         'root, so the rule is in the weights. Use --rule_view to '

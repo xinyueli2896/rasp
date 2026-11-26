@@ -114,7 +114,7 @@ RULE_MODE="${RULE_MODE:-compiled}"
 RULE_VIEW="${RULE_VIEW:-root_next}"
 CHORD_MINOR="${CHORD_MINOR:-harmonic}"
 MODE_OPTS=(--rule_mode "$RULE_MODE" --rule_view "$RULE_VIEW")
-[[ "$RULE_MODE" == chord ]] && MODE_OPTS+=(--chord_minor_pattern "$CHORD_MINOR")
+[[ "$RULE_MODE" == chord* ]] && MODE_OPTS+=(--chord_minor_pattern "$CHORD_MINOR")
 # Every run still logs to cp_bass unless told otherwise.
 WANDB_PROJECT="${WANDB_PROJECT:-cp_bass}"
 

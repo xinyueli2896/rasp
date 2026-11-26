@@ -310,7 +310,7 @@ def load_v6_adapter(ck: str, args) -> CPYinyangTransformer:
 
     cfg = dict(
         adapter_rank=args.adapter_rank, n_skip=n_skip, lora_rank=lora_rank,
-        rule_mode='chord', rule_view=args.rule_view,
+        rule_mode=args.rule_mode, rule_view=args.rule_view,
         rule_input=rule_input, rule_enc_type=enc_type, rule_enc_hidden=enc_hidden,
         rule_subbeats_per_chord=int(spc) if spc is not None else args.beats_per_chord,
         rule_rate=('bar' if bool(rr) else 'beat') if rr is not None else 'bar',
@@ -370,6 +370,12 @@ def main():
     p.add_argument('--minor_pattern', default='harmonic',
                    choices=['harmonic', 'natural'])
     p.add_argument('--rule_view', default='root_next')
+    p.add_argument('--rule_mode', default='chord_compiled',
+                   choices=['chord', 'chord_compiled'],
+                   help='the rule model the adapters trained with. Both give '
+                        'identical rule streams on the generation path, so an '
+                        'older chord checkpoint also scores correctly under '
+                        'chord_compiled; pass the one that trained for clarity')
     p.add_argument('--split', default='val',
                    choices=['val', 'test', 'train', 'all'])
     p.add_argument('--corrupt_tonic', default=None,

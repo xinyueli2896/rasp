@@ -63,7 +63,10 @@ export CKPT_DIR="${CKPT_DIR:-$WORK/checkpoints_$TAG}"
 export LOG_DIR="${LOG_DIR:-$WORK/logs_$TAG}"
 
 # v6's rule. run_cp_stems.sh passes these through to the trainer.
-export RULE_MODE="${RULE_MODE:-chord}"
+# chord_compiled: the v5 construction (attention head + MLP SequenceMap,
+# models/rasp_compiled_chord_rule.py) over the 24 triads. RULE_MODE=chord
+# is the earlier lookup-table model, kept so runs trained with it reproduce.
+export RULE_MODE="${RULE_MODE:-chord_compiled}"
 export RULE_VIEW="${RULE_VIEW:-root_next}"   # -> chord_next for the chord model
 export CHORD_MINOR="${CHORD_MINOR:-harmonic}"
 export WANDB_PROJECT="${WANDB_PROJECT:-cp_bass}"
@@ -149,6 +152,7 @@ eval_seed () {
           --n_prompt_beats "$PROBE_PROMPT" --n_gen_beats "$PROBE_GEN"
           --n_trials "$N_TRIALS" --temperature "$t"
           --minor_pattern "$CHORD_MINOR" --rule_view "$RULE_VIEW"
+          --rule_mode "$RULE_MODE"
           --json_out "$LOG_DIR/table_s${sd}_T${t}.json")
     [[ -n "$MIDI_DIR" ]] && args+=(--save_midi_dir "$MIDI_DIR/s$sd/T$t")
     echo "=== table, seed $sd, T=$t ==="
