@@ -72,6 +72,10 @@ from models.chord_tracr_rule_model import (
 
 METRICS = ('chord_acc', 'root_acc', 'qual_acc')
 HYPOTHESES = ('rule', 'parallel', 'relative')
+# Whole-sequence verdicts, in priority order: a sequence is assigned the first
+# hypothesis whose cadence EVERY generated bar plays (exact chord, voiced);
+# 'other' when none does.
+VERDICTS = HYPOTHESES + ('other',)
 
 
 def corrupt(tonic: torch.Tensor, how: str, rng: torch.Generator) -> torch.Tensor:
@@ -215,10 +219,22 @@ def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
         out[f'{name}/chord_acc'] = chord_hit.float().mean(1)
         out[f'{name}/root_acc'] = root_hit.float().mean(1)
         out[f'{name}/qual_acc'] = qual_hit.float().mean(1)
+        out[f'_{name}/whole'] = chord_hit.all(1)             # (B,) bool
         if name == 'rule':
             out['_per_bar'] = chord_hit.float()              # (B, n_bars)
             out['_phases'] = phases
     out['unvoiced'] = (~voiced).float().mean(1)
+
+    # Whole-sequence verdict: which cadence did the WHOLE continuation follow?
+    # Stored as a per-sample code and as one-hot fractions, so the per-chord
+    # mean times n is a count of sequences.
+    verdict = torch.full((B,), len(HYPOTHESES), dtype=torch.long, device=gen.device)
+    for i in reversed(range(len(HYPOTHESES))):
+        verdict[out[f'_{HYPOTHESES[i]}/whole']] = i
+    for i, v in enumerate(VERDICTS):
+        out[f'whole/{v}'] = (verdict == i).float()
+    out['_verdict'] = verdict
+    out['_got'] = got
     return out
 
 
@@ -230,6 +246,12 @@ def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
     spc = args.beats_per_chord
     total = args.n_prompt_beats + args.n_gen_beats
     out = {}
+    if midi_dir:                 # a rerun replaces this model's files
+        d = os.path.join(midi_dir, label)
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                if fn == 'index.tsv' or (fn.startswith('chord_') and fn.endswith('.mid')):
+                    os.remove(os.path.join(d, fn))
     for tonic, items in sorted(pool.items()):
         if not items:
             continue
@@ -260,11 +282,20 @@ def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
         for i, v in enumerate(pb.tolist()):
             per_bar_acc[label][i].append(v)
         if midi_dir:
+            # EVERY prompt's generation, named by tonic, prompt number and the
+            # whole-sequence verdict, plus one line per file in index.tsv
+            # with the chords read off each generated bar.
             d = os.path.join(midi_dir, label)
             os.makedirs(d, exist_ok=True)
-            both = torch.cat([prompt[:1], gen[:1]], dim=1)
-            write_midi(both[0], base.tokenizer,
-                       os.path.join(d, f'chord_{CHORD_NAMES[tonic]}.mid'))
+            both = torch.cat([prompt, gen], dim=1)
+            with open(os.path.join(d, 'index.tsv'), 'a') as f:
+                for j, (fname, song, _) in enumerate(items):
+                    v = VERDICTS[int(sc['_verdict'][j])]
+                    name = f'chord_{CHORD_NAMES[tonic]}_p{j}_{v}.mid'
+                    write_midi(both[j], base.tokenizer, os.path.join(d, name))
+                    bars = ' '.join(CHORD_NAMES[int(c)] for c in sc['_got'][j])
+                    f.write(f'{name}\t{CHORD_NAMES[tonic]}\t{v}\t'
+                            f'{fname}:{song}\t{bars}\n')
     return out
 
 
@@ -481,6 +512,18 @@ def main():
             f'{row(pc, sorted(pc), h + "/chord_acc"):>12.3f}' for h in HYPOTHESES))
     print('  parallel high with rule low = read the tonic, defaulted to the')
     print('  other mode -- the failure v4/v5 metrics score as perfect.')
+
+    print('\nwhich cadence did the WHOLE sequence follow? (number of sequences;')
+    print('  a sequence counts for a cadence only if every generated bar plays it)')
+    for part, chords in (('all', None), ('finetune', seen), ('unseen', unseen)):
+        print(f'  [{part}]')
+        print(f'  {"model":<24}' + ''.join(f'{v:>10}' for v in VERDICTS) + f'{"n":>7}')
+        for label, pc in per_chord_all.items():
+            cs = sorted(pc) if chords is None else [c for c in chords if c in pc]
+            n = sum(pc[c]['n'] for c in cs)
+            cnt = [round(sum(pc[c][f'whole/{v}'] * pc[c]['n'] for c in cs))
+                   for v in VERDICTS]
+            print(f'  {label:<24}' + ''.join(f'{x:>10d}' for x in cnt) + f'{n:>7d}')
 
     if args.corrupt_tonic:
         print(f'\nINTERVENTION: the rule model was fed a {args.corrupt_tonic} '
