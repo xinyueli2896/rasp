@@ -57,7 +57,7 @@ import torch
 import torch.nn.functional as F
 
 TASKS = {'roman': 3, 'next_chord': 24}
-LAMBDAS = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+LAMBDAS = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]
 MDL_FRACS = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.0625, 0.125, 0.25, 0.5, 1.0]
 
 
@@ -193,9 +193,13 @@ def main():
     p.add_argument('--cv_folds', type=int, default=5)
     p.add_argument('--no_mdl', action='store_true')
     p.add_argument('--no_control', action='store_true')
+    p.add_argument('--allow_cpu', action='store_true')
     args = p.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu' and not args.allow_cpu:
+        raise SystemExit('no CUDA device visible to torch; the full run is too slow on '
+                         'CPU. Check the job got a GPU, or pass --allow_cpu.')
     meta = dict(np.load(os.path.join(args.probe_dir, 'meta.npz')))
     for k in ('split', 'src_file'):
         meta[k] = meta[k].astype(str)

@@ -23,9 +23,12 @@ What is saved, per model, for every (window, bar b = 1..W-1):
     <out>/meta.npz            labels and bookkeeping, identical for every model
                               (the windows are chosen by --seed, not by model)
 
-Windows start at a random bar of the span, not only on a I bar, so a bar's
-phase in the cycle is not a function of its position in the window. The
-position-only control in probe_train measures how much is left.
+Every span contributes one window at each of the four cycle offsets (start
+bar s with s % 4 = 0, 1, 2, 3), so a bar's phase is independent of its
+position in the window. With 8-bar windows most spans (8 bars long) could
+only start on a I, and the smoke run's position-only probe read the roman
+numeral at 0.79 from position alone; 5-bar windows remove that. The
+position-only control in probe_train checks it.
 
 Models, each given as NAME=SPEC:
     base=/path/to/v0.42.ckpt               a checkpoint file
@@ -98,8 +101,14 @@ def choose_windows(prefix: str, window_bars: int, per_span: int,
             starts = np.arange(0, n_bars - window_bars + 1)
             if len(starts) == 0:
                 continue
-            if len(starts) > per_span:
-                starts = np.sort(rng.choice(starts, per_span, replace=False))
+            # One start per offset in the cycle (s % 4), so every bar position
+            # in the window sees every phase equally often and position alone
+            # cannot predict phase. A span too short for all four offsets
+            # contributes none: it would bring the confound back.
+            by_off = [starts[starts % CYCLE == o] for o in range(CYCLE)]
+            if any(len(g) == 0 for g in by_off):
+                continue
+            starts = np.sort([int(rng.choice(g)) for g in by_off][:per_span])
             for s in starts:
                 a = start[i] + int(s) * BAR
                 out.append((split, int(i), files[i], int(chords[i]), int(s),
@@ -192,9 +201,12 @@ def main():
     p.add_argument('--model', action='append', required=True,
                    help='NAME=SPEC; SPEC is a .ckpt, a run directory, or random:SEED')
     p.add_argument('--model_size', type=int, default=1)
-    p.add_argument('--window_bars', type=int, default=8,
-                   help='8 bars = 128 steps, the v6 TRAIN_LENGTH')
-    p.add_argument('--windows_per_span', type=int, default=2)
+    p.add_argument('--window_bars', type=int, default=5,
+                   help='5 bars: one cycle of context plus the bar asked about. '
+                        'An 8-bar span then fits a window at every offset 0-3, '
+                        'which decorrelates phase from position')
+    p.add_argument('--windows_per_span', type=int, default=4,
+                   help='at most 4: one per cycle offset')
     p.add_argument('--max_spans', type=int, default=0,
                    help='per split; 0 = all. A smoke run uses e.g. 100')
     p.add_argument('--chord_minor', default='harmonic')

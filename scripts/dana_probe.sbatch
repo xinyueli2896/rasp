@@ -63,6 +63,7 @@ echo "ft      $FT_RUN"
 echo "out     $OUT   smoke=$SMOKE"
 nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0}" \
   --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || true
+"$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available())"
 echo "started $(date -Is)"
 
 "$PY" -m midi_adapter.probe_extract \
