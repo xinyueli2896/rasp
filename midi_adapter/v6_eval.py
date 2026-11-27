@@ -189,6 +189,28 @@ def read_bar_chords(gen: torch.Tensor, spc: int):
     return roots, mino > maj, (maj + mino) > 0
 
 
+def chord_tone_counts(gen: torch.Tensor, spc: int, want: torch.Tensor):
+    """(hits, notes) each (B, n_bars): how many of a bar's notes are tones of
+    the chord `want` (B, n_bars, ids 0..23) asks for there.
+
+    A note is one sounding note event in the processed tokens -- the same
+    validity test read_bar_chords uses (a real program, a real pitch), bass
+    included -- counted once at its onset, whatever its length. A chord tone
+    is a pitch class in {root, third, fifth} of the wanted triad: third +3 for
+    minor, +4 for major, fifth +7.
+    """
+    B, T, W2 = gen.shape
+    n_bars = T // spc
+    pairs = gen[:, :n_bars * spc, :].reshape(B, n_bars, spc, W2 // 2, 2)
+    valid = (pairs[..., 0] < 127) & (pairs[..., 1] >= 128)
+    pc = (pairs[..., 1] % 128) % 12                              # (B, bars, spc, poly)
+    root = (want % 12)[:, :, None, None]
+    third = (root + torch.where(want >= 12, 3, 4)[:, :, None, None]) % 12
+    fifth = (root + 7) % 12
+    tone = (pc == root) | (pc == third) | (pc == fifth)
+    return (tone & valid).sum((2, 3)), valid.sum((2, 3))
+
+
 def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
           n_prompt: int, spc: int, extra: dict | None = None) -> dict:
     """Per-sample scores for each hypothesis, plus a per-bar-index breakdown.
@@ -223,6 +245,7 @@ def score(gen: torch.Tensor, tonic: torch.Tensor, rule: ChordTracrRuleModel,
         if name == 'rule':
             out['_per_bar'] = chord_hit.float()              # (B, n_bars)
             out['_phases'] = phases
+            out['_ct_hits'], out['_ct_notes'] = chord_tone_counts(gen, spc, want)
     out['unvoiced'] = (~voiced).float().mean(1)
 
     # Whole-sequence verdict: which cadence did the WHOLE continuation follow?
@@ -278,6 +301,11 @@ def eval_entry(label, model, is_adapter, base, pool, rule, args, device,
         out[tonic] = {k: float(v.mean()) for k, v in sc.items()
                       if not k.startswith('_')}
         out[tonic]['n'] = len(items)
+        # Chord tones against the RULE cadence, pooled over this tonic's
+        # prompts: note counts per generated bar, summed later across tonics
+        # so every note weighs the same.
+        out[tonic]['ct_hits'] = sc['_ct_hits'].sum(0).tolist()
+        out[tonic]['ct_notes'] = sc['_ct_notes'].sum(0).tolist()
         pb = sc['_per_bar'].mean(0)
         for i, v in enumerate(pb.tolist()):
             per_bar_acc[label][i].append(v)
@@ -566,6 +594,32 @@ def main():
         print(f'{label:<26}' + ''.join(
             f'{sum(per_bar_acc[label][b]) / len(per_bar_acc[label][b]):>9.3f}'
             for b in bars))
+
+    def ct(pc, chords, bar=None):
+        cs = [c for c in chords if c in pc]
+        h = sum(pc[c]['ct_hits'][bar] if bar is not None else sum(pc[c]['ct_hits'])
+                for c in cs)
+        n = sum(pc[c]['ct_notes'][bar] if bar is not None else sum(pc[c]['ct_notes'])
+                for c in cs)
+        return 100.0 * h / n if n else float('nan')
+
+    print('\nchord tones: % of generated notes that are root/3rd/5th of the')
+    print('  chord the rule cadence asks for in that bar (notes pooled)')
+    print(f'{"model":<26}{"all":>9}{"finetune":>10}{"unseen":>9}'
+          f'{"uns maj":>9}{"uns min":>9}')
+    for label, pc in per_chord_all.items():
+        um = [c for c in unseen if not chord_is_minor(c)]
+        un = [c for c in unseen if chord_is_minor(c)]
+        print(f'{label:<26}{ct(pc, sorted(pc)):>9.1f}{ct(pc, seen):>10.1f}'
+              f'{ct(pc, unseen):>9.1f}{ct(pc, um):>9.1f}{ct(pc, un):>9.1f}')
+    for part, chords in (('all', None), ('finetune', seen), ('unseen', unseen)):
+        print(f'\nchord tones % by generated bar index [{part}]  (cycle bar in brackets)')
+        print(f'{"model":<26}' + ''.join(
+            f'{f"b{b + 1}[{(b + 1 + args.n_prompt_beats // args.beats_per_chord - 1) % N_POS}]":>9}'
+            for b in bars))
+        for label, pc in per_chord_all.items():
+            cs = sorted(pc) if chords is None else chords
+            print(f'{label:<26}' + ''.join(f'{ct(pc, cs, b):>9.1f}' for b in bars))
 
     print('\nper tonic chord, chord_acc, DATA row only -- the scorer self-test  (* held out)')
     for mino in (False, True):
