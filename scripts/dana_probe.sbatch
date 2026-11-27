@@ -42,6 +42,7 @@ if [[ "$SMOKE" == 1 ]]; then
   OUT="${OUT:-$WORK/probe_r1_smoke}"
   EXTRACT_ARGS=(--max_spans 100)
   TRAIN_ARGS=(--layers 0,6,12 --seeds 0)
+  [[ "${ALLOW_CPU:-0}" == 1 ]] && TRAIN_ARGS+=(--allow_cpu)
 else
   OUT="${OUT:-$WORK/probe_r1}"
   EXTRACT_ARGS=()
@@ -64,6 +65,12 @@ echo "out     $OUT   smoke=$SMOKE"
 nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0}" \
   --query-gpu=index,name,memory.total --format=csv,noheader 2>/dev/null || true
 "$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'available', torch.cuda.is_available())"
+# Stop now rather than after an hour of CPU extraction. ALLOW_CPU=1 overrides.
+if [[ "${ALLOW_CPU:-0}" != 1 ]] && ! "$PY" -c "import sys, torch; sys.exit(not torch.cuda.is_available())"; then
+  echo "no GPU visible to torch (CUDA_VISIBLE_DEVICES='${CUDA_VISIBLE_DEVICES:-}');" >&2
+  echo "check the allocation: sacct -j ${SLURM_JOB_ID:-<id>} -o JobID,Partition,QOS,AllocTRES%60" >&2
+  exit 1
+fi
 echo "started $(date -Is)"
 
 "$PY" -m midi_adapter.probe_extract \
