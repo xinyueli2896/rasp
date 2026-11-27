@@ -356,6 +356,22 @@ def load_v6_adapter(ck: str, args) -> CPYinyangTransformer:
         bst = torch.load(args.base_ckpt, map_location='cpu')
         base.load_state_dict(bst.get('state_dict', bst))
     ad = CPYinyangTransformer(base_model=base, **cfg)
+    # The rule model has no weights, only buffers it rebuilds from the cadence
+    # table. Runs trained with --rule_mode chord saved that table
+    # (rule_model.cadence, persistent); chord_compiled keeps all its buffers
+    # non-persistent. A saved rule buffer is therefore not a weight to load
+    # but a record to CHECK: it must equal what the rebuild computed, else
+    # the eval would score against a different cadence than the run trained on.
+    own = dict(ad.named_buffers())
+    for k in [k for k in sd if k.startswith('rule_model.')]:
+        if k in ad.state_dict():
+            continue                     # persistent here too: loads normally
+        v = sd.pop(k)
+        mine = own.get(k)
+        if mine is None or mine.shape != v.shape or not torch.equal(mine.cpu(), v.cpu()):
+            raise SystemExit(f'{ck}: saved {k} differs from the rebuilt rule model '
+                             f'({args.rule_mode}); refusing to score it')
+        print(f'  {k}: saved by the run, equal to the rebuilt rule -- checked')
     missing, unexpected = ad.load_state_dict(sd, strict=False)
     _report_load(missing, unexpected)
     real_missing = [k for k in missing
